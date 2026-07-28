@@ -10,16 +10,24 @@ timing, media sourcing and provenance, edit decisions, synthetic plates,
 editable audio stems, a versioned Resolve manifest/FCPXML compiler, Free/Studio
 automation, rendering, and source-inclusive editor handoff.
 
+The committed `produce-resolve-documentary` agent skill guides the missing
+editorial front end from a topic through research, claims, script, approvals,
+and the deterministic CLI. The CLI itself still begins with an authored marked
+script; topic-to-script is not an unattended executable stage.
+
 Real episode projects, source media, credentials, caches, renders, Resolve
 archives, and local application state are intentionally excluded from Git.
 
 ## Requirements
 
+- Windows 10/11 x64, or macOS 12+ on Intel or Apple silicon, on hardware
+  supported by DaVinci Resolve
 - Python 3.11 or newer
 - DaVinci Resolve 21 or newer
 - FFmpeg and ffprobe on `PATH` for conforming, generated plates, audio stems,
   verification, and the explicit legacy backend
-- Chrome or Edge for browser-capture operations
+- Chrome, Edge, or Chromium for browser-capture operations
+- Poppler's `pdftoppm` for PDF evidence capture
 - an ElevenLabs API key and voice ID only when using narration or sound
   generation
 
@@ -41,16 +49,26 @@ On Windows:
 powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1
 ```
 
-Or install manually:
+On macOS:
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-Copy-Item .env.example .env
+```bash
+# Homebrew is one option for the command-line prerequisites.
+brew install uv ffmpeg poppler
+bash scripts/bootstrap.sh
+```
+
+Or use the identical manual setup on either platform:
+
+```text
+uv sync --extra dev
+uv run rabbithole resolve doctor --mode free
 ```
 
 Fill in `.env` only for the paid/network services you use. The checked-in
 example contains no credentials or account-specific voice identifier.
+`RABBITHOLE_RESOLVE_PATH` and `RABBITHOLE_BROWSER_PATH` can point to
+nonstandard application locations. `RABBITHOLE_PROJECTS_DIR` can place ignored
+episode workspaces on another local volume.
 
 Run RabbitHole from a repository checkout with this editable installation. The
 runner, Fusion templates, schemas, and LUT are versioned repository assets; a
@@ -60,30 +78,29 @@ standalone wheel is intentionally not a supported transfer format.
 
 Create a Git-ignored episode workspace:
 
-```powershell
-rabbithole new my-episode
-rabbithole validate projects/my-episode/script/04-final.md
-rabbithole narrate projects/my-episode/script/04-final.md `
-  --out projects/my-episode/narration/vo.wav --dry-run
-rabbithole assets projects/my-episode/narration/timing.json
-rabbithole edl projects/my-episode/narration/timing.json
+```text
+uv run rabbithole new my-episode
+uv run rabbithole validate projects/my-episode/script/04-final.md
+uv run rabbithole narrate projects/my-episode/script/04-final.md --out projects/my-episode/narration/vo.wav --dry-run
+uv run rabbithole assets projects/my-episode/narration/timing.json
+uv run rabbithole edl projects/my-episode/narration/timing.json
 ```
 
 Then compile and build the editable Resolve timeline:
 
-```powershell
-rabbithole resolve preflight projects/my-episode
-rabbithole resolve prepare projects/my-episode
-rabbithole resolve build projects/my-episode
+```text
+uv run rabbithole resolve preflight projects/my-episode
+uv run rabbithole resolve prepare projects/my-episode
+uv run rabbithole resolve build projects/my-episode
 ```
 
 For Resolve Free, `build` prints a one-line Python loader. Open the intended
 project, paste the loader into `Workspace > Console`, and press Enter. You can
 also install the same runner under `Workspace > Scripts`:
 
-```powershell
-rabbithole resolve install-runner
-rabbithole resolve status projects/my-episode
+```text
+uv run rabbithole resolve install-runner
+uv run rabbithole resolve status projects/my-episode
 ```
 
 The generated timeline is immutable and named `AUTO_BUILD_<hash>`. Duplicate it
@@ -92,9 +109,9 @@ an `EDITORIAL_` timeline.
 
 Render and package a complete editor handoff:
 
-```powershell
-rabbithole resolve render projects/my-episode
-rabbithole resolve handoff projects/my-episode --out D:\handoffs
+```text
+uv run rabbithole resolve render projects/my-episode
+uv run rabbithole resolve handoff projects/my-episode --out <handoff-directory>
 ```
 
 The handoff contains a source-inclusive `.dra`, a lightweight `.drp`, style
@@ -104,21 +121,59 @@ A `.drp` by itself is not treated as a media archive.
 The proven render path remains the general-command default until a local
 Resolve Console pilot passes. Resolve remains available explicitly:
 
-```powershell
-rabbithole render projects/my-episode/narration/timing.json --backend resolve
-rabbithole render projects/my-episode/narration/timing.json --backend ffmpeg
+```text
+uv run rabbithole render projects/my-episode/narration/timing.json --backend resolve
+uv run rabbithole render projects/my-episode/narration/timing.json --backend ffmpeg
 ```
 
 See [the Resolve workflow](docs/resolve-workflow.md) for Free/Studio behavior,
 safety guarantees, queue states, and editor transfer.
 
+## Move an episode to another machine
+
+Git carries the reusable application and the committed
+[`produce-resolve-documentary`](.agents/skills/produce-resolve-documentary/SKILL.md)
+skill. Because episode workspaces and media are deliberately Git-ignored, use a
+checksum-verified bundle before Resolve assembly:
+
+```text
+uv run rabbithole resolve bundle projects/my-episode --out my-episode.bundle.zip
+uv run rabbithole resolve verify-bundle my-episode.bundle.zip
+uv run rabbithole resolve restore-bundle my-episode.bundle.zip --out projects/my-episode
+```
+
+Run `doctor`, `preflight`, and `prepare` again on the receiving machine. The
+bundle excludes credentials, stale locks/queues, generated Resolve builds, and
+prior renders. After Resolve assembly, use the source-inclusive DRA/DRP handoff
+instead:
+
+```text
+uv run rabbithole resolve verify-handoff <handoff.zip>
+uv run rabbithole resolve restore-handoff <handoff.zip> --out <restore-directory>
+```
+
+For a Mac mini used as the render host, clone this repository, run
+`bash scripts/bootstrap.sh`, restore the episode bundle, and then run:
+
+```text
+uv run rabbithole resolve doctor --mode <free|studio>
+uv run rabbithole resolve install-runner
+uv run rabbithole resolve preflight projects/my-episode --mode <free|studio>
+uv run rabbithole resolve prepare projects/my-episode
+uv run rabbithole resolve build projects/my-episode --mode <free|studio>
+uv run rabbithole resolve render projects/my-episode --mode <free|studio>
+```
+
+Resolve Free still requires its one-time Console Python version check and the
+in-app loader. Studio can use the automatically discovered external bridge.
+
 ## Local AI / MCP
 
 Install the optional MCP dependency and run the local stdio server:
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[mcp]"
-rabbithole-resolve-mcp
+```text
+uv sync --extra dev --extra mcp
+uv run rabbithole-resolve-mcp
 ```
 
 On Resolve Free, MCP tools compile and queue work, then return
@@ -135,6 +190,8 @@ another project, or delete an editor timeline.
 - [`style/`](style/) — palette, typography, sound map, and deterministic LUT
 - [`pipeline/crowley-hinglish.yaml`](pipeline/crowley-hinglish.yaml) — stage and
   checkpoint contract
+- [`.agents/skills/produce-resolve-documentary/`](.agents/skills/produce-resolve-documentary/SKILL.md)
+  — repository-local topic-to-Resolve operating skill
 - [`schemas/`](schemas/) — versioned machine contracts
 - [`examples/demo-project/`](examples/demo-project/) — fictional, generated
   fixture with no production media
@@ -143,8 +200,8 @@ another project, or delete an editor timeline.
 
 ## Tests
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest
+```text
+uv run pytest
 ```
 
 Tests use temporary synthetic media and fake Resolve API objects. They do not

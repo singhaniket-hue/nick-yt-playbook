@@ -26,7 +26,12 @@ class Config:
 
     @property
     def projects_dir(self) -> Path:
-        return REPO_ROOT / "projects"
+        configured = os.environ.get("RABBITHOLE_PROJECTS_DIR")
+        return (
+            Path(configured).expanduser().resolve()
+            if configured
+            else REPO_ROOT / "projects"
+        )
 
     @property
     def style_dir(self) -> Path:

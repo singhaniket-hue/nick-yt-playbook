@@ -10,8 +10,8 @@ $Venv = Join-Path $Root ".venv"
 
 if (-not (Test-Path -LiteralPath $Venv)) {
     if (Get-Command uv -ErrorAction SilentlyContinue) {
-        Write-Host "Creating .venv with Python 3.11 ..."
-        & uv venv --python 3.11 $Venv
+        Write-Host "Syncing the Python 3.11+ environment with uv ..."
+        & uv sync --extra dev --project $Root
     }
     else {
         Write-Host "Creating .venv with $Python ..."
@@ -35,5 +35,7 @@ if (-not (Test-Path -LiteralPath $EnvFile)) {
 }
 
 Write-Host "Bootstrap complete."
+Write-Host "No application was launched and no render queue was touched."
 Write-Host "Add ELEVENLABS_API_KEY and RABBITHOLE_VOICE_ID to .env."
 Write-Host "FFmpeg/FFprobe and a Chromium browser remain external prerequisites."
+Write-Host "Run: uv run rabbithole resolve doctor"

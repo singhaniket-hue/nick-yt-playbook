@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import importlib.util
 import os
 from pathlib import Path
 import shutil
-import sys
 from typing import Any, Mapping
 
 from .resolve_install import install_style_assets
@@ -19,6 +17,11 @@ from .resolve_runner import (
     run_pending_jobs,
 )
 from .resolve_safety import DEFAULT_LOCK_RELATIVE_PATH, is_path_within
+from .resolve_platform import (
+    find_resolve_application,
+    host_report,
+    resolve_scripting_module_available,
+)
 
 
 class ResolveServiceError(RuntimeError):
@@ -50,37 +53,108 @@ def _mode(value: str | None) -> str:
 
 
 def _resolve_installation() -> dict[str, Any]:
-    executable: Path | None = None
-    candidates: list[Path] = []
-    if sys.platform == "win32":
-        program_files = os.environ.get("ProgramFiles")
-        if program_files:
-            candidates.append(
-                Path(program_files)
-                / "Blackmagic Design"
-                / "DaVinci Resolve"
-                / "Resolve.exe"
-            )
-    elif sys.platform == "darwin":
-        candidates.append(
-            Path("/Applications/DaVinci Resolve/DaVinci Resolve.app")
-        )
-    else:
-        candidates.extend((Path("/opt/resolve/bin/resolve"), Path("/usr/bin/resolve")))
-    discovered = shutil.which("Resolve") or shutil.which("resolve")
-    if discovered:
-        candidates.insert(0, Path(discovered))
-    for candidate in candidates:
-        if candidate.exists():
-            executable = candidate.resolve()
-            break
-    module_available = importlib.util.find_spec("DaVinciResolveScript") is not None
+    host = host_report()
+    executable = find_resolve_application()
+    module_available = resolve_scripting_module_available()
     return {
         "installed": executable is not None,
         "executable": os.fspath(executable) if executable else None,
         "scripting_module_available": module_available,
-        "script_api": os.environ.get("RESOLVE_SCRIPT_API"),
-        "script_library": os.environ.get("RESOLVE_SCRIPT_LIB"),
+        "script_api": os.environ.get("RESOLVE_SCRIPT_API")
+        or host["resolve_script_api"],
+        "script_library": os.environ.get("RESOLVE_SCRIPT_LIB")
+        or host["resolve_script_library"],
+        "script_module": host["resolve_script_module"],
+    }
+
+
+def portability_report(*, mode: str = "free") -> dict[str, Any]:
+    """Report host prerequisites without opening Resolve or touching a project."""
+
+    selected_mode = _mode(mode)
+    host = host_report()
+    tools = {
+        name: shutil.which(name)
+        for name in ("ffmpeg", "ffprobe", "pdftoppm", "yt-dlp")
+    }
+    try:
+        from .sources.capture import find_browser
+
+        browser = find_browser()
+    except Exception:
+        browser = None
+    checks = [
+        {
+            "name": "host_python",
+            "ok": bool(host["python_ok"]),
+            "severity": "error",
+            "detail": {
+                "version": host["python"],
+                "minimum": "3.11",
+                "executable": host["python_executable"],
+            },
+        },
+        {
+            "name": "davinci_resolve",
+            "ok": bool(host["resolve_installed"]),
+            "severity": "error",
+            "detail": host["resolve_application"],
+        },
+    ]
+    checks.extend(
+        {
+            "name": name,
+            "ok": tools[name] is not None,
+            "severity": "error" if name in {"ffmpeg", "ffprobe"} else "warning",
+            "detail": tools[name],
+        }
+        for name in tools
+    )
+    checks.append(
+        {
+            "name": "chromium_browser",
+            "ok": browser is not None,
+            "severity": "warning",
+            "detail": os.fspath(browser) if browser else None,
+        }
+    )
+    if selected_mode == "studio":
+        checks.append(
+            {
+                "name": "studio_external_bridge",
+                "ok": bool(host["resolve_script_module_available"]),
+                "severity": "error",
+                "detail": {
+                    "module": host["resolve_script_module"],
+                    "api": host["resolve_script_api"],
+                    "library": host["resolve_script_library"],
+                },
+            }
+        )
+    else:
+        checks.append(
+            {
+                "name": "free_console_python",
+                "ok": False,
+                "severity": "warning",
+                "detail": (
+                    "Open Workspace > Console and run `import sys; "
+                    "print(sys.version)`. The checked-in runner requires 3.11+."
+                ),
+            }
+        )
+    return {
+        "ok": all(
+            item["ok"] or item["severity"] != "error" for item in checks
+        ),
+        "mode": selected_mode,
+        "host": host,
+        "checks": checks,
+        "safe": {
+            "resolve_started": False,
+            "render_queue_touched": False,
+            "project_mutated": False,
+        },
     }
 
 
@@ -345,6 +419,7 @@ __all__ = [
     "install_resolve_integration",
     "preflight_project",
     "prepare_project",
+    "portability_report",
     "project_status",
     "queue_project_action",
 ]

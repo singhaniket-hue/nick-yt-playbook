@@ -42,6 +42,10 @@ from .resolve_safety import (
     require_write_path,
     utc_now,
 )
+from .resolve_platform import (
+    configure_resolve_scripting_environment,
+    resolve_runner_install_directory,
+)
 from .resolve_style import (
     ResolveStyleError,
     apply_style_to_new_timeline,
@@ -628,6 +632,7 @@ def _default_studio_external_adapter() -> Any:
     This function is never reached unless ``allow_studio_external=True``.
     """
 
+    configure_resolve_scripting_environment()
     try:
         module = importlib.import_module("DaVinciResolveScript")
     except ImportError as exc:
@@ -2348,38 +2353,7 @@ def run_pending_jobs(
 
 
 def _default_runner_install_directory() -> Path:
-    if sys.platform == "win32":
-        appdata = os.environ.get("APPDATA")
-        base = _canonical(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-        return (
-            base
-            / "Blackmagic Design"
-            / "DaVinci Resolve"
-            / "Support"
-            / "Fusion"
-            / "Scripts"
-            / "Utility"
-        )
-    if sys.platform == "darwin":
-        return (
-            Path.home()
-            / "Library"
-            / "Application Support"
-            / "Blackmagic Design"
-            / "DaVinci Resolve"
-            / "Fusion"
-            / "Scripts"
-            / "Utility"
-        )
-    return (
-        Path.home()
-        / ".local"
-        / "share"
-        / "DaVinciResolve"
-        / "Fusion"
-        / "Scripts"
-        / "Utility"
-    )
+    return resolve_runner_install_directory().resolve(strict=False)
 
 
 def install_runner(

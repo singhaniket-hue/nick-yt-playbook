@@ -97,14 +97,12 @@ deviations_from_documentary_montage:
       orchestration.mode: executive-producer, routing every stage through an
       LLM-agent "director" skill (pipelines/documentary-montage/*-director).
     crowley_hinglish: >
-      Plain, deterministic Python. Every stage below is a `rabbithole
-      <subcommand>` CLI invocation (rabbithole/cli.py); there are no
-      pipeline/skills/*-director skills in this repo, and none are planned
-      for the stages that already have working deterministic implementations
-      (validation gates, EDL construction, rendering). This is a pipeline
-      definition in the documentary-montage sense of "declares stages and
-      artifacts," not in the sense of "is executable by engine/'s
-      orchestrator."
+      Deterministic Python owns every stage below through a `rabbithole
+      <subcommand>` CLI invocation (rabbithole/cli.py). The repository-local
+      `.agents/skills/produce-resolve-documentary` skill guides an agent through
+      topic research, approvals, host setup, the deterministic commands, and
+      cross-machine transfer; it does not replace validation gates, EDL
+      construction, queue safety, or rendering with an opaque director.
 
 # -----------------------------------------------------------------------------
 # Checkpoint / approval policy (design spec section 8.1).
@@ -119,8 +117,8 @@ checkpoint_policy:
     - script
     - assets
     - edl
-  auto_approve_at:
     - render
+  auto_approve_at: []
   note: >
     narrate, timing, and slots have no checkpoint of their own -- once script
     is approved, narration, the timing spine, and the derived slot plan are
@@ -146,7 +144,7 @@ orchestration:
 extensions:
   custom_scripts: true
   custom_playbooks: false
-  custom_skills: false
+  custom_skills: true
   custom_tools: false
 
 # -----------------------------------------------------------------------------

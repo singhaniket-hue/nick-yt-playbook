@@ -50,6 +50,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -72,21 +73,36 @@ DEFAULT_SETTLE_MS = 2500
 # is available to an ordinary browser and to the HTTP source probe.  A normal
 # desktop UA keeps the visual capture and the source-text QA on the same public
 # page; it does not bypass authentication, cookies, or a paywall.
+_CAPTURE_PLATFORM_TOKEN = (
+    "Macintosh; Intel Mac OS X 10_15_7"
+    if sys.platform == "darwin"
+    else (
+        "X11; Linux x86_64"
+        if sys.platform.startswith("linux")
+        else "Windows NT 10.0; Win64; x64"
+    )
+)
 CAPTURE_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    f"Mozilla/5.0 ({_CAPTURE_PLATFORM_TOKEN}) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/138.0.0.0 Safari/537.36"
 )
 
-# Where a browser lives on a normal Windows install. Checked in order; Edge is
-# listed too because it is present on every Windows machine even when Chrome is
-# not.
+# Common native browser locations on Windows and macOS.  Nonexistent paths are
+# harmless; the explicit environment override and PATH lookup run as well.
 BROWSER_CANDIDATES = (
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "~/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "~/Applications/Chromium.app/Contents/MacOS/Chromium",
 )
+BROWSER_PATH_ENV = "RABBITHOLE_BROWSER_PATH"
 
 ARCHIVE_HOSTS = ("web.archive.org", "archive.org/web", "archive.ph", "archive.today",
                  "perma.cc", "webcitation.org")
@@ -129,13 +145,32 @@ def _default_transport(url: str) -> tuple[int, bytes]:
     return response.status_code, response.content
 
 
-def find_browser(candidates: tuple[str, ...] = BROWSER_CANDIDATES) -> Path | None:
+def find_browser(candidates: tuple[str, ...] | None = None) -> Path | None:
     """The first installed browser that can take a headless screenshot."""
-    for candidate in candidates:
-        path = Path(candidate)
+    selected = list(candidates if candidates is not None else BROWSER_CANDIDATES)
+    override = os.environ.get(BROWSER_PATH_ENV)
+    if override:
+        selected.insert(0, override)
+    for candidate in selected:
+        path = Path(candidate).expanduser()
         if path.exists():
             return path
-    found = shutil.which("chrome") or shutil.which("msedge") or shutil.which("chromium")
+    found = next(
+        (
+            value
+            for name in (
+                "google-chrome",
+                "google-chrome-stable",
+                "chrome",
+                "msedge",
+                "microsoft-edge",
+                "chromium",
+                "chromium-browser",
+            )
+            if (value := shutil.which(name))
+        ),
+        None,
+    )
     return Path(found) if found else None
 
 

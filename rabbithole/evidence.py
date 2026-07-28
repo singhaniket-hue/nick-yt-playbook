@@ -52,6 +52,17 @@ class EvidenceBuild:
 def _font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     candidates = (
         Path(r"C:\Windows\Fonts\arialbd.ttf" if bold else r"C:\Windows\Fonts\arial.ttf"),
+        Path(
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+            if bold
+            else "/System/Library/Fonts/Supplemental/Arial.ttf"
+        ),
+        Path(
+            "/Library/Fonts/Arial Bold.ttf"
+            if bold
+            else "/Library/Fonts/Arial.ttf"
+        ),
+        Path("/System/Library/Fonts/Helvetica.ttc"),
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
              if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
     )

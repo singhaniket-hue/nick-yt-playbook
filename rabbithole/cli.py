@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import re
 import subprocess
 import sys
@@ -75,6 +76,18 @@ from rabbithole.validate import (
 def _claims_for(script_path: Path) -> list[dict]:
     """Locate claims.json for a script at projects/<slug>/script/<file>.md."""
     return load_claims(script_path.parent.parent / "claims.json")
+
+
+def _portable_asset_record(record: AssetRecord, project_root: Path) -> AssetRecord:
+    """Store media under an episode as project-relative POSIX paths."""
+
+    raw = Path(record.local_path).expanduser()
+    resolved = raw.resolve() if raw.is_absolute() else (Path.cwd() / raw).resolve()
+    try:
+        local_path = resolved.relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        local_path = record.local_path.replace("\\", "/")
+    return dataclasses.replace(record, local_path=local_path)
 
 
 def _quality_mode(args: argparse.Namespace) -> str:
@@ -342,7 +355,7 @@ def cmd_bind(args: argparse.Namespace) -> int:
 
     fields = archives.to_record_fields(hit, f"archival-{args.slots[0]}", out_path)
     fields["used_in_slots"] = tuple(args.slots)
-    record = AssetRecord(**fields)
+    record = _portable_asset_record(AssetRecord(**fields), project_root)
 
     records = load_provenance(project_root / "provenance.json")
     records = [r for r in records if r.asset_id != record.asset_id]
@@ -356,7 +369,15 @@ def cmd_bind(args: argparse.Namespace) -> int:
 
 
 def cmd_new(args: argparse.Namespace) -> int:
-    root = new_project(REPO_ROOT / "projects", args.slug)
+    configured = getattr(args, "projects_dir", None) or os.environ.get(
+        "RABBITHOLE_PROJECTS_DIR"
+    )
+    projects_dir = (
+        Path(configured).expanduser().resolve()
+        if configured
+        else REPO_ROOT / "projects"
+    )
+    root = new_project(projects_dir, args.slug)
     print(f"Created {root}")
     return 0
 
@@ -479,6 +500,9 @@ def cmd_assets(args: argparse.Namespace) -> int:
         palette=read_json(REPO_ROOT / "style" / "palette.json"),
         quality=quality,
     )
+    new_records = [
+        _portable_asset_record(record, project_root) for record in new_records
+    ]
     if exec_findings:
         print()
         print(format_report(exec_findings))
@@ -1168,6 +1192,13 @@ def main(argv: list[str] | None = None) -> int:
 
     new = sub.add_parser("new", help="Scaffold a new episode project")
     new.add_argument("slug", help="Episode slug, e.g. aviloop-hindi")
+    new.add_argument(
+        "--projects-dir",
+        help=(
+            "Project workspace root (default: RABBITHOLE_PROJECTS_DIR or "
+            "<checkout>/projects)"
+        ),
+    )
     new.set_defaults(func=cmd_new)
 
     assets = sub.add_parser("assets", help="Plan and source visual assets for a slot plan")

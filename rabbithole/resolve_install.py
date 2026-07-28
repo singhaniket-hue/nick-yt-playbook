@@ -7,8 +7,9 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
-import sys
 from typing import Iterable
+
+from .resolve_platform import user_resolve_support_root as _platform_support_root
 
 
 class ResolveInstallError(RuntimeError):
@@ -20,24 +21,7 @@ def repository_root() -> Path:
 
 
 def user_resolve_support_root() -> Path:
-    if sys.platform == "win32":
-        appdata = os.environ.get("APPDATA")
-        base = Path(appdata).resolve() if appdata else Path.home() / "AppData" / "Roaming"
-        return (
-            base
-            / "Blackmagic Design"
-            / "DaVinci Resolve"
-            / "Support"
-        )
-    if sys.platform == "darwin":
-        return (
-            Path.home()
-            / "Library"
-            / "Application Support"
-            / "Blackmagic Design"
-            / "DaVinci Resolve"
-        )
-    return Path.home() / ".local" / "share" / "DaVinciResolve"
+    return _platform_support_root().resolve(strict=False)
 
 
 def _sha256(path: Path) -> str:

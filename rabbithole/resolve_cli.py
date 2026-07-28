@@ -10,10 +10,17 @@ from typing import Any, Callable
 
 from .resolve_service import (
     install_resolve_integration,
+    portability_report,
     preflight_project,
     prepare_project,
     project_status,
     queue_project_action,
+)
+from .resolve_handoff import restore_handoff, validate_handoff
+from .episode_bundle import (
+    package_episode,
+    restore_episode_bundle,
+    validate_episode_bundle,
 )
 
 
@@ -125,12 +132,50 @@ def cmd_resolve_status(args: argparse.Namespace) -> int:
     return 1 if result.get("state") == "failed" else 0
 
 
+def cmd_resolve_doctor(args: argparse.Namespace) -> int:
+    result = portability_report(mode=args.mode)
+    _print(result)
+    return 0 if result["ok"] else 1
+
+
+def cmd_resolve_verify_handoff(args: argparse.Namespace) -> int:
+    return _guard(lambda: validate_handoff(args.package))
+
+
+def cmd_resolve_restore_handoff(args: argparse.Namespace) -> int:
+    return _guard(lambda: restore_handoff(args.package, args.out))
+
+
+def cmd_resolve_bundle(args: argparse.Namespace) -> int:
+    return _guard(lambda: package_episode(args.project_root, args.out))
+
+
+def cmd_resolve_verify_bundle(args: argparse.Namespace) -> int:
+    return _guard(lambda: validate_episode_bundle(args.package))
+
+
+def cmd_resolve_restore_bundle(args: argparse.Namespace) -> int:
+    return _guard(lambda: restore_episode_bundle(args.package, args.out))
+
+
 def add_resolve_parser(subparsers: Any) -> argparse.ArgumentParser:
     resolve = subparsers.add_parser(
         "resolve",
         help="Compile, build, render, and hand off editable DaVinci Resolve projects",
     )
     actions = resolve.add_subparsers(dest="resolve_command", required=True)
+
+    doctor = actions.add_parser(
+        "doctor",
+        help="Inspect portable host prerequisites without opening Resolve",
+    )
+    doctor.add_argument(
+        "--mode",
+        choices=("free", "studio"),
+        default="free",
+        help="Check Free in-app or Studio external scripting prerequisites",
+    )
+    doctor.set_defaults(func=cmd_resolve_doctor)
 
     def project_command(name: str, help_text: str) -> argparse.ArgumentParser:
         command = actions.add_parser(name, help=help_text)
@@ -189,6 +234,44 @@ def add_resolve_parser(subparsers: Any) -> argparse.ArgumentParser:
     status = actions.add_parser("status", help="Read durable Resolve queue/status state")
     status.add_argument("project_root")
     status.set_defaults(func=cmd_resolve_status)
+
+    bundle = actions.add_parser(
+        "bundle",
+        help="Package an in-progress episode for another Windows/macOS host",
+    )
+    bundle.add_argument("project_root")
+    bundle.add_argument("--out", required=True, help="New .zip path outside the episode")
+    bundle.set_defaults(func=cmd_resolve_bundle)
+
+    verify_bundle = actions.add_parser(
+        "verify-bundle",
+        help="Verify a portable pre-Resolve episode bundle",
+    )
+    verify_bundle.add_argument("package")
+    verify_bundle.set_defaults(func=cmd_resolve_verify_bundle)
+
+    restore_bundle = actions.add_parser(
+        "restore-bundle",
+        help="Restore a verified episode bundle into a new project directory",
+    )
+    restore_bundle.add_argument("package")
+    restore_bundle.add_argument("--out", required=True)
+    restore_bundle.set_defaults(func=cmd_resolve_restore_bundle)
+
+    verify_handoff = actions.add_parser(
+        "verify-handoff",
+        help="Verify a portable handoff ZIP/directory and all checksums",
+    )
+    verify_handoff.add_argument("package")
+    verify_handoff.set_defaults(func=cmd_resolve_verify_handoff)
+
+    restore_handoff_parser = actions.add_parser(
+        "restore-handoff",
+        help="Safely extract/copy and verify a portable handoff",
+    )
+    restore_handoff_parser.add_argument("package")
+    restore_handoff_parser.add_argument("--out", required=True)
+    restore_handoff_parser.set_defaults(func=cmd_resolve_restore_handoff)
 
     install = actions.add_parser(
         "install-runner",

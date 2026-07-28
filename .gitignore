@@ -65,6 +65,8 @@ handoffs/
 *.drp
 *.drt
 *.dpx
+*.bundle.zip
+.rabbithole-bundle/
 checksums.sha256
 
 # Editor and operating-system noise

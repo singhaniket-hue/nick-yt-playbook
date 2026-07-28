@@ -705,12 +705,18 @@ def _validate_plan(plan: Mapping[str, Any]) -> None:
 
 
 def _media_uri(path: str, project_root: Path | None) -> str:
+    portable = path.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:/", portable):
+        return "file:///" + quote(portable, safe="/:._~-")
+    if portable.startswith("//"):
+        return "file:" + quote(portable, safe="/:._~-")
+    if portable.startswith("/"):
+        return "file://" + quote(portable, safe="/:._~-")
     candidate = Path(path)
     if project_root is not None and not candidate.is_absolute():
         candidate = (project_root / candidate).resolve()
     if candidate.is_absolute():
         return candidate.as_uri()
-    portable = path.replace("\\", "/")
     return "file:./" + quote(portable, safe="/:._~-")
 
 

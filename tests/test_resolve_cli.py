@@ -26,3 +26,48 @@ def test_general_render_defaults_to_ffmpeg_until_resolve_pilot_passes(
     result = cli.main(["render", str(tmp_path / "timing.json"), "--dry-run"])
     assert result == 7
     assert observed["backend"] == "ffmpeg"
+
+
+def test_resolve_doctor_reports_without_opening_resolve(monkeypatch, capsys):
+    monkeypatch.setattr(
+        resolve_cli,
+        "portability_report",
+        lambda *, mode: {
+            "ok": True,
+            "mode": mode,
+            "safe": {
+                "resolve_started": False,
+                "render_queue_touched": False,
+                "project_mutated": False,
+            },
+        },
+    )
+
+    result = cli.main(["resolve", "doctor", "--mode", "studio"])
+
+    assert result == 0
+    output = capsys.readouterr().out
+    assert '"mode": "studio"' in output
+    assert '"resolve_started": false' in output
+
+
+def test_resolve_bundle_command_delegates_to_portable_packager(
+    tmp_path, monkeypatch, capsys
+):
+    observed = {}
+
+    def fake_package(project_root, output):
+        observed.update(project_root=project_root, output=output)
+        return {"valid": True, "bundle_path": str(output)}
+
+    monkeypatch.setattr(resolve_cli, "package_episode", fake_package)
+    project = tmp_path / "episode"
+    output = tmp_path / "episode.zip"
+
+    result = cli.main(
+        ["resolve", "bundle", str(project), "--out", str(output)]
+    )
+
+    assert result == 0
+    assert observed == {"project_root": str(project), "output": str(output)}
+    assert '"valid": true' in capsys.readouterr().out

@@ -8,7 +8,7 @@
         "mcp",
         "rabbithole-resolve-mcp"
       ],
-      "cwd": "C:/path/to/nick-yt-playbook"
+      "cwd": "/absolute/path/to/nick-yt-playbook"
     }
   }
 }

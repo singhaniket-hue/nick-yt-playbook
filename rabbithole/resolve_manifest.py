@@ -1704,6 +1704,16 @@ def _path_for_plan(path: str | Path, root: Path) -> tuple[str, str]:
     raw = str(path)
     if not raw:
         return "", "missing"
+    portable_raw = _portable_string(raw)
+    native_absolute = Path(raw).is_absolute()
+    windows_absolute = bool(re.match(r"^[A-Za-z]:/", portable_raw))
+    posix_absolute = portable_raw.startswith("/") and not portable_raw.startswith("//")
+    foreign_absolute = (
+        (windows_absolute and os.name != "nt")
+        or (posix_absolute and os.name == "nt")
+    )
+    if foreign_absolute or (portable_raw.startswith("//") and not native_absolute):
+        return portable_raw, "external-absolute"
     legacy = _legacy_project_path(raw, root)
     if legacy is not None:
         _, portable = legacy
@@ -1727,6 +1737,13 @@ def _path_for_plan(path: str | Path, root: Path) -> tuple[str, str]:
 def _resolve_media_path(path: str, root: Path) -> Path | None:
     if not path:
         return None
+    portable = _portable_string(path)
+    if (
+        bool(re.match(r"^[A-Za-z]:/", portable)) and os.name != "nt"
+    ) or (
+        portable.startswith("/") and os.name == "nt"
+    ):
+        return None
     legacy = _legacy_project_path(path, root)
     if legacy is not None:
         return legacy[0]
@@ -1737,7 +1754,7 @@ def _resolve_media_path(path: str, root: Path) -> Path | None:
 def _legacy_project_path(path: str, root: Path) -> tuple[Path, str] | None:
     """Rebase old repo-relative ``projects/<slug>/...`` provenance entries."""
 
-    if Path(path).is_absolute():
+    if _looks_absolute_portable(path):
         return None
     parts = PurePosixPath(path.replace("\\", "/")).parts
     if len(parts) < 3 or parts[0] != "projects" or parts[1] != root.name:
@@ -1763,7 +1780,12 @@ def _portable_string(value: str) -> str:
 
 
 def _looks_absolute_portable(value: str) -> bool:
-    return value.startswith("/") or bool(re.match(r"^[A-Za-z]:/", value))
+    normalized = value.replace("\\", "/")
+    return (
+        normalized.startswith("/")
+        or normalized.startswith("//")
+        or bool(re.match(r"^[A-Za-z]:/", normalized))
+    )
 
 
 def _binding_token(value: str) -> str:

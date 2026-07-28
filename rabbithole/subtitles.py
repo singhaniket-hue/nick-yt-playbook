@@ -10,8 +10,12 @@ sentence boundary reads as wrong even when it technically fits.
 
 from __future__ import annotations
 
+from functools import lru_cache
+import os
 import re
+import shutil
 import subprocess
+import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -187,7 +191,13 @@ def group_cues(
 # `pick_font`'s docstring). Confirmed empirically on this Windows machine
 # (see `_installed_font_families`): "Nirmala UI" is installed via
 # Nirmala.ttc, "Noto Sans Devanagari" and "Mangal" are not.
-DEVANAGARI_FONT_CANDIDATES = ("Nirmala UI", "Noto Sans Devanagari", "Mangal")
+DEVANAGARI_FONT_CANDIDATES = (
+    "Noto Sans Devanagari",
+    "Nirmala UI",
+    "Kohinoor Devanagari",
+    "Devanagari Sangam MN",
+    "Mangal",
+)
 
 # Subtitle geometry, as a fraction of the frame so it scales with any
 # width/height `build_ass` is given rather than being pinned to 1920x1080.
@@ -209,26 +219,12 @@ _SHADOW_RE = re.compile(
 )
 
 
-def _installed_font_families() -> set[str]:
-    """Font family names registered on this Windows machine.
+def _windows_font_families() -> set[str]:
+    """Read the Windows font registry when it is available."""
 
-    Reads `HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts`,
-    the registry key Windows itself populates on font install -- the same
-    source Explorer's Fonts folder and GDI font enumeration draw from. This
-    was chosen over `fc-list` because `fc-list` is not on PATH on this
-    machine (checked directly: `where fc-list` finds nothing).
-
-    A single TrueType Collection registers every family it contains under
-    one value name, joined by " & ", with a trailing parenthetical like
-    "(TrueType)" -- confirmed empirically: `Nirmala.ttc` registers as
-    "Nirmala UI & Nirmala UI Bold & Nirmala UI Semilight & Nirmala Text & "
-    "Nirmala Text Bold & Nirmala Text Semilight (TrueType)". Each of those
-    six names is split out and stripped so `pick_font` can match "Nirmala
-    UI" directly.
-    """
     try:
         import winreg
-    except ImportError:  # pragma: no cover - Windows-only module
+    except ImportError:
         return set()
 
     families: set[str] = set()
@@ -252,6 +248,94 @@ def _installed_font_families() -> set[str]:
                 part = part.strip()
                 if part:
                     families.add(part)
+    return families
+
+
+def _font_directories() -> tuple[Path, ...]:
+    """Return native per-user/system font roots for the current host."""
+
+    if sys.platform == "win32":
+        windows = Path(os.environ.get("WINDIR", r"C:\Windows"))
+        return (windows / "Fonts",)
+    if sys.platform == "darwin":
+        return (
+            Path.home() / "Library" / "Fonts",
+            Path("/Library/Fonts"),
+            Path("/System/Library/Fonts"),
+            Path("/System/Library/Fonts/Supplemental"),
+        )
+    return (
+        Path.home() / ".local" / "share" / "fonts",
+        Path.home() / ".fonts",
+        Path("/usr/local/share/fonts"),
+        Path("/usr/share/fonts"),
+    )
+
+
+def _font_file_families(path: Path) -> set[str]:
+    """Read family names from a TTF/OTF/TTC through Pillow's FreeType bridge."""
+
+    try:
+        from PIL import ImageFont
+    except ImportError:
+        return set()
+
+    families: set[str] = set()
+    # Collections may contain several families.  Ordinary TTF/OTF files stop
+    # after index zero; a conservative cap prevents malformed files looping.
+    for index in range(16):
+        try:
+            face = ImageFont.truetype(str(path), size=12, index=index)
+        except (OSError, ValueError):
+            break
+        try:
+            family, _style = face.getname()
+        except Exception:
+            family = ""
+        if family:
+            families.add(str(family).strip())
+        if path.suffix.lower() != ".ttc":
+            break
+    return families
+
+
+@lru_cache(maxsize=1)
+def _installed_font_families() -> set[str]:
+    """Discover font families on Windows, macOS, and Linux.
+
+    Prefer the native Windows registry or Fontconfig.  macOS does not ship
+    ``fc-list`` by default, so fall back to reading its standard font folders
+    with Pillow.  The result is cached because a full system-font scan is
+    stable for the duration of one render command.
+    """
+
+    families = _windows_font_families()
+    fc_list = shutil.which("fc-list")
+    if fc_list:
+        result = subprocess.run(
+            [fc_list, "--format=%{family}\n"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                for family in line.split(","):
+                    cleaned = family.strip()
+                    if cleaned:
+                        families.add(cleaned)
+
+    suffixes = {".ttf", ".otf", ".ttc"}
+    for directory in _font_directories():
+        if not directory.is_dir():
+            continue
+        try:
+            files = directory.rglob("*")
+            for path in files:
+                if path.is_file() and path.suffix.lower() in suffixes:
+                    families.update(_font_file_families(path))
+        except OSError:
+            continue
     return families
 
 

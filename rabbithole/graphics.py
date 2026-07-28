@@ -75,6 +75,8 @@ TITLE_FONT_CANDIDATES = (
     "Bebas Neue",
     "Anton",
     "Oswald",
+    "Avenir Next Condensed",
+    "Helvetica Neue",
     "Bahnschrift",
     "Impact",
     "Arial Black",

@@ -20,8 +20,12 @@ makes rebuilds reproducible and editor handoffs auditable.
 
 ## Prerequisites
 
+- Windows 10/11 x64, or macOS 12+ on Intel/Apple silicon hardware
+  supported by Resolve
 - Python 3.11 or newer
 - FFmpeg and ffprobe on `PATH` for media preparation and the legacy backend
+- Poppler's `pdftoppm` for PDF evidence and Chrome/Edge/Chromium for browser
+  capture
 - DaVinci Resolve 21 or newer; the implementation targets its installed
   scripting documentation, while the local live-application pilot remains a
   release gate
@@ -30,10 +34,16 @@ makes rebuilds reproducible and editor handoffs auditable.
 
 Install the Python project:
 
-```powershell
+```text
 uv sync
+uv run rabbithole resolve doctor --mode free
 uv run rabbithole --help
 ```
+
+Use `scripts/bootstrap.ps1` on Windows or `scripts/bootstrap.sh` on macOS.
+`doctor` is read-only: it does not launch Resolve, open a project, or touch the
+render queue. Set `RABBITHOLE_RESOLVE_PATH` or `RABBITHOLE_BROWSER_PATH` only
+for a nonstandard application location.
 
 ## Project contract
 
@@ -64,7 +74,7 @@ not expose the external scripting connection used by an MCP server or a normal
 terminal process. The normal Free workflow is therefore prepare outside Resolve,
 execute inside Resolve:
 
-```powershell
+```text
 uv run rabbithole resolve preflight projects/<slug>
 uv run rabbithole resolve prepare projects/<slug>
 uv run rabbithole resolve build projects/<slug>
@@ -78,14 +88,14 @@ checkout. In Resolve:
    press Enter.
 3. Alternatively, install the menu runner once:
 
-   ```powershell
+   ```text
    uv run rabbithole resolve install-runner
    ```
 
    Restart Resolve, then run `Workspace > Scripts > Utility > RabbitHole Runner`.
 4. Inspect the result:
 
-   ```powershell
+   ```text
    uv run rabbithole resolve status projects/<slug>
    ```
 
@@ -111,14 +121,18 @@ Resolve Studio's external bridge from Python 3.11+.
 
 Studio can run the same queue through the external scripting bridge:
 
-```powershell
+```text
 uv run rabbithole resolve build projects/<slug> --mode studio
 uv run rabbithole resolve status projects/<slug>
 ```
 
 External mode is explicitly gated. Selecting it on a Free installation produces
 an actionable error instead of silently falling back or attempting unsupported
-network control.
+network control. On a standard Windows or macOS installation, RabbitHole
+discovers Resolve's official `Developer/Scripting/Modules` directory and
+`fusionscript` library automatically. Existing `RESOLVE_SCRIPT_API`,
+`RESOLVE_SCRIPT_LIB`, and `RABBITHOLE_RESOLVE_PATH` overrides remain
+authoritative.
 
 ## Generated timeline
 
@@ -167,7 +181,7 @@ Automation never mutates a timeline whose name starts with `EDITORIAL_`.
 
 After reviewing the generated timeline:
 
-```powershell
+```text
 uv run rabbithole resolve render projects/<slug>
 ```
 
@@ -177,7 +191,7 @@ it externally. The generated plan selects single-clip MP4/H.264, 1080p30,
 Deliver-page format was last used. The general render command also exposes the
 explicit backend:
 
-```powershell
+```text
 uv run rabbithole render projects/<slug>/narration/timing.json --backend resolve
 uv run rabbithole render projects/<slug>/narration/timing.json --backend ffmpeg
 ```
@@ -223,12 +237,36 @@ runner only adds a new immutable generated timeline to it. If no project is
 open, it may create a uniquely named RabbitHole project. It never switches away
 from a user's open project.
 
+## Move an unfinished episode to another machine
+
+Git transfers the application, tests, reusable Resolve assets, and the
+repository-local production skill. It intentionally does not transfer
+`projects/<slug>` or its media. Before Resolve assembly, create a portable
+episode bundle outside the project root:
+
+```text
+uv run rabbithole resolve bundle projects/<slug> --out <episode.bundle.zip>
+uv run rabbithole resolve verify-bundle <episode.bundle.zip>
+uv run rabbithole resolve restore-bundle <episode.bundle.zip> --out <new-project-root>
+```
+
+The bundle preserves the project-relative tree and verifies every file with
+SHA-256. It refuses absolute/escaping media paths, symlinks, missing referenced
+media, case-colliding names, unsafe ZIP members, and overwrites. It excludes
+`.env` files, credentials, caches, prior renders/handoffs, stale locks/queues,
+and generated Resolve builds.
+
+On the receiving Windows or macOS host, recreate `.env` locally and run
+`resolve doctor`, `resolve preflight`, and `resolve prepare` again. Recompiling
+the plan/FCPXML on that machine is mandatory; do not transfer or execute the old
+queue state.
+
 ## Editor handoff
 
 Create a source-inclusive handoff:
 
-```powershell
-uv run rabbithole resolve handoff projects/<slug> --out D:\handoffs
+```text
+uv run rabbithole resolve handoff projects/<slug> --out <handoff-directory>
 ```
 
 The handoff job asks Resolve to create:
@@ -260,8 +298,9 @@ On the editor's machine:
    the restored archive and relink to the media copied by Resolve during restore.
 4. Install only the bundled fonts/templates whose licence notes permit it.
 5. Duplicate `AUTO_BUILD_<hash>` to `EDITORIAL_v1` before changing the cut.
-6. Verify `checksums.sha256` with the platform's SHA-256 tool if any file appears
-   missing.
+6. Run `uv run rabbithole resolve verify-handoff <handoff.zip>` before restore,
+   or `restore-handoff <handoff.zip> --out <directory>` to extract and verify in
+   one operation.
 
 ## Queue states
 

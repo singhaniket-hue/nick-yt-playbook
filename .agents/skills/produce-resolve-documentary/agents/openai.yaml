@@ -1,0 +1,4 @@
+interface:
+  display_name: "Produce Resolve Documentary"
+  short_description: "Topic-to-Resolve documentary workflow"
+  default_prompt: "Use $produce-resolve-documentary to turn my topic into a reviewed, portable DaVinci Resolve documentary."

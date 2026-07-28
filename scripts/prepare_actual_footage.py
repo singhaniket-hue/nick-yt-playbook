@@ -33,7 +33,46 @@ from rabbithole.slots import Slot, build_slots
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_FONT = Path("C:/Windows/Fonts/arialbd.ttf")
+FONT_CANDIDATES = (
+    Path("C:/Windows/Fonts/arialbd.ttf"),
+    Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+    Path("/Library/Fonts/Arial Bold.ttf"),
+    Path("/System/Library/Fonts/Helvetica.ttc"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+)
+
+
+def find_font(explicit: Path | None = None) -> Path:
+    candidates = (explicit.expanduser(),) if explicit else FONT_CANDIDATES
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    requested = f" at {explicit}" if explicit else ""
+    raise FileNotFoundError(
+        "No FFmpeg drawtext font was found"
+        + requested
+        + ". Supply --font with a licensed TTF/OTF/TTC file."
+    )
+
+
+def resolve_project_path(project_root: Path, value: str) -> Path:
+    """Resolve new project-relative paths with a legacy repo-relative fallback."""
+
+    candidate = Path(value).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+    portable = (project_root / candidate).resolve()
+    if portable.exists():
+        return portable
+    return (REPO_ROOT / candidate).resolve()
+
+
+def portable_project_path(project_root: Path, path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        return resolved.as_posix()
 
 
 def read_json(path: Path) -> dict:
@@ -156,6 +195,7 @@ def build_filter(
     caption_file: Path | None,
     glitch_intro: bool,
     evidence_overlay: bool,
+    font_path: Path,
 ) -> str:
     chains = [
         (
@@ -208,14 +248,14 @@ def build_filter(
     label_path = ffmpeg_filter_path(label_file)
     finishing = current + (
         "drawbox=x=48:y=963:w=1060:h=72:color=black@0.72:t=fill"
-        f",drawtext=fontfile='{ffmpeg_filter_path(DEFAULT_FONT)}':"
+        f",drawtext=fontfile='{ffmpeg_filter_path(font_path)}':"
         f"textfile='{label_path}':fontcolor=white:fontsize=28:"
         "x=70:y=983:borderw=1:bordercolor=black"
     )
     if caption_file is not None:
         caption_path = ffmpeg_filter_path(caption_file)
         finishing += (
-            f",drawtext=fontfile='{ffmpeg_filter_path(DEFAULT_FONT)}':"
+            f",drawtext=fontfile='{ffmpeg_filter_path(font_path)}':"
             f"textfile='{caption_path}':fontcolor=white:fontsize=40:"
             "x=(w-text_w)/2:y=76:box=1:boxcolor=black@0.80:"
             "boxborderw=20:borderw=1:bordercolor=black"
@@ -234,8 +274,9 @@ def build_asset(
     source: dict,
     assignment: dict,
     force: bool,
+    font_path: Path,
 ) -> Path:
-    raw_path = REPO_ROOT / source["raw_path"]
+    raw_path = resolve_project_path(project_root, str(source["raw_path"]))
     if not raw_path.exists():
         raise FileNotFoundError(f"{source_key}: missing raw file {raw_path}")
 
@@ -263,6 +304,7 @@ def build_asset(
         caption_file=caption_file,
         glitch_intro=bool(assignment.get("glitch_intro")),
         evidence_overlay=bool(assignment.get("evidence_overlay")),
+        font_path=font_path,
     )
     inputs = [
         "ffmpeg",
@@ -274,7 +316,7 @@ def build_asset(
     ]
     evidence_overlay = assignment.get("evidence_overlay")
     if evidence_overlay:
-        overlay_path = REPO_ROOT / str(evidence_overlay)
+        overlay_path = resolve_project_path(project_root, str(evidence_overlay))
         if not overlay_path.exists():
             raise FileNotFoundError(
                 f"{slot.slot_id}: missing evidence overlay {overlay_path}"
@@ -364,7 +406,7 @@ def rebind_provenance(
                 original_url=source["url"],
                 license=source["license"],
                 retrieved_at=now,
-                local_path=str(output_path.relative_to(REPO_ROOT)),
+                local_path=portable_project_path(project_root, output_path),
                 used_in_slots=(slot.slot_id,),
                 notes=(
                     f"Actual-footage base; source_key={source_key}; "
@@ -402,6 +444,11 @@ def main() -> int:
     parser.add_argument("--range", dest="slot_range")
     parser.add_argument("--slots", dest="slot_list")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--font",
+        type=Path,
+        help="Licensed TTF/OTF/TTC used for source straps (auto-detected by OS)",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--apply-provenance", action="store_true")
     args = parser.parse_args()
@@ -423,7 +470,13 @@ def main() -> int:
     if not targets:
         raise SystemExit("No video-led slots selected")
 
-    output_dir = REPO_ROOT / plan["output_directory"]
+    output_value = Path(str(plan["output_directory"])).expanduser()
+    output_dir = (
+        output_value.resolve()
+        if output_value.is_absolute()
+        else (project_root / output_value).resolve()
+    )
+    font_path = find_font(args.font)
     assignments: list[tuple[Slot, str, dict, dict]] = []
     for slot in targets:
         assignment = source_assignment(plan, slots, slot)
@@ -461,6 +514,7 @@ def main() -> int:
             source=source,
             assignment=assignment,
             force=args.force,
+            font_path=font_path,
         )
         built.append((slot, source_key, source, assignment, path))
 
@@ -478,7 +532,7 @@ def main() -> int:
     report = {
         "version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "plan": str(plan_path.relative_to(REPO_ROOT)),
+        "plan": portable_project_path(project_root, plan_path),
         "planned_full_video_seconds": round(planned_video, 3),
         "episode_seconds": round(total, 3),
         "planned_full_video_ratio": round(planned_ratio, 6),
@@ -489,7 +543,7 @@ def main() -> int:
         "available_video_seconds": round(available_seconds, 3),
         "available_slots": [slot.slot_id for slot in available_slots],
         "provenance_backup": (
-            str(backup_path.relative_to(REPO_ROOT)) if backup_path else None
+            portable_project_path(project_root, backup_path) if backup_path else None
         ),
     }
     report_path = project_root / "research" / "actual-footage-build.json"
