@@ -64,11 +64,14 @@ from rabbithole.subtitles import burn, group_cues, pick_font, write_ass
 from rabbithole.timing import WPM_BAND, rebuild_timing, timing_summary
 from rabbithole.validate import (
     Finding,
+    ValidationProfile,
+    ValidationProfileError,
     check_transliterated_english,
     check_transliteration,
     format_report,
     load_claims,
     load_sfx_names,
+    validation_profile_for_script,
     validate_all,
 )
 
@@ -106,6 +109,37 @@ def _devanagari_for(script_path: Path) -> Path:
     return script_path.parent / "05-devanagari.md"
 
 
+def _validation_profile(
+    script_path: Path,
+    wpm: int | None,
+    *,
+    fallback_wpm: int = 177,
+) -> tuple[ValidationProfile | None, list[Finding]]:
+    """Load one profile for both validation and narration.
+
+    Profile errors are normal gate output rather than tracebacks, but remain
+    non-overridable: narrating against an unknown duration target can spend
+    money on the wrong script.
+    """
+
+    try:
+        return (
+            validation_profile_for_script(
+                script_path,
+                wpm=wpm,
+                fallback_wpm=fallback_wpm,
+            ),
+            [],
+        )
+    except ValidationProfileError as exc:
+        return None, [
+            Finding(
+                gate="brief_profile",
+                severity="error",
+                message=str(exc),
+            )
+        ]
+
 
 def _romanized_words_for(project_root: Path) -> list[str] | None:
     """The canonical script's words, for resolving `[KEY:]` markers.
@@ -127,11 +161,21 @@ def cmd_validate(args: argparse.Namespace) -> int:
     parsed = parse(source)
     sfx_names = load_sfx_names(REPO_ROOT / "style" / "sfx.json")
 
+    profile, profile_findings = _validation_profile(
+        script_path, getattr(args, "wpm", None)
+    )
+    if profile is None:
+        print(format_report(profile_findings))
+        return 1
+
     deva_path = _devanagari_for(script_path)
     deva_parsed = parse(deva_path.read_text(encoding="utf-8")) if deva_path.exists() else None
 
     findings = validate_all(
-        parsed, sfx_names=sfx_names, wpm=args.wpm, claims=_claims_for(script_path)
+        parsed,
+        sfx_names=sfx_names,
+        claims=_claims_for(script_path),
+        profile=profile,
     )
     findings += check_transliteration(parsed, deva_parsed)
     if deva_parsed is not None:
@@ -148,12 +192,25 @@ def cmd_narrate(args: argparse.Namespace) -> int:
     parsed = parse(source)
     sfx_names = load_sfx_names(REPO_ROOT / "style" / "sfx.json")
 
+    profile, profile_findings = _validation_profile(
+        script_path,
+        getattr(args, "wpm", None),
+        fallback_wpm=cfg.wpm,
+    )
+    if profile is None:
+        print(format_report(profile_findings))
+        print("\nRefusing to narrate until brief.json defines a valid duration target.")
+        return 1
+
     deva_path = _devanagari_for(script_path)
     deva_source = deva_path.read_text(encoding="utf-8") if deva_path.exists() else None
     deva_parsed = parse(deva_source) if deva_source is not None else None
 
     findings = validate_all(
-        parsed, sfx_names=sfx_names, wpm=cfg.wpm, claims=_claims_for(script_path)
+        parsed,
+        sfx_names=sfx_names,
+        claims=_claims_for(script_path),
+        profile=profile,
     )
     findings += check_transliteration(parsed, deva_parsed)
     if deva_parsed is not None:
@@ -1146,7 +1203,12 @@ def main(argv: list[str] | None = None) -> int:
 
     validate = sub.add_parser("validate", help="Run the review gates on a script")
     validate.add_argument("script", help="Path to the marked-up narration script")
-    validate.add_argument("--wpm", type=int, default=177)
+    validate.add_argument(
+        "--wpm",
+        type=int,
+        default=None,
+        help="Override brief target_wpm (default: brief value, then 177)",
+    )
     validate.set_defaults(func=cmd_validate)
 
     narrate = sub.add_parser("narrate", help="Render a script to narration audio")
@@ -1154,6 +1216,12 @@ def main(argv: list[str] | None = None) -> int:
     narrate.add_argument("--out", required=True, help="Output WAV path")
     narrate.add_argument("--dry-run", action="store_true", help="Report cost only")
     narrate.add_argument("--force", action="store_true", help="Narrate despite failing gates")
+    narrate.add_argument(
+        "--wpm",
+        type=int,
+        default=None,
+        help="Override brief target_wpm for script gates",
+    )
     narrate.set_defaults(func=cmd_narrate)
 
     timing = sub.add_parser("timing", help="Summarise a timing spine (timing.json)")

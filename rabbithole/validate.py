@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
 
-from rabbithole.markers import SHOT_KINDS, ParsedScript, markers_of, word_count
 from rabbithole.jsonio import read_json
+from rabbithole.markers import SHOT_KINDS, ParsedScript, markers_of, word_count
 
 WORD_COUNT_MIN = 4500
 WORD_COUNT_MAX = 7400
@@ -20,6 +24,365 @@ REHOOK_MIN_MINUTES = 3
 REHOOK_MAX_MINUTES = 5
 
 
+class ValidationProfileError(ValueError):
+    """A project brief exists but cannot safely define validation targets."""
+
+
+@dataclass(frozen=True)
+class ValidationProfile:
+    """All duration-sensitive script gates for one episode.
+
+    A project brief can describe a shorter or longer final episode than the
+    original 30-40 minute format.  The profile keeps the total word-count gate,
+    the five act budgets, and re-hook timing on the same WPM-derived basis.
+    Without an explicit brief target, ``default`` preserves the original hard
+    gates exactly.
+    """
+
+    word_count_min: int
+    word_count_max: int
+    act_budgets: Mapping[int, int]
+    wpm: int
+    word_count_tolerance: float = ACT_TOLERANCE
+    act_budget_tolerance: float = ACT_TOLERANCE
+    target_duration_minutes: float | None = None
+    target_word_count: int | None = None
+    source: str = "default long-format gates"
+
+    @classmethod
+    def default(cls, wpm: int = 177) -> ValidationProfile:
+        _require_positive_wpm(wpm)
+        return cls(
+            word_count_min=WORD_COUNT_MIN,
+            word_count_max=WORD_COUNT_MAX,
+            act_budgets=MappingProxyType(dict(ACT_BUDGETS)),
+            wpm=wpm,
+        )
+
+    @classmethod
+    def for_duration(
+        cls,
+        target_duration_minutes: float,
+        wpm: int = 177,
+        *,
+        word_count_tolerance: float = ACT_TOLERANCE,
+        act_budget_tolerance: float = ACT_TOLERANCE,
+        act_budgets: Mapping[int, int] | None = None,
+        source: str = "project brief",
+    ) -> ValidationProfile:
+        _require_positive_wpm(wpm)
+        _require_tolerance(word_count_tolerance, "word_count_tolerance")
+        _require_tolerance(act_budget_tolerance, "act_budget_tolerance")
+        if (
+            isinstance(target_duration_minutes, bool)
+            or not isinstance(target_duration_minutes, (int, float))
+            or not math.isfinite(target_duration_minutes)
+            or target_duration_minutes <= 0
+        ):
+            raise ValidationProfileError(
+                "target_duration_minutes must be a positive finite number."
+            )
+
+        target_words = int(round(target_duration_minutes * wpm))
+        if target_words < len(ACT_BUDGETS):
+            raise ValidationProfileError(
+                "target_duration_minutes is too short to allocate words across all five acts."
+            )
+
+        # Decimal avoids turning an exact boundary such as 2640 * 1.15 into
+        # 3035.9999999999995 before floor is applied.
+        decimal_target = Decimal(target_words)
+        decimal_tolerance = Decimal(str(word_count_tolerance))
+        word_min = int(
+            (decimal_target * (Decimal(1) - decimal_tolerance)).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
+        word_max = int(
+            (decimal_target * (Decimal(1) + decimal_tolerance)).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+        )
+        budgets = (
+            _validated_act_word_budgets(act_budgets)
+            if act_budgets is not None
+            else _scale_act_budgets(target_words)
+        )
+        budget_total = sum(budgets.values())
+        if not word_min <= budget_total <= word_max:
+            raise ValidationProfileError(
+                f"act budgets total {budget_total} words, outside the episode's "
+                f"{word_min}-{word_max}-word range."
+            )
+        return cls(
+            word_count_min=word_min,
+            word_count_max=word_max,
+            act_budgets=MappingProxyType(budgets),
+            wpm=wpm,
+            word_count_tolerance=word_count_tolerance,
+            act_budget_tolerance=act_budget_tolerance,
+            target_duration_minutes=float(target_duration_minutes),
+            target_word_count=target_words,
+            source=source,
+        )
+
+    @property
+    def is_brief_aware(self) -> bool:
+        return self.target_duration_minutes is not None
+
+
+def _require_positive_wpm(wpm: int) -> None:
+    if isinstance(wpm, bool) or not isinstance(wpm, int) or wpm <= 0:
+        raise ValidationProfileError("WPM must be a positive integer.")
+
+
+def _require_tolerance(value: float, field: str) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= value < 1
+    ):
+        raise ValidationProfileError(
+            f"{field} must be a finite number greater than or equal to 0 "
+            f"and less than 1."
+        )
+
+
+def _validated_act_word_budgets(value: object) -> dict[int, int]:
+    if not isinstance(value, Mapping):
+        raise ValidationProfileError("act_word_budgets must be a JSON object.")
+
+    budgets: dict[int, int] = {}
+    for raw_number, raw_budget in value.items():
+        if isinstance(raw_number, bool):
+            raise ValidationProfileError(
+                "act_word_budgets keys must be the act numbers 1 through 5."
+            )
+        try:
+            number = int(raw_number)
+        except (TypeError, ValueError):
+            raise ValidationProfileError(
+                "act_word_budgets keys must be the act numbers 1 through 5."
+            ) from None
+        if str(raw_number).strip() not in {str(number), f"{number}.0"}:
+            raise ValidationProfileError(
+                "act_word_budgets keys must be the act numbers 1 through 5."
+            )
+        if number in budgets:
+            raise ValidationProfileError(
+                f"act_word_budgets defines Act {number} more than once."
+            )
+        if (
+            isinstance(raw_budget, bool)
+            or not isinstance(raw_budget, int)
+            or raw_budget <= 0
+        ):
+            raise ValidationProfileError(
+                f"act_word_budgets Act {number} must be a positive integer."
+            )
+        budgets[number] = raw_budget
+
+    expected = set(ACT_BUDGETS)
+    missing = sorted(expected - set(budgets))
+    extra = sorted(set(budgets) - expected)
+    if missing or extra:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing acts {missing}")
+        if extra:
+            details.append(f"unexpected acts {extra}")
+        raise ValidationProfileError(
+            "act_word_budgets must define Acts 1-5 exactly ("
+            + "; ".join(details)
+            + ")."
+        )
+    return budgets
+
+
+def _act_budgets_from_durations(value: object, wpm: int) -> dict[int, int]:
+    if not isinstance(value, Mapping):
+        raise ValidationProfileError("act_duration_seconds must be a JSON object.")
+
+    seconds_by_act: dict[int, float] = {}
+    for raw_number, raw_seconds in value.items():
+        try:
+            number = int(raw_number)
+        except (TypeError, ValueError):
+            raise ValidationProfileError(
+                "act_duration_seconds keys must be the act numbers 1 through 5."
+            ) from None
+        if str(raw_number).strip() not in {str(number), f"{number}.0"}:
+            raise ValidationProfileError(
+                "act_duration_seconds keys must be the act numbers 1 through 5."
+            )
+        if number in seconds_by_act:
+            raise ValidationProfileError(
+                f"act_duration_seconds defines Act {number} more than once."
+            )
+        if (
+            isinstance(raw_seconds, bool)
+            or not isinstance(raw_seconds, (int, float))
+            or not math.isfinite(raw_seconds)
+            or raw_seconds <= 0
+        ):
+            raise ValidationProfileError(
+                f"act_duration_seconds Act {number} must be a positive finite number."
+            )
+        seconds_by_act[number] = float(raw_seconds)
+
+    expected = set(ACT_BUDGETS)
+    missing = sorted(expected - set(seconds_by_act))
+    extra = sorted(set(seconds_by_act) - expected)
+    if missing or extra:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing acts {missing}")
+        if extra:
+            details.append(f"unexpected acts {extra}")
+        raise ValidationProfileError(
+            "act_duration_seconds must define Acts 1-5 exactly ("
+            + "; ".join(details)
+            + ")."
+        )
+
+    return {
+        number: max(1, int(round(seconds * wpm / 60)))
+        for number, seconds in seconds_by_act.items()
+    }
+
+
+def _scale_act_budgets(target_words: int) -> dict[int, int]:
+    """Scale the corpus act shape while preserving an exact total.
+
+    Largest-remainder allocation avoids losing or inventing words through five
+    independent ``round`` calls. Ties stay in act order for deterministic
+    output on every platform.
+    """
+
+    base_total = sum(ACT_BUDGETS.values())
+    raw = {
+        number: target_words * budget / base_total
+        for number, budget in ACT_BUDGETS.items()
+    }
+    scaled = {number: math.floor(value) for number, value in raw.items()}
+    remainder = target_words - sum(scaled.values())
+    order = sorted(raw, key=lambda number: (-(raw[number] - scaled[number]), number))
+    for number in order[:remainder]:
+        scaled[number] += 1
+    return scaled
+
+
+def validation_profile_for_script(
+    script_path: Path,
+    wpm: int | None = None,
+    *,
+    fallback_wpm: int = 177,
+) -> ValidationProfile:
+    """Discover ``brief.json`` beside a project's ``script`` directory.
+
+    ``projects/<slug>/script/<edition>.md`` maps to
+    ``projects/<slug>/brief.json``. A missing brief, or a well-formed brief
+    without ``target_duration_minutes``, deliberately falls back to the legacy
+    long-format gates. A present but malformed brief fails closed: silently
+    selecting unrelated duration gates could approve the wrong script or spend
+    money narrating it.
+    """
+
+    if wpm is not None:
+        _require_positive_wpm(wpm)
+    _require_positive_wpm(fallback_wpm)
+
+    path = Path(script_path)
+    brief_path = path.parent.parent / "brief.json"
+    if not brief_path.exists():
+        return ValidationProfile.default(wpm=wpm or fallback_wpm)
+
+    try:
+        brief = read_json(brief_path)
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValidationProfileError(
+            f"Cannot load validation target from {brief_path}: {exc}"
+        ) from exc
+
+    if not isinstance(brief, dict):
+        raise ValidationProfileError(
+            f"{brief_path} must contain a JSON object; got {type(brief).__name__}."
+        )
+
+    validation = brief.get("validation", {})
+    if validation is None:
+        validation = {}
+    if not isinstance(validation, dict):
+        raise ValidationProfileError(
+            f"{brief_path}: validation must be a JSON object."
+        )
+
+    brief_wpm = brief.get("target_wpm")
+    if brief_wpm is not None:
+        try:
+            _require_positive_wpm(brief_wpm)
+        except ValidationProfileError as exc:
+            raise ValidationProfileError(f"{brief_path}: target_wpm: {exc}") from exc
+    selected_wpm = wpm if wpm is not None else (brief_wpm or fallback_wpm)
+
+    target_present = (
+        "target_duration_minutes" in brief
+        and brief["target_duration_minutes"] is not None
+    )
+    duration_specific_fields = {
+        "word_count_tolerance",
+        "act_budget_tolerance",
+        "act_word_budgets",
+        "act_duration_seconds",
+    }
+    if not target_present:
+        configured = sorted(duration_specific_fields.intersection(validation))
+        if configured:
+            raise ValidationProfileError(
+                f"{brief_path}: validation fields {configured} require "
+                f"target_duration_minutes."
+            )
+        return ValidationProfile.default(wpm=selected_wpm)
+
+    word_tolerance = validation.get("word_count_tolerance", ACT_TOLERANCE)
+    act_tolerance = validation.get("act_budget_tolerance", ACT_TOLERANCE)
+    has_act_word_budgets = "act_word_budgets" in validation
+    has_act_durations = "act_duration_seconds" in validation
+    if has_act_word_budgets and has_act_durations:
+        raise ValidationProfileError(
+            f"{brief_path}: validation may define act_word_budgets or "
+            f"act_duration_seconds, not both."
+        )
+    act_word_budgets = None
+    if has_act_word_budgets:
+        try:
+            act_word_budgets = _validated_act_word_budgets(
+                validation["act_word_budgets"]
+            )
+        except ValidationProfileError as exc:
+            raise ValidationProfileError(f"{brief_path}: {exc}") from exc
+    elif has_act_durations:
+        try:
+            act_word_budgets = _act_budgets_from_durations(
+                validation["act_duration_seconds"], selected_wpm
+            )
+        except ValidationProfileError as exc:
+            raise ValidationProfileError(f"{brief_path}: {exc}") from exc
+
+    try:
+        return ValidationProfile.for_duration(
+            brief["target_duration_minutes"],
+            wpm=selected_wpm,
+            word_count_tolerance=word_tolerance,
+            act_budget_tolerance=act_tolerance,
+            act_budgets=act_word_budgets,
+            source=str(brief_path),
+        )
+    except ValidationProfileError as exc:
+        raise ValidationProfileError(f"{brief_path}: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class Finding:
     gate: str
@@ -28,18 +391,31 @@ class Finding:
     line: int | None = None
 
 
-def check_word_count(parsed: ParsedScript) -> list[Finding]:
+def check_word_count(
+    parsed: ParsedScript, profile: ValidationProfile | None = None
+) -> list[Finding]:
+    selected = profile or ValidationProfile.default()
     total = word_count(parsed)
-    if WORD_COUNT_MIN <= total <= WORD_COUNT_MAX:
+    if selected.word_count_min <= total <= selected.word_count_max:
         return []
+
+    if selected.is_brief_aware:
+        requirement = (
+            f"the {selected.target_duration_minutes:g}-minute brief at "
+            f"{selected.wpm} WPM requires {selected.word_count_min}-"
+            f"{selected.word_count_max} words "
+            f"(target {selected.target_word_count})"
+        )
+    else:
+        requirement = (
+            f"the format requires {selected.word_count_min}-"
+            f"{selected.word_count_max}"
+        )
     return [
         Finding(
             gate="word_count",
             severity="error",
-            message=(
-                f"Script is {total} words; the format requires "
-                f"{WORD_COUNT_MIN}-{WORD_COUNT_MAX}."
-            ),
+            message=f"Script is {total} words; {requirement}.",
         )
     ]
 
@@ -62,7 +438,10 @@ def act_spans(parsed: ParsedScript) -> dict[int, tuple[int, int]]:
     return spans
 
 
-def check_act_budgets(parsed: ParsedScript) -> list[Finding]:
+def check_act_budgets(
+    parsed: ParsedScript, profile: ValidationProfile | None = None
+) -> list[Finding]:
+    selected = profile or ValidationProfile.default()
     findings: list[Finding] = []
     acts = markers_of(parsed, "ACT")
 
@@ -90,7 +469,7 @@ def check_act_budgets(parsed: ParsedScript) -> list[Finding]:
         )
 
     spans = act_spans(parsed)
-    for number, budget in ACT_BUDGETS.items():
+    for number, budget in selected.act_budgets.items():
         if number not in spans:
             findings.append(
                 Finding(
@@ -104,14 +483,15 @@ def check_act_budgets(parsed: ParsedScript) -> list[Finding]:
         start, end = spans[number]
         actual = end - start
         drift = (actual - budget) / budget
-        if abs(drift) > ACT_TOLERANCE:
+        if abs(drift) > selected.act_budget_tolerance:
             findings.append(
                 Finding(
                     gate="act_budget",
                     severity="error",
                     message=(
                         f"Act {number} is {actual} words against a budget of {budget} "
-                        f"({drift:+.0%}); tolerance is +-{ACT_TOLERANCE:.0%}."
+                        f"({drift:+.0%}); tolerance is "
+                        f"+-{selected.act_budget_tolerance:.0%}."
                     ),
                 )
             )
@@ -422,12 +802,14 @@ def validate_all(
     sfx_names: set[str],
     wpm: int = 177,
     claims: list[dict] | None = None,
+    profile: ValidationProfile | None = None,
 ) -> list[Finding]:
     """Run every gate and return findings in gate order."""
+    selected = profile or ValidationProfile.default(wpm=wpm)
     return [
-        *check_word_count(parsed),
-        *check_act_budgets(parsed),
-        *check_rehook_spacing(parsed, wpm=wpm),
+        *check_word_count(parsed, profile=selected),
+        *check_act_budgets(parsed, profile=selected),
+        *check_rehook_spacing(parsed, wpm=selected.wpm),
         *check_register(parsed),
         *check_marker_args(parsed, sfx_names),
         *check_claims(parsed, claims or []),

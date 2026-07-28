@@ -88,6 +88,19 @@ uv run rabbithole assets projects/my-episode/narration/timing.json
 uv run rabbithole edl projects/my-episode/narration/timing.json
 ```
 
+`validate` and `narrate` both read the sibling episode `brief.json`. When it
+contains a positive numeric `target_duration_minutes`, they derive the spoken
+word target from `target_wpm` (or the configured/default WPM), allow the
+specified `validation.word_count_tolerance` (default +/-15%), and scale all
+five act budgets proportionally. An approved beat plan can instead provide
+five explicit `validation.act_word_budgets`, or five
+`validation.act_duration_seconds` values to convert at the selected WPM.
+`--wpm` explicitly overrides `target_wpm` for either command. With no brief or
+no duration field, the original 4,500-7,400-word gate and fixed
+90/440/3360/1590/530 act budgets remain unchanged. A present but malformed
+brief is an error rather than a silent fallback, including for
+`narrate --force`, so narration cannot spend money against an unknown target.
+
 Then compile and build the editable Resolve timeline:
 
 ```text

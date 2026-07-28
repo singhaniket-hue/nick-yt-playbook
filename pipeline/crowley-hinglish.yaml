@@ -60,10 +60,17 @@ deviations_from_documentary_montage:
       An untimed "tone poem" -- duration and shape come from the brief, with
       no fixed target.
     crowley_hinglish: >
-      A fixed-format episode: 30-40 minutes at 165-190 WPM narration, ~4,500-
-      7,400 words across five acts with corpus-derived per-act word budgets
-      (ACT_BUDGETS in rabbithole/validate.py), average shot length 2.95-3.35s.
-      These are hard review-gate numbers, not guidance.
+      A brief-targeted episode at 165-190 WPM narration across five acts.
+      `validate` and `narrate` convert an explicit
+      brief.target_duration_minutes and target_wpm into a word target
+      (+/-15% by default). An approved beat plan may supply five
+      validation.act_word_budgets or five validation.act_duration_seconds;
+      otherwise the corpus act shape is proportionally scaled (ACT_BUDGETS in
+      rabbithole/validate.py). A CLI --wpm is an explicit override. If the
+      brief has no duration target, the original 30-40 minute,
+      ~4,500-7,400-word gates and fixed act budgets remain unchanged. Average
+      shot length remains 2.95-3.35s. These are hard review-gate numbers, not
+      guidance.
 
   - dimension: render_split
     documentary_montage: >
@@ -169,8 +176,8 @@ stages:
     checkpoint_required: true
     human_approval_default: true
     review_focus:
-      - Word count within 4500-7400
-      - Every act within 15% of its corpus-derived word budget
+      - Word count within the brief/WPM-derived range, or 4500-7400 without a target
+      - Every act within 15% of its profile's corpus-derived word budget
       - Act III [REHOOK] markers spaced 3-5 minutes apart
       - No aap-register violation (tum/yaar/bhai/casual tokens) survives
       - Every assertion of wrongdoing about a named person has a claims_ledger entry
