@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import functools
 import os
+from pathlib import Path
+import shutil
 import subprocess
 
 CPU_ENCODER = "libx264"
@@ -38,6 +40,69 @@ ENV_OVERRIDE = "RABBITHOLE_VIDEO_ENCODER"
 # NVENC preset vocabulary is p1 (fastest) .. p7 (slowest/best). p4 is its
 # balanced default and the closest analogue to x264's "medium".
 _NVENC_PRESET = "p4"
+
+
+@functools.lru_cache(maxsize=None)
+def available_filters(executable: str = "ffmpeg") -> frozenset[str]:
+    """Filter names this ffmpeg build advertises.
+
+    Homebrew's regular FFmpeg 8 formula is intentionally a smaller build and
+    does not include libass.  In that build a graph such as ``ass=subs.ass``
+    fails with the misleading parser message ``No option name near`` rather
+    than saying that the filter is absent.  Querying ``-filters`` lets callers
+    fail before starting an encode and explain the actual dependency.
+    """
+    try:
+        result = subprocess.run(
+            [executable, "-hide_banner", "-filters"],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    if result.returncode != 0:
+        return frozenset()
+    text = result.stdout.decode("utf-8", errors="replace")
+    names: set[str] = set()
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and "->" in fields[2]:
+            names.add(fields[1])
+    return frozenset(names)
+
+
+def _ffmpeg_candidates() -> tuple[str, ...]:
+    """FFmpeg executables worth probing, in user-visible priority order.
+
+    ``ffmpeg-full`` is keg-only, so Homebrew deliberately does not put it on
+    PATH. Probe its stable ``opt`` location after the user's active ffmpeg; this
+    lets an ASS-only stage use the capable build without changing which FFmpeg
+    the rest of an established pipeline uses.
+    """
+    candidates: list[str] = []
+    active = shutil.which("ffmpeg")
+    if active:
+        candidates.append(active)
+    for path in (
+        Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"),
+        Path("/usr/local/opt/ffmpeg-full/bin/ffmpeg"),
+    ):
+        if path.is_file():
+            candidates.append(os.fspath(path))
+    return tuple(dict.fromkeys(candidates))
+
+
+def require_filter(name: str) -> str:
+    """Return an FFmpeg providing ``name``, or raise an actionable error."""
+    for executable in _ffmpeg_candidates():
+        if name in available_filters(executable):
+            return executable
+    raise RuntimeError(
+        f"FFmpeg on PATH is missing the required {name!r} filter. Install an "
+        "FFmpeg build compiled with libass. On macOS with Homebrew, use "
+        "`brew install ffmpeg-full` and put "
+        "`$(brew --prefix ffmpeg-full)/bin` before the regular FFmpeg on PATH."
+    )
 
 
 @functools.lru_cache(maxsize=1)

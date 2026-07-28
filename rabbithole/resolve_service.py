@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 from typing import Any, Mapping
 
+from .encoding import require_filter
 from .resolve_install import install_style_assets
 from .resolve_manifest import ResolveManifestError, compile_resolve_plan, write_resolve_bundle
 from .resolve_runner import (
@@ -109,6 +110,21 @@ def portability_report(*, mode: str = "free") -> dict[str, Any]:
             "detail": tools[name],
         }
         for name in tools
+    )
+    try:
+        ass_ffmpeg = require_filter("ass")
+        ass_filter_detail: Any = ass_ffmpeg
+        ass_filter_ok = True
+    except RuntimeError as exc:
+        ass_filter_detail = str(exc)
+        ass_filter_ok = False
+    checks.append(
+        {
+            "name": "ffmpeg_ass_filter",
+            "ok": ass_filter_ok,
+            "severity": "error",
+            "detail": ass_filter_detail,
+        }
     )
     checks.append(
         {

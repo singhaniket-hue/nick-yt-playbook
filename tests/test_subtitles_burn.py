@@ -7,9 +7,13 @@ shape as tests/test_render_finish.py.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
+import pytest
+
 from rabbithole.render import probe_duration
+import rabbithole.subtitles as subtitles
 from rabbithole.subtitles import SubtitleCue, burn, write_ass
 
 W, H, FPS = 320, 180, 30
@@ -185,22 +189,70 @@ def test_burning_a_cue_does_not_meaningfully_change_pixels_outside_the_lower_thi
 # --- burn: the ':' filter-path problem ------------------------------------------
 
 
-def test_burn_works_with_a_path_containing_spaces_and_a_drive_letter_colon(tmp_path):
+def test_burn_works_with_a_spaced_absolute_path_on_each_host(tmp_path):
     spaced_dir = tmp_path / "a dir with spaces"
     spaced_dir.mkdir()
     video = _video_with_audio(spaced_dir / "my video.mp4")
     ass_path = _write_test_ass(spaced_dir / "my subs.ass")
     out_path_target = spaced_dir / "burned output.mp4"
 
-    # tmp_path is already an absolute Windows path containing a drive letter
-    # colon (e.g. C:\Users\...\pytest-.../test_...0); combined with the
-    # space in "a dir with spaces" this exercises exactly the failure mode
-    # that made the `ass=` filter's colon collide with a Windows drive
-    # letter in earlier work on this project.
-    assert ":" in str(spaced_dir)
+    # On Windows the absolute tmp_path also contains a drive-letter colon,
+    # exercising the filtergraph collision that motivated the cwd/bare-name
+    # approach. macOS has no drive letter, but the same test still covers its
+    # absolute path and whitespace.
+    assert spaced_dir.is_absolute()
+    if os.name == "nt":
+        assert ":" in str(spaced_dir)
 
     out_path = burn(video, ass_path, out_path_target)
 
     assert out_path.exists()
     assert out_path.stat().st_size > 0
     assert probe_duration(out_path) > 0
+
+
+def test_burn_names_the_ass_filename_option_explicitly(tmp_path, monkeypatch):
+    video = tmp_path / "video.mp4"
+    ass_path = tmp_path / "subs.ass"
+    output = tmp_path / "burned.mp4"
+    video.write_bytes(b"mock video")
+    ass_path.write_text("[Script Info]\n", encoding="utf-8")
+    observed = {}
+
+    def fake_require_filter(name):
+        observed["filter"] = name
+        return "/mock/bin/ffmpeg-with-libass"
+
+    monkeypatch.setattr(subtitles, "require_filter", fake_require_filter)
+
+    def fake_run(args, cwd=None):
+        observed["args"] = args
+        observed["cwd"] = cwd
+
+    monkeypatch.setattr(subtitles, "_run", fake_run)
+
+    assert burn(video, ass_path, output) == output.resolve()
+    vf = observed["args"][observed["args"].index("-vf") + 1]
+    assert vf == "ass=filename=subs.ass"
+    assert observed["args"][0] == "/mock/bin/ffmpeg-with-libass"
+    assert observed["filter"] == "ass"
+    assert observed["cwd"] == tmp_path.resolve()
+
+
+def test_burn_checks_for_libass_before_starting_encode(tmp_path, monkeypatch):
+    video = tmp_path / "video.mp4"
+    ass_path = tmp_path / "subs.ass"
+    output = tmp_path / "burned.mp4"
+
+    def missing_filter(_name):
+        raise RuntimeError("Install an FFmpeg build compiled with libass")
+
+    monkeypatch.setattr(subtitles, "require_filter", missing_filter)
+    monkeypatch.setattr(
+        subtitles,
+        "_run",
+        lambda *_args, **_kwargs: pytest.fail("encode must not start without libass"),
+    )
+
+    with pytest.raises(RuntimeError, match="compiled with libass"):
+        burn(video, ass_path, output)

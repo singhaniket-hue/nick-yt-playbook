@@ -25,7 +25,8 @@ archives, and local application state are intentionally excluded from Git.
 - Python 3.11 or newer
 - DaVinci Resolve 21 or newer
 - FFmpeg and ffprobe on `PATH` for conforming, generated plates, audio stems,
-  verification, and the explicit legacy backend
+  verification, and the explicit legacy backend. Subtitle and graphic-card
+  generation requires FFmpeg's `ass` filter (libass).
 - Chrome, Edge, or Chromium for browser-capture operations
 - Poppler's `pdftoppm` for PDF evidence capture
 - an ElevenLabs API key and voice ID only when using narration or sound
@@ -52,8 +53,9 @@ powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1
 On macOS:
 
 ```bash
-# Homebrew is one option for the command-line prerequisites.
-brew install uv ffmpeg poppler
+# Homebrew's regular FFmpeg 8 formula omits libass; use the keg-only full build.
+brew install uv ffmpeg-full poppler
+export PATH="$(brew --prefix ffmpeg-full)/bin:$PATH"
 bash scripts/bootstrap.sh
 ```
 

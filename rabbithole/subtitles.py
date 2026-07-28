@@ -24,7 +24,7 @@ from rabbithole.audiomix import SilenceWindow, silence_windows
 from rabbithole.overlays import _find_keyword_word
 from rabbithole.sources.plates import PLATE_BUFSIZE, PLATE_CRF, PLATE_MAXRATE
 from rabbithole.validate import Finding
-from rabbithole.encoding import video_args
+from rabbithole.encoding import require_filter, video_args
 
 MAX_CUE_CHARS = 42
 MAX_CUE_WORDS = 7
@@ -618,11 +618,14 @@ def burn(video_path: Path, ass_path: Path, out_path: Path) -> Path:
     (`C\\:/Users/.../subs.ass`) still fails -- libass reports "Unable to
     parse 'original_size' option value" because downstream option parsing
     still trips on it -- while running ffmpeg with `cwd` set to the ASS
-    file's own directory and passing just its bare filename (`ass=subs.ass`)
-    works cleanly. That's the approach used here, same as `movie=` before
-    it. Only the ASS path needs this: `-i`/output-filename arguments are
-    plain CLI args, not filtergraph option values, so `video_path` and
-    `out_path` are passed as ordinary absolute paths.
+    file's own directory and passing just its bare filename
+    (`ass=filename=subs.ass`) works cleanly. That's the approach used here,
+    same as `movie=` before it. The option is named explicitly so a missing
+    `ass` filter cannot be confused with a positional-option parsing change
+    in newer ffmpeg builds. Only the ASS path needs this:
+    `-i`/output-filename arguments are plain CLI args, not filtergraph option
+    values, so `video_path` and `out_path` are passed as ordinary absolute
+    paths.
 
     Applies the same bitrate cap `render.finish` uses for its own encode
     (`sources/plates.PLATE_CRF`/`PLATE_MAXRATE`/`PLATE_BUFSIZE`). The audio
@@ -634,11 +637,17 @@ def burn(video_path: Path, ass_path: Path, out_path: Path) -> Path:
     out_path = Path(out_path).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Homebrew's regular FFmpeg 8 formula omits libass. Its parser reports
+    # "No option name near 'subs.ass'", which looks like a quoting bug even
+    # though the filter itself is absent. Detect that before starting an
+    # encode and point macOS users at the supported formula.
+    ffmpeg = require_filter("ass")
+
     _run(
         [
-            "ffmpeg", "-y",
+            ffmpeg, "-y",
             "-i", str(video_path),
-            "-vf", f"ass={ass_path.name}",
+            "-vf", f"ass=filename={ass_path.name}",
             *video_args(PLATE_CRF, maxrate=PLATE_MAXRATE, bufsize=PLATE_BUFSIZE),
             "-pix_fmt", "yuv420p",
             "-c:a", "copy",

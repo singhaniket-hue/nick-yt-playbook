@@ -7,6 +7,7 @@ agree.
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,14 +15,71 @@ from rabbithole.encoding import (
     CPU_ENCODER,
     ENV_OVERRIDE,
     GPU_ENCODERS,
+    available_filters,
     detect_encoder,
     is_gpu,
+    require_filter,
     video_args,
 )
 
 
 def test_libx264_gets_crf():
     assert video_args(20, encoder="libx264") == ["-c:v", "libx264", "-crf", "20"]
+
+
+def test_available_filters_parses_ffmpeg_listing(monkeypatch):
+    import rabbithole.encoding as encoding
+
+    listing = b"""Filters:
+  T.. = Timeline support
+  .. ass               V->V       Render ASS subtitles.
+  TS scale             V->V       Scale the input video.
+"""
+    monkeypatch.setattr(
+        encoding.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=listing),
+    )
+    available_filters.cache_clear()
+    try:
+        assert available_filters("/mock/bin/ffmpeg") == frozenset({"ass", "scale"})
+    finally:
+        available_filters.cache_clear()
+
+
+def test_require_filter_explains_homebrew_ffmpeg_full(monkeypatch):
+    import rabbithole.encoding as encoding
+
+    monkeypatch.setattr(encoding, "_ffmpeg_candidates", lambda: ("/mock/bin/ffmpeg",))
+    monkeypatch.setattr(
+        encoding, "available_filters", lambda _executable: frozenset({"scale"})
+    )
+
+    with pytest.raises(RuntimeError, match=r"brew install ffmpeg-full"):
+        require_filter("ass")
+
+
+def test_require_filter_can_use_homebrew_full_when_path_ffmpeg_is_minimal(
+    monkeypatch,
+):
+    import rabbithole.encoding as encoding
+
+    monkeypatch.setattr(
+        encoding,
+        "_ffmpeg_candidates",
+        lambda: ("/usr/local/bin/ffmpeg", "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"),
+    )
+    monkeypatch.setattr(
+        encoding,
+        "available_filters",
+        lambda executable: (
+            frozenset({"ass", "scale"})
+            if "ffmpeg-full" in executable
+            else frozenset({"scale"})
+        ),
+    )
+
+    assert require_filter("ass") == "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
 
 
 def test_nvenc_gets_cq_not_crf():

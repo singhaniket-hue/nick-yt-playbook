@@ -23,7 +23,8 @@ makes rebuilds reproducible and editor handoffs auditable.
 - Windows 10/11 x64, or macOS 12+ on Intel/Apple silicon hardware
   supported by Resolve
 - Python 3.11 or newer
-- FFmpeg and ffprobe on `PATH` for media preparation and the legacy backend
+- FFmpeg and ffprobe on `PATH` for media preparation and the legacy backend.
+  Subtitle and graphic-card generation requires the `ass` filter (libass).
 - Poppler's `pdftoppm` for PDF evidence and Chrome/Edge/Chromium for browser
   capture
 - DaVinci Resolve 21 or newer; the implementation targets its installed
@@ -44,6 +45,14 @@ Use `scripts/bootstrap.ps1` on Windows or `scripts/bootstrap.sh` on macOS.
 `doctor` is read-only: it does not launch Resolve, open a project, or touch the
 render queue. Set `RABBITHOLE_RESOLVE_PATH` or `RABBITHOLE_BROWSER_PATH` only
 for a nonstandard application location.
+
+On macOS, Homebrew's regular FFmpeg 8 formula omits libass. Install and select
+the full keg before running the pipeline:
+
+```bash
+brew install ffmpeg-full poppler
+export PATH="$(brew --prefix ffmpeg-full)/bin:$PATH"
+```
 
 ## Project contract
 

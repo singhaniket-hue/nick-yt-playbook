@@ -32,10 +32,14 @@ macOS:   bash scripts/bootstrap.sh
 Check:   uv run rabbithole resolve doctor --mode free
 ```
 
-Require Python 3.11+, Resolve 21+, FFmpeg, and ffprobe. Require Poppler
-(`pdftoppm`) for PDF evidence and Chrome, Edge, or Chromium for browser
-captures. On macOS, recommend Homebrew only as an installation option; do not
-install system packages without authorization.
+Require Python 3.11+, Resolve 21+, FFmpeg, and ffprobe. Subtitle and graphic
+card generation also requires FFmpeg's `ass` filter (libass); `resolve doctor`
+checks it before episode work. Homebrew's regular macOS FFmpeg formula omits
+libass, so use `ffmpeg-full` and prepend `$(brew --prefix
+ffmpeg-full)/bin` when Homebrew is authorized. Require Poppler (`pdftoppm`) for
+PDF evidence and Chrome, Edge, or Chromium for browser captures. Recommend
+Homebrew only as an installation option; do not install system packages
+without authorization.
 
 Keep `.env` local and ignored. Never print, transfer, or commit credentials.
 Require `ELEVENLABS_API_KEY` and `RABBITHOLE_VOICE_ID` only for paid narration

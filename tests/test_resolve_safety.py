@@ -107,6 +107,26 @@ def test_unknown_process_state_is_not_treated_as_stale(tmp_path: Path) -> None:
         first.release()
 
 
+def test_live_process_without_start_time_is_treated_as_active_lock(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "episode"
+    first = ProjectLock(project, stage="build").acquire()
+    try:
+        second = ProjectLock(
+            project,
+            stage="render",
+            process_probe=lambda pid: ProcessProbe(
+                True,
+                detail="process start time unavailable",
+            ),
+        )
+        with pytest.raises(ResolveLockError, match="locked by PID"):
+            second.acquire()
+    finally:
+        first.release()
+
+
 def test_external_write_roots_require_explicit_mode_and_reject_drive_root(
     tmp_path: Path,
 ) -> None:

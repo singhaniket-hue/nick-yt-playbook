@@ -461,9 +461,12 @@ class ProjectLock:
                 f"{observed.detail or 'unknown process state'}"
             )
         if observed.process_start is None:
-            raise ResolveLockError(
-                f"PID {owner.pid} is live but its process start time is unavailable"
-            )
+            # Liveness alone is enough to classify the lock as active.  This
+            # occurs on POSIX hosts without psutil (and can also occur when the
+            # OS permits a signal probe but withholds process metadata).  We
+            # cannot safely compare process identities or reclaim the lock, so
+            # fail closed through the normal "locked by PID" path.
+            return False
         # Windows and psutil timestamps are sub-second floats.  JSON preserves
         # enough precision that only a tiny representation tolerance is needed;
         # a whole-second tolerance could misidentify rapid PID reuse.

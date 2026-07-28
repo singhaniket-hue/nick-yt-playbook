@@ -27,4 +27,5 @@ fi
 echo "Bootstrap complete. No application was launched and no render queue was touched."
 echo "Add ELEVENLABS_API_KEY and RABBITHOLE_VOICE_ID to .env only if needed."
 echo "Run: uv run rabbithole resolve doctor"
-echo "macOS prerequisites: DaVinci Resolve 21+, FFmpeg/ffprobe, and optionally Poppler plus Chrome/Edge."
+echo "macOS prerequisites: DaVinci Resolve 21+, FFmpeg/ffprobe with libass, and optionally Poppler plus Chrome/Edge."
+echo 'Homebrew: brew install ffmpeg-full poppler && export PATH="$(brew --prefix ffmpeg-full)/bin:$PATH"'

@@ -241,6 +241,11 @@ def test_free_doctor_is_read_only_and_manual_console_gate_is_nonfatal(
         resolve_service.shutil, "which", lambda name: f"/mock/bin/{name}"
     )
     monkeypatch.setattr(
+        resolve_service,
+        "require_filter",
+        lambda name: f"/mock/bin/ffmpeg-with-{name}",
+    )
+    monkeypatch.setattr(
         capture,
         "find_browser",
         lambda: Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
@@ -257,6 +262,8 @@ def test_free_doctor_is_read_only_and_manual_console_gate_is_nonfatal(
     }
     assert checks["free_console_python"]["ok"] is False
     assert checks["free_console_python"]["severity"] == "warning"
+    assert checks["ffmpeg_ass_filter"]["ok"] is True
+    assert checks["ffmpeg_ass_filter"]["detail"] == "/mock/bin/ffmpeg-with-ass"
     assert "studio_external_bridge" not in checks
 
 
@@ -269,6 +276,11 @@ def test_studio_doctor_requires_the_external_bridge_but_remains_read_only(
     monkeypatch.setattr(
         resolve_service.shutil, "which", lambda name: f"/mock/bin/{name}"
     )
+    monkeypatch.setattr(
+        resolve_service,
+        "require_filter",
+        lambda name: f"/mock/bin/ffmpeg-with-{name}",
+    )
     monkeypatch.setattr(capture, "find_browser", lambda: None)
 
     report = resolve_service.portability_report(mode="studio")
@@ -280,6 +292,39 @@ def test_studio_doctor_requires_the_external_bridge_but_remains_read_only(
     assert report["safe"]["resolve_started"] is False
     assert report["safe"]["render_queue_touched"] is False
     assert report["safe"]["project_mutated"] is False
+
+
+def test_doctor_rejects_ffmpeg_without_libass_before_episode_work(
+    monkeypatch,
+):
+    def missing_ass_filter(_name):
+        raise RuntimeError(
+            "FFmpeg on PATH is missing the required 'ass' filter; "
+            "brew install ffmpeg-full"
+        )
+
+    monkeypatch.setattr(
+        resolve_service, "host_report", lambda: _host_report(bridge_available=True)
+    )
+    monkeypatch.setattr(
+        resolve_service.shutil, "which", lambda name: f"/mock/bin/{name}"
+    )
+    monkeypatch.setattr(
+        resolve_service,
+        "require_filter",
+        missing_ass_filter,
+    )
+    monkeypatch.setattr(capture, "find_browser", lambda: None)
+
+    report = resolve_service.portability_report(mode="free")
+    checks = {item["name"]: item for item in report["checks"]}
+
+    assert report["ok"] is False
+    assert checks["ffmpeg_ass_filter"]["ok"] is False
+    assert checks["ffmpeg_ass_filter"]["severity"] == "error"
+    assert "brew install ffmpeg-full" in checks["ffmpeg_ass_filter"]["detail"]
+    assert report["safe"]["resolve_started"] is False
+    assert report["safe"]["render_queue_touched"] is False
 
 
 def test_macos_browser_bundle_and_environment_override_are_discovered(
