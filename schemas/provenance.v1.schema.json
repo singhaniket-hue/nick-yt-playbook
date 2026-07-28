@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rabbithole.local/schemas/provenance.v1.schema.json",
+  "title": "Canonical asset provenance ledger",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "asset_id",
+      "tier",
+      "provider",
+      "original_url",
+      "license",
+      "retrieved_at",
+      "local_path",
+      "used_in_slots",
+      "notes"
+    ],
+    "properties": {
+      "asset_id": {"type": "string", "minLength": 1},
+      "tier": {"type": "string"},
+      "provider": {"type": "string"},
+      "original_url": {"type": "string"},
+      "license": {"type": "string"},
+      "retrieved_at": {"type": "string"},
+      "local_path": {"type": "string"},
+      "used_in_slots": {
+        "oneOf": [
+          {"type": "string", "minLength": 1},
+          {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "uniqueItems": true
+          }
+        ]
+      },
+      "notes": {}
+    }
+  }
+}

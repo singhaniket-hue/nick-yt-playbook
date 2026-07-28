@@ -1,0 +1,326 @@
+# crowley-hinglish: the custom OpenMontage-shaped pipeline definition for this
+# project's documentary format.
+#
+# This file is documentation-as-data. It describes stages, artifacts, and the
+# checkpoint/budget contract for humans (and any future tooling) to read. It
+# is NOT consumed by engine/ -- OpenMontage's own pipeline loader never sees
+# this file. Every stage below actually runs as a plain `rabbithole
+# <subcommand>` CLI invocation (see rabbithole/cli.py); there is no
+# executive-producer / stage-director-skill orchestration here, and nothing
+# in this file executes anything on its own. It exists so the contract this
+# project has struck with upstream's assumptions -- see
+# `deviations_from_documentary_montage` below -- is written down once,
+# explicitly, rather than left to be inferred from the code.
+#
+# Reference schema: engine/pipeline_defs/documentary-montage.yaml, read for
+# its shape only. Its assumptions are not this project's assumptions -- see
+# the deviations section for exactly where and why this file departs from it.
+
+name: crowley-hinglish
+version: "2.0"
+description: >
+  30-40 minute faceless investigative documentaries about dark-internet and
+  true-crime subjects, structured and paced after the @NickCrowley format,
+  narrated in the author's personal Hinglish voice by their ElevenLabs
+  professional voice clone. Five-act structure (Cold Open / Origin / Rabbit
+  Hole / Climax / Unresolved Outro) with Act III re-hooks every 3-5 minutes,
+  three-tier asset sourcing (primary artifacts / archival texture /
+  generated atmospherics) with a provenance ledger, a claims ledger gating
+  any assertion of wrongdoing about a named person, and a Resolve-first edit
+  (deterministic plan/FCPXML -> editable Resolve timeline -> grade + mix).
+  See docs/crowley-pipeline-automation-companion.md for the automation design
+  and docs/dark-documentary-playbook.md for the editorial reference.
+category: documentary
+stability: alpha  # actively under construction in this repo; not upstream's "beta"
+
+reference_input:
+  supported: false  # matches documentary-montage.yaml; no reference-video input path exists
+
+# -----------------------------------------------------------------------------
+# Where this pipeline deliberately does not inherit documentary-montage's
+# assumptions. Read documentary-montage.yaml as reference only -- these are
+# the specific points where this project's format is fundamentally different,
+# stated explicitly rather than left as a silent drift from the schema it was
+# modeled on.
+# -----------------------------------------------------------------------------
+deviations_from_documentary_montage:
+  - dimension: narration
+    documentary_montage: >
+      Narration is OPTIONAL (idea stage's narration_plan may legitimately be
+      absent if music + visuals + end-tag carry the register).
+    crowley_hinglish: >
+      Narration is MANDATORY. This format is narration-led Hinglish
+      commentary from end to end; there is no silent/music-only mode. The
+      script stage (see below) does not pass review without narration text,
+      and `rabbithole narrate` is not optional tooling -- it is the only
+      path from script to a renderable episode.
+
+  - dimension: runtime_and_shape
+    documentary_montage: >
+      An untimed "tone poem" -- duration and shape come from the brief, with
+      no fixed target.
+    crowley_hinglish: >
+      A fixed-format episode: 30-40 minutes at 165-190 WPM narration, ~4,500-
+      7,400 words across five acts with corpus-derived per-act word budgets
+      (ACT_BUDGETS in rabbithole/validate.py), average shot length 2.95-3.35s.
+      These are hard review-gate numbers, not guidance.
+
+  - dimension: render_split
+    documentary_montage: >
+      compose is a single Remotion-locked pass. Its own review_focus says so
+      explicitly: "render_runtime locked at proposal MUST stay 'remotion' on
+      this pipeline until HyperFrames end-tag parity lands -- ... Silent swap
+      to hyperframes or ffmpeg is a CRITICAL governance violation."
+    crowley_hinglish: >
+      An explicit Resolve-first hybrid, declared here as the stated contract
+      rather than left as an implicit break from upstream's lock:
+        1. Media preparation -- ffmpeg is retained for conforming source clips,
+           generated plates, editable audio stems, and deterministic probes.
+        2. Timeline compilation -- rabbithole.resolve_manifest and
+           rabbithole.fcpxml turn timing.json, edit/edl.json, and provenance.json
+           into a versioned integer-frame plan plus FCPXML.
+        3. Editorial and finish -- the in-app Resolve runner imports an immutable
+           AUTO_BUILD_<hash> timeline, adds track names and provenance markers,
+           applies the verified baseline LUT/grade where the API supports it,
+           queues the render, and creates a source-inclusive Project Archive for
+           handoff. Portable Fusion assets are installed for the editor; advanced
+           placement and texture/VHS treatments remain review work.
+      `rabbithole render --backend ffmpeg` remains the proven fallback and the
+      general-command default until the local Resolve pilot gates pass. It is
+      never selected as a silent downgrade from an explicit Resolve command.
+      Declaring this split here, in the pipeline definition itself, is what
+      makes it a stated contract instead of the silent swap upstream's own
+      compose stage explicitly forbids.
+
+  - dimension: orchestration_model
+    documentary_montage: >
+      orchestration.mode: executive-producer, routing every stage through an
+      LLM-agent "director" skill (pipelines/documentary-montage/*-director).
+    crowley_hinglish: >
+      Plain, deterministic Python. Every stage below is a `rabbithole
+      <subcommand>` CLI invocation (rabbithole/cli.py); there are no
+      pipeline/skills/*-director skills in this repo, and none are planned
+      for the stages that already have working deterministic implementations
+      (validation gates, EDL construction, rendering). This is a pipeline
+      definition in the documentary-montage sense of "declares stages and
+      artifacts," not in the sense of "is executable by engine/'s
+      orchestrator."
+
+# -----------------------------------------------------------------------------
+# Checkpoint / approval policy (design spec section 8.1).
+# -----------------------------------------------------------------------------
+default_checkpoint_policy: guided
+checkpoint_policy:
+  human_approval_required_at:
+    - brief    # projects/<slug>/brief.json, created by `rabbithole new <slug>`;
+               # not its own stage below (nothing downstream reads it as an
+               # artifact), but approval on it is required before script
+               # authoring starts.
+    - script
+    - assets
+    - edl
+  auto_approve_at:
+    - render
+  note: >
+    narrate, timing, and slots have no checkpoint of their own -- once script
+    is approved, narration, the timing spine, and the derived slot plan are
+    mechanical/deterministic outputs, not editorial decisions.
+
+# -----------------------------------------------------------------------------
+# Budget governance (design spec section 8.2). Values are the .env.example
+# defaults this repo ships; a real .env may override them per episode.
+# -----------------------------------------------------------------------------
+budget:
+  episode_cap_usd: 25    # RABBITHOLE_EPISODE_CAP_USD
+  mode: warn             # RABBITHOLE_BUDGET_MODE -- spend stays visible without
+                          # halting a render mid-run; upstream's $10 total cap /
+                          # $0.50 per-action threshold would trip continuously
+                          # on a full ~38k-character episode.
+
+orchestration:
+  mode: cli
+  entrypoint: rabbithole.cli:main
+  budget_default_usd: 25
+  budget_mode: warn
+
+extensions:
+  custom_scripts: true
+  custom_playbooks: false
+  custom_skills: false
+  custom_tools: false
+
+# -----------------------------------------------------------------------------
+# Stages, in run order. Each names the actual `rabbithole` CLI subcommand
+# that implements it (or explains why there isn't a dedicated one), the
+# artifacts it requires, and the artifacts it produces.
+# -----------------------------------------------------------------------------
+stages:
+  - name: script
+    cli: rabbithole validate <script.md>
+    description: >
+      The marked-up narration script: five acts, [SHOT:]/[SILENCE:]/[SFX:]/
+      [MUSIC:]/[REHOOK]/[CHAPTER:]/[CENSOR:]/[KEY:] markers, aap-register
+      Hinglish throughout. Reviewed by rabbithole.validate.validate_all plus
+      the romanized/Devanagari transliteration-parity gates.
+    required_artifacts_in:
+      - brief
+      - claims_ledger
+    produces:
+      - script
+    tools_available: []
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - Word count within 4500-7400
+      - Every act within 15% of its corpus-derived word budget
+      - Act III [REHOOK] markers spaced 3-5 minutes apart
+      - No aap-register violation (tum/yaar/bhai/casual tokens) survives
+      - Every assertion of wrongdoing about a named person has a claims_ledger entry
+      - Devanagari TTS edition mirrors the romanized canonical script exactly
+
+  - name: narrate
+    cli: rabbithole narrate <script.md> --out narration/vo.wav
+    description: >
+      ElevenLabs TTS from the Devanagari edition (voice selected with
+      RABBITHOLE_VOICE_ID, model eleven_multilingual_v2), chunked on paragraph boundaries with
+      previous_text/next_text for prosody continuity, [SILENCE:] realised as
+      true digital silence. Writes narration_audio AND timing_spine in one
+      call (rabbithole.pipeline:render_narration writes narration/timing.json
+      beside the output WAV) -- they are not two separate CLI invocations.
+    required_artifacts_in:
+      - script  # must pass the script stage's gates, or --force
+    produces:
+      - narration_audio
+      - timing_spine
+    tools_available:
+      - elevenlabs_tts
+    checkpoint_required: false
+    human_approval_default: false
+
+  - name: timing
+    cli: rabbithole timing <narration/timing.json>
+    description: >
+      Not a producer of new artifacts -- timing_spine is already written by
+      the narrate stage above. This is the review/report point over that
+      spine: measured WPM vs. the 165-190 band, marker counts, REHOOK gap
+      minutes. Listed as its own stage because it is the natural place a
+      human sanity-checks pacing before assets/edl consume the spine.
+    required_artifacts_in:
+      - timing_spine
+    produces: []
+    tools_available: []
+    checkpoint_required: false
+    human_approval_default: false
+
+  - name: slots
+    cli: null  # no dedicated subcommand
+    description: >
+      The slot plan (rabbithole.slots:build_slots): one Slot per [SHOT:]
+      marker, kind/detail/queries/hold-duration. Not materialised by its own
+      CLI stage -- `rabbithole assets` and `rabbithole edl` each call
+      build_slots() internally, deterministically, from timing_spine. Listed
+      here because it is a distinct, reviewable artifact shape and a shared
+      dependency of both downstream stages, not because a separate command
+      writes it to disk.
+    required_artifacts_in:
+      - timing_spine
+    produces:
+      - slot_plan  # derived, not persisted to its own file
+    tools_available: []
+    checkpoint_required: false
+    human_approval_default: false
+
+  - name: assets
+    cli: rabbithole assets <narration/timing.json>
+    description: >
+      Plans and sources one asset per slot across three tiers (primary
+      artifacts, archival texture, generated atmospherics), recording full
+      provenance (provider, original_url, license, retrieved_at) for every
+      asset.
+    required_artifacts_in:
+      - timing_spine
+      - slot_plan
+      - claims_ledger
+      - research_artifacts
+    produces:
+      - asset_manifest  # provenance.json
+    tools_available:
+      - ytdlp
+      - archive_sources
+      - plate_generator
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - Every slot has exactly one asset in the provenance ledger
+      - Tier-1 (primary artifact) footage never fetched without a matching claims_ledger entry
+      - Full licence string present on every archival-texture asset
+
+  - name: edl
+    cli: rabbithole edl <narration/timing.json>
+    description: >
+      The edit decision list: script-pinned [SHOT:] cuts subdivided with
+      asl-fill cutaways to bring local average shot length into 2.95-3.35s,
+      plus overlay instructions (rabbithole.overlays:build_overlays) for
+      chapter cards, censor boxes, and keyword highlights derived from
+      [CHAPTER:]/[CENSOR:]/[KEY:] markers.
+    required_artifacts_in:
+      - timing_spine
+      - slot_plan
+      - asset_manifest
+    produces:
+      - edit_decision_list  # edit/edl.json: cuts[] + overlays[]
+    tools_available: []
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - Total duration within 1s of narration
+      - No two adjacent cuts share subject AND scale
+      - At most 4 distinct transition types
+      - Every cut has a reason; every pinned (script-origin) cut still sits at its marker time
+
+  - name: render
+    cli: rabbithole resolve render <project-root>
+    description: >
+      Compile the immutable edit plan, execute it through Resolve Free's in-app
+      runner or Resolve Studio's external scripting bridge, and render from the
+      editable Resolve timeline. Safety locks refuse overlapping project work
+      or an already-running Resolve render.
+    required_artifacts_in:
+      - edit_decision_list
+      - asset_manifest
+      - narration_audio
+      - timing_spine
+    produces:
+      - resolve_plan       # resolve-plan.v1.json + timeline.fcpxml
+      - resolve_timeline   # AUTO_BUILD_<hash>, duplicated by editors before edits
+      - render_output      # Resolve render under projects/<slug>/renders/
+      - project_archive    # optional full-media .dra + .drp handoff
+    render_layers:
+      - name: prepare
+        engine: ffmpeg
+        implementation:
+          - rabbithole.audiomix
+          - rabbithole.sources.plates
+        produces: conformed media, generated plates, and editable audio stems
+      - name: compile
+        engine: python
+        implementation:
+          - rabbithole.resolve_manifest
+          - rabbithole.fcpxml
+        produces: versioned frame-accurate Resolve plan and FCPXML
+      - name: finish
+        engine: davinci_resolve
+        implementation: rabbithole.resolve_runner
+        produces: >
+          editable V1-V4/A1-A5 track contract, subtitles, grouped provenance
+          markers, baseline grade intent/application, an optional final render,
+          and a source-inclusive portable archive. Fusion/VHS placement and the
+          complete Crowley texture treatment remain human-review items.
+    tools_available: []
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - Generated duration matches the EDL to within one frame
+      - No protected EDITORIAL_vN timeline was changed
+      - Evidence, redactions, rights flags, subtitles, and source bites are reviewed
+      - Output and restored archive match the target canvas and track map

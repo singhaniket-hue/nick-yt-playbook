@@ -1,0 +1,123 @@
+# Human-readable channel style contract.
+# The Python compiler has dependency-free defaults matching these values.
+# Per-episode machine overrides belong in <project>/resolve-overrides.json.
+schema_version: 1
+name: crowley_hinglish
+
+timeline:
+  width: 1920
+  height: 1080
+  fps: 30
+  audio_sample_rate: 48000
+  start_timecode: "01:00:00:00"
+  generated_timeline_prefix: "AUTO_BUILD_"
+  protected_timeline_prefix: "EDITORIAL_"
+
+tracks:
+  video:
+    V1: "BASE FOOTAGE"
+    V2: "EVIDENCE + INSERTS"
+    V3: "TEXT + GRAPHICS"
+    V4: "GRAIN + TEXTURE"
+  audio:
+    A1: "NARRATION"
+    A2: "SOURCE BITES"
+    A3: "MUSIC"
+    A4: "SFX"
+    A5: "ROOM TONE + UTILITY"
+  subtitle:
+    S1: "HINGLISH / DEVANAGARI"
+
+narration:
+  lufs_target: -15
+  lufs_tolerance: 1
+  high_pass_hz: 80
+  mud_cut_hz: 350
+  presence_low_hz: 2000
+  presence_high_hz: 5000
+  compressor_ratio: 3.0
+  gain_reduction_db: [4, 6]
+  limiter_dbtp: -1
+
+ducking:
+  music_under_voice_db: -15
+  source_bite_default_db: -18
+  release_ms: 900
+  silence_return_fade_ms: 1000
+
+grade:
+  lut: "../style/luts/crowley-noir.cube"
+  powergrade: "grades/crowley_v1.drx"
+  saturation_range: [0.35, 0.45]
+  teal_shadows: true
+  lower_highlights: true
+  vignette_amount: 0.20
+  note: "The LUT carries color only. Vignette and texture stay editable in Resolve."
+
+texture:
+  video_track: V4
+  grain_opacity: 0.18
+  grain_opacity_range: [0.10, 0.30]
+  scanline_opacity: 0.08
+  blend_mode: overlay
+
+vhs:
+  intensity: 0.60
+  apply_to: [tagged, generated]
+  layers:
+    - soften
+    - chromatic_aberration
+    - scanlines
+    - noise
+    - jitter
+    - osd_timecode
+    - edge_damage
+  osd_font: "VCR OSD Mono"
+
+motion:
+  still_push_pct: 8
+  screenshot_push_pct: 5
+  long_footage_push_pct: 3
+  long_footage_threshold_seconds: 12
+  alternate_direction: true
+  alternate_axis: true
+  heavy_freeze: true
+  easing: smooth
+
+transitions:
+  default: hard_cut
+  evidence: static_burst
+  evidence_frames: [2, 5]
+  chapter: glitch_break_v1
+  chapter_frames: [8, 15]
+  post_heavy: dip_black
+  post_heavy_ms: 1500
+  jcut_lead_ms: 1500
+  maximum_distinct_types: 4
+
+titles:
+  chapter_template: "Fusion/Templates/Edit/Titles/RabbitholeChapter.setting"
+  source_template: "Fusion/Templates/Edit/Titles/RabbitholeSource.setting"
+  chapter_duration_seconds: [2.5, 4.0]
+  chapter_label_color: "#ff334e"
+  title_color: "#f4f1e8"
+  background_color: "#08090b"
+  font_fallbacks:
+    monospace: ["IBM Plex Mono", "Courier New"]
+    devanagari: ["Noto Sans Devanagari", "Mangal"]
+
+review_flags:
+  require_human_verification:
+    - tracked_redaction
+    - source_rights_unclear
+    - missing_media
+    - generated_recreation
+    - deepest_point
+    - unresolved_evidence
+
+handoff:
+  include_source_media: true
+  include_render_cache: false
+  include_proxy_media: false
+  include_project_export: true
+  include_checksums: true

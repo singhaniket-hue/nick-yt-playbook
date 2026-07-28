@@ -1,0 +1,37 @@
+[project]
+name = "rabbithole"
+version = "0.2.0"
+description = "Portable Resolve-first automation toolkit for long-form dark-documentary video production"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "Pillow>=10.0",
+    "python-dotenv>=1.0",
+    "requests>=2.31",
+    "yt-dlp>=2024.8.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+mcp = [
+    "mcp>=1.25,<2",
+]
+
+[project.scripts]
+rabbithole = "rabbithole.cli:main"
+rabbithole-resolve-mcp = "rabbithole.resolve_mcp:main"
+rabbithole-resolve-runner = "rabbithole.resolve_runner:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["rabbithole*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

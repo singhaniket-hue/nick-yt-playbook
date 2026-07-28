@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rabbithole.local/schemas/edl.v1.schema.json",
+  "title": "Canonical edit decision list",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "quality",
+    "mode",
+    "duration_seconds",
+    "cut_count",
+    "average_shot_length",
+    "cuts",
+    "overlays"
+  ],
+  "properties": {
+    "quality": {"type": "string", "minLength": 1},
+    "mode": {"type": "string", "minLength": 1},
+    "duration_seconds": {"type": "number", "minimum": 0},
+    "cut_count": {"type": "integer", "minimum": 0},
+    "average_shot_length": {"type": "number", "minimum": 0},
+    "cuts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "index",
+          "start",
+          "end",
+          "slot_id",
+          "origin",
+          "framing",
+          "transition",
+          "reason"
+        ],
+        "properties": {
+          "index": {"type": "integer", "minimum": 0},
+          "start": {"type": "number", "minimum": 0},
+          "end": {"type": "number", "minimum": 0},
+          "slot_id": {"type": "string", "minLength": 1},
+          "origin": {"type": "string"},
+          "framing": {},
+          "transition": {},
+          "reason": {"type": "string"}
+        }
+      }
+    },
+    "overlays": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "start", "end", "text", "detail"],
+        "properties": {
+          "kind": {"type": "string", "minLength": 1},
+          "start": {"type": "number", "minimum": 0},
+          "end": {"type": "number", "minimum": 0},
+          "text": {"type": "string"},
+          "detail": {}
+        }
+      }
+    }
+  }
+}

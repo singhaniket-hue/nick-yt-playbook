@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rabbithole.local/schemas/timing.v1.schema.json",
+  "title": "Canonical narration timing",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["duration_seconds", "word_count", "words", "markers"],
+  "properties": {
+    "duration_seconds": {"type": "number", "minimum": 0},
+    "word_count": {"type": "integer", "minimum": 0},
+    "words": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["index", "word", "start", "end"],
+            "properties": {
+              "index": {"type": "integer", "minimum": 0},
+              "word": {"type": "string"},
+              "start": {"type": "number", "minimum": 0},
+              "end": {"type": "number", "minimum": 0}
+            }
+          },
+          {
+            "type": "array",
+            "prefixItems": [
+              {"type": "integer", "minimum": 0},
+              {"type": "string"},
+              {"type": "number", "minimum": 0},
+              {"type": "number", "minimum": 0}
+            ],
+            "minItems": 4,
+            "maxItems": 4
+          }
+        ]
+      }
+    },
+    "markers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "arg", "word_index", "line", "seconds"],
+        "properties": {
+          "kind": {"type": "string", "minLength": 1},
+          "arg": {},
+          "word_index": {"type": ["integer", "null"]},
+          "line": {"type": ["integer", "null"]},
+          "seconds": {"type": "number", "minimum": 0}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,35 @@
+[
+  {
+    "asset_id": "demo-s001",
+    "tier": "primary",
+    "provider": "local synthetic fixture",
+    "original_url": "",
+    "license": "CC0-style generated test media; no external source",
+    "retrieved_at": "2026-07-28T00:00:00Z",
+    "local_path": "assets/s001.mp4",
+    "used_in_slots": ["s001"],
+    "notes": "Generated locally by scripts/create_demo_media.py"
+  },
+  {
+    "asset_id": "demo-s002",
+    "tier": "archival",
+    "provider": "local synthetic fixture",
+    "original_url": "",
+    "license": "CC0-style generated test media; no external source",
+    "retrieved_at": "2026-07-28T00:00:00Z",
+    "local_path": "assets/s002.mp4",
+    "used_in_slots": ["s002"],
+    "notes": "Generated locally by scripts/create_demo_media.py"
+  },
+  {
+    "asset_id": "demo-s003",
+    "tier": "generated",
+    "provider": "local synthetic fixture",
+    "original_url": "",
+    "license": "CC0-style generated test media; no external source",
+    "retrieved_at": "2026-07-28T00:00:00Z",
+    "local_path": "assets/s003.mp4",
+    "used_in_slots": ["s003"],
+    "notes": "Generated locally by scripts/create_demo_media.py"
+  }
+]

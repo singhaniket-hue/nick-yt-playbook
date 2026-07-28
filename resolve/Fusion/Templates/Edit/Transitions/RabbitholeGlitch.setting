@@ -1,0 +1,59 @@
+{
+	Tools = ordered() {
+		RabbitholeGlitch = GroupOperator {
+			NameSet = true,
+			Inputs = ordered() {
+				MainInput1 = InstanceInput {
+					SourceOp = "GlitchDissolve",
+					Source = "Background",
+				},
+				MainInput2 = InstanceInput {
+					SourceOp = "GlitchDissolve",
+					Source = "Foreground",
+				},
+				Intensity = InstanceInput {
+					SourceOp = "NoiseMap",
+					Source = "Contrast",
+					Name = "Glitch intensity",
+					Default = 3,
+				},
+			},
+			Outputs = {
+				MainOutput1 = InstanceOutput {
+					SourceOp = "GlitchDissolve",
+					Source = "Output",
+				}
+			},
+			Tools = ordered() {
+				NoiseMap = FastNoise {
+					Inputs = {
+						GlobalOut = Input { Value = 20000, },
+						Width = Input { Value = 1920, },
+						Height = Input { Value = 1080, },
+						UseFrameFormatSettings = Input { Value = 1, },
+						Detail = Input { Value = 1, },
+						Contrast = Input { Value = 3, },
+						Scale = Input { Value = 18, },
+						SeetheRate = Input { Value = 2, },
+					},
+					ViewInfo = OperatorInfo { Pos = { -110, 85 } },
+				},
+				GlitchDissolve = Dissolve {
+					Transitions = {
+						[0] = "DFTLumaRamp"
+					},
+					Inputs = {
+						Operation = Input { Value = FuID { "DFTLumaRamp" }, },
+						Map = Input {
+							SourceOp = "NoiseMap",
+							Source = "Output",
+						},
+						["DFTLumaRamp.Softness"] = Input { Value = 0.03, },
+					},
+					ViewInfo = OperatorInfo { Pos = { 110, 25 } },
+				}
+			},
+		}
+	},
+	ActiveTool = "RabbitholeGlitch"
+}

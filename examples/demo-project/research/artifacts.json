@@ -1,0 +1,34 @@
+[
+  {
+    "artifact_id": "demo-001",
+    "url": "https://example.com/archive/signal-room",
+    "title": "Fictional signal-room archive",
+    "kind": "web-page",
+    "date": "2025-01-15",
+    "source_role": "primary",
+    "use": "Opening screenshot",
+    "rights_note": "Synthetic example; replace with a verified source",
+    "slot_id": "s001"
+  },
+  {
+    "artifact_id": "demo-002",
+    "url": "https://example.org/library/radio-log",
+    "title": "Fictional radio log",
+    "kind": "document",
+    "date": "2024-11-02",
+    "source_role": "context",
+    "use": "Timeline context",
+    "rights_note": "Synthetic example; replace with a verified source"
+  },
+  {
+    "artifact_id": "demo-003",
+    "url": "https://example.net/collections/transmitter",
+    "title": "Fictional transmitter photograph",
+    "kind": "image",
+    "date": "2023-06-10",
+    "source_role": "illustrative",
+    "use": "Equipment cutaway",
+    "rights_note": "Synthetic example; replace with a licensed source",
+    "slot_id": "s003"
+  }
+]

@@ -1,0 +1,12 @@
+{
+  "title_card": {"family": "Bebas Neue", "weight": 400, "transform": "uppercase", "tracking": 0.04},
+  "thumbnail": {"family": "Montserrat", "weight": 900, "transform": "uppercase"},
+  "subtitle": {
+    "family": "Inter",
+    "weight": 600,
+    "placement": "lower-third-center",
+    "fill": "#E0E0E0",
+    "keyword_fill": "#FFFF00",
+    "shadow": "0 2px 6px rgba(0,0,0,0.9)"
+  }
+}

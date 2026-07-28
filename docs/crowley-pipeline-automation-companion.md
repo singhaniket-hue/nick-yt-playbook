@@ -2,18 +2,30 @@
 
 **Companion to the Dark Documentary Playbook**
 
-Automating the dark-documentary edit in DaVinci Resolve — how the local AI production pipeline (Claude Code / Codex CLI → MCP → Resolve scripting API) is configured to produce videos in the exact style defined in the Playbook.
+Target design for automating the dark-documentary edit in DaVinci Resolve —
+how the local RabbitHole CLI/MCP pipeline maps the Playbook into deterministic
+editing rules.
 
 | | |
 |---|---|
-| **System** | `local_media_mcp.py` + `davinci_resolve_mcp.py` |
-| **Engine** | DaVinci Resolve (free tier) scripting API |
+| **System** | `rabbithole` CLI + `rabbithole.resolve_mcp` |
+| **Engine** | DaVinci Resolve in-app API, with FFmpeg preparation/fallback |
 | **Style** | Nick Crowley — analog-horror documentary |
 | **Input** | Machine-readable script + asset folder |
-| **Output** | Draft rough cut, styled, ready for human pass |
+| **Target output** | Draft rough cut, styled, ready for human pass |
 | **Date** | July 2026 |
 
 ---
+
+> **IMPLEMENTATION SCOPE**
+>
+> Sections 03–11 are the target-state design contract, not a claim that every
+> treatment is already automated. The implementation-status table in Section 12
+> is authoritative. The current Resolve path compiles and imports an editable
+> conform, names its tracks, preserves source/review metadata, applies only the
+> explicitly tested baseline style treatments, and packages an editor handoff.
+> Fairlight processing, advanced VHS damage, tracked redactions, final credits,
+> and emotional timing remain manual or planned until their status is updated.
 
 ## Contents
 
@@ -59,7 +71,7 @@ The mapping between the two documents:
 
 The Project Overview is explicit: no visual judgment, no emotional-beat sense, no one-shot perfection. In this genre the line falls in a specific place, because dread is a timing art. The machine assembles everything that is **rule-driven**; you own everything that is **dread-driven**.
 
-| The pipeline does (deterministic) | You do (judgment) |
+| Target pipeline does (deterministic) | You do (judgment) |
 |---|---|
 | Cut narration into the timeline with scripted pauses | Decide whether a pause needs 2 seconds or 4 |
 | Place assets against script beats per the shot list | Choose WHICH screenshot is the most chilling one |
@@ -117,8 +129,8 @@ Stage 2 generates whatever the script calls for that doesn't exist. In this genr
 
 | Source | Generates | Style constraints (auto-applied prompt suffix / post-process) |
 |---|---|---|
-| `local_media_mcp.py` (images) | Atmospheric B-roll stills: dark hallways, rural roads, CRT screens, storm windows | Dark, desaturated, underexposed, grain-friendly; degraded by the VHS stack downstream so it blends |
-| `local_media_mcp.py` (video) | Short ambient loops (static, rain, flickering light) | 4–8s loops; low motion; no faces, no readable text |
+| Configured local image generator | Atmospheric B-roll stills: dark hallways, rural roads, CRT screens, storm windows | Dark, desaturated, underexposed, grain-friendly; degraded by the VHS stack downstream so it blends |
+| Configured local video generator | Short ambient loops (static, rain, flickering light) | 4–8s loops; low motion; no faces, no readable text |
 | Higgsfield | Higher-end atmosphere shots and stylized recreations | Always tagged `[REC]`; era-appropriate degradation |
 | ElevenLabs voice clone | Pickup lines when re-recording isn't possible; quote read-outs (labeled) | Never used to voice real people from the case — quotes are read in YOUR narrator voice or shown as text cards |
 | Noise-suppression tool | Cleans your narration before ingest | 30–50% mix per Playbook §05 — over-cleaned voice breaks the intimate close-mic feel |
@@ -129,7 +141,8 @@ Generation requests inherit a fixed style prompt block (palette, mood, grain, er
 
 ## 05 Timeline Assembly — Track Map & Placement
 
-`davinci_resolve_mcp.py` builds every project on the Playbook §08 track layout, hard-coded so all projects are identical and every later stage knows where things live:
+The target contract builds every project on a fixed track layout so all projects
+are identical and every later stage knows where things live:
 
 ```
 V4  grain / texture overlays        # one grain clip spanning the timeline, Overlay blend, 10–30%
@@ -138,12 +151,13 @@ V2  evidence & inserts              # screenshots, screen recordings, documents,
 V1  base footage                    # archive footage, B-roll, recreations, location shots
 
 A1  narration                       # per-chapter VO WAVs, cut with [PAUSE] gaps
-A2  music beds                      # per-chapter beds, sidechain-ducked to A1
-A3  ambience / room tone            # never true silence except during [SILENCE]
+A2  original-source bites           # quoted/source audio preserved separately
+A3  music beds                      # per-chapter beds, ducked under A1
 A4  SFX hits                        # booms, static bursts, typewriter clicks, camera shutters
+A5  ambience / room tone            # utility audio; silence only when authored
 ```
 
-### Assembly order (mirrors the Playbook's radio-edit workflow)
+### Target assembly order (mirrors the Playbook's radio-edit workflow)
 
 1. **Narration skeleton.** Place chapter VO files on A1 in order, inserting `[PAUSE]` gaps. Timeline length is now fixed. Compute each paragraph's in/out timecodes from the VO segments (silence detection between paragraphs, validated against script word counts at 130–150 wpm).
 2. **Chapter infrastructure.** At each `[CH:]` boundary: insert the glitch-break macro (Sec. 08), then the chapter-card compound clip on V3 (2.5–4s), then a marker that later exports as a YouTube timestamp.
@@ -154,6 +168,10 @@ A4  SFX hits                        # booms, static bursts, typewriter clicks, c
 ---
 
 ## 06 Audio Pass — Fairlight Automation
+
+This section is a target-state Fairlight specification. The current reusable
+pipeline can prepare/mix deterministic stems with FFmpeg; it does not yet build
+this complete Fairlight chain through Resolve's scripting API.
 
 - **Narration chain** (per Playbook §05), applied as a saved Fairlight preset: high-pass 80 Hz → mud cut ~300–400 Hz → presence lift 2–5 kHz → compression ~3:1 targeting 4–6 dB reduction → normalize dialogue to **−15 LUFS ±1**.
 - **Ducking:** sidechain compressor on A2 keyed from A1, ~−15 dB under speech, slow release so beds swell gently in pauses — mimicking the manual keyframing the Playbook describes.
@@ -185,15 +203,27 @@ Every motion value lives in the config (Sec. 11), so "zoom aggressiveness" is on
 
 ### The Crowley grade (stage 6 of the pipeline)
 
-Built once by hand on the Color page per Playbook §08 — saturation ~35–45, crushed-but-readable shadows pushed teal, lowered highlights, soft vignette −15 to −25% — then exported as a **PowerGrade / .cube LUT** the pipeline applies to every clip. Grain is NOT baked into the LUT; it's the V4 overlay clip, so it stays uniform across cuts. One grade, every clip, every video: the consistency that builds channel identity is now free.
+The target look is built once on the Color page per Playbook §08 — saturation
+~35–45, crushed-but-readable shadows pushed teal, lowered highlights, soft
+vignette −15 to −25% — then exported as a PowerGrade or `.cube` LUT. The current
+runner checksum-locks the asset and applies it only to eligible archival V1
+clips on a newly imported build; evidence V2 and pre-styled graphics are left
+untouched. Grain, vignette, and VHS damage are not encoded in the LUT and remain
+editable V4/Fusion review work.
 
 ### The VHS degradation stack as a preset
 
-The Playbook §09 stack (soften → chromatic aberration → scanlines → noise → jitter → OSD timecode → edge damage) is built once as a Fusion macro / saved preset chain. The pipeline applies it to every clip tagged `[VHS]` or `[REC]`, and to everything in `/assets/generated/` by default (degradation is what makes generated B-roll blend with real archive material). Intensity is a single 0–1 config parameter mapped across all seven layers.
+The target Playbook §09 stack (soften → chromatic aberration → scanlines →
+noise → jitter → OSD timecode → edge damage) is built once as a Fusion macro /
+saved preset chain. The repository installs its portable template assets, but
+the documented scripting API cannot deterministically place and trim them at
+an arbitrary edit range. The runner records this as manual style intent instead
+of pretending the treatment was applied.
 
 ### The signature glitch chapter break
 
-The channel's watermark (Playbook §09) ships as a reusable timeline chunk the assembler drops at every `[CH:]` boundary:
+The target channel watermark (Playbook §09) is a reusable timeline chunk for an
+editor to place at every `[CH:]` boundary:
 
 1. Preceding footage plays clean for its final 3–6 seconds (assembler guarantees this window exists).
 2. 8–15 frames of stacked damage: static burst overlay + displacement slices + 2-frame stutter repeats + hue rotation into magenta/pink-red with saturation spike (pre-built 10-frame adjustment clip).
@@ -221,6 +251,10 @@ The Playbook's transition table (§10) translates directly into deterministic in
 ---
 
 ## 10 Text & Graphics Automation
+
+These are target behaviors. The baseline repository includes portable Fusion
+templates and deterministic text intent, but tracked redactions, per-character
+SFX, and final credit/description generation are not yet complete.
 
 - **Chapter cards:** one Fusion template (Playbook §12): red monospace "CHAPTER 03" typewriter-animated at top, white title glitch-in below, grain + vignette pulse, boom. The assembler instantiates it per `[CH:]` tag — text is data, design is fixed.
 - **Typewriter engine:** Text+ with Write-On/Follower animation as a macro; per-character click SFX auto-laid on A4 at low volume.
@@ -286,7 +320,10 @@ safety:
 
 ### Draft render output
 
-Each run produces: `draft_v{n}.mp4` (1080p H.264 review quality) · `chapters.txt` (YouTube timestamps) · `credits.txt` · `qc_report.txt` (uncovered narration, missing assets, loudness stats, items awaiting human review) · a Resolve project you open for the human pass.
+A complete target-state run produces: `draft_v{n}.mp4` (1080p H.264 review
+quality), `chapters.txt`, `credits.txt`, `qc_report.txt`, and a Resolve project
+for the human pass. The current handoff includes those text/QC artifacts only
+when the episode already generated them.
 
 ### The review loop, genre edition
 
@@ -295,21 +332,30 @@ Each run produces: `draft_v{n}.mp4` (1080p H.264 review quality) · `chapters.tx
 3. Human pass in Resolve for the judgment work: deepest-point timing, evidence verification, redaction check, the final ±5% on silences.
 4. Final render at full quality; description assembled from chapters + credits + content warning template.
 
-### Build roadmap (extends the Project Overview status list)
+### Implementation status
 
 | # | Milestone | Status |
 |---|---|---|
-| 1 | `local_media_mcp.py` — local image/video generation routing | Built |
-| 2 | `davinci_resolve_mcp.py` — Resolve scripting API as MCP tools | Next build |
-| 3 | Style asset pack: `crowley_v1` PowerGrade/LUT, VHS stack macro, glitch-break chunk, chapter-card + text templates (hand-built once in Resolve, per Playbook §08–§12) | To do — prerequisite for stage 6/7 automation |
-| 4 | `crowley_style.yaml` v1 + script tag parser | To do |
-| 5 | End-to-end test on one real chapter (not a full video) — validates timing math, ducking, and the glitch break placement cheaply | To do |
-| 6 | Full-video run + review-loop dry run | To do |
-| 7 | Extensions: thumbnail draft generation, publishing tools | Later |
+| 1 | Local media preparation, capture, source-audio, plate, music, and SFX tooling | Built |
+| 2 | Versioned Resolve plan and FCPXML compiler with CLI and local MCP entry points | Built |
+| 3 | Resolve Free in-app runner, explicit Studio external bridge, durable queue, and fail-closed safety locks | Built and fake-API tested; Free Console still requires Python 3.11+ confirmation |
+| 4 | Portable style pack: `crowley_style.yaml`, deterministic LUT, Fusion titles, and glitch transition | Built; the baseline LUT is applied to eligible archival V1 clips, while Fusion/V4 placement and optional PowerGrade/DRX capture remain manual |
+| 5 | Editor handoff with source-inclusive DRA, DRP, presets, fonts/licenses, manifest, and checksums | Built; fake-API tested |
+| 6 | Synthetic chapter compile and import fixture | Compiler and fake import pass; live Resolve pilot is pending after the local first-run Welcome screen |
+| 7 | Full real-episode run and human review-loop dry run | Pending |
+| 8 | Thumbnail drafts and publishing tools | Later |
 
-> **A NOTE ON THE FREE TIER**
+> **A NOTE ON RESOLVE FREE**
 >
-> Everything above runs on Resolve's free tier via its scripting API. The Studio-only features the Project Overview mentions (Magic Mask for parallax cutouts, advanced noise reduction) have free workarounds in the Playbook (manual masks / remove.bg, Adobe Podcast Enhance). The $295 Studio license remains a someday-maybe, not a dependency.
+> Resolve Free supports the required API calls only from a script running inside
+> Resolve, such as the Python Console or an installed Workspace script. It does
+> not expose the external scripting bridge used by a terminal process. The CLI
+> and MCP server therefore compile and queue the job; the editor pastes the
+> printed loader into Resolve's Console, or runs the installed Workspace runner.
+> Resolve Studio can run the same queue externally when that mode is selected
+> explicitly. The checked-in Python runner requires a Console running Python
+> 3.11 or newer; its bootstrap refuses older Consoles before claiming a job.
+> Studio-only effects still need their documented free alternatives.
 
 ---
 

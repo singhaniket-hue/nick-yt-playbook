@@ -1,0 +1,67 @@
+{
+	Tools = ordered() {
+		RabbitholeSource = GroupOperator {
+			NameSet = true,
+			Inputs = ordered() {
+				SourceText = InstanceInput {
+					SourceOp = "SourceCaption",
+					Source = "StyledText",
+					Name = "Source",
+					Default = "SOURCE: ARCHIVE",
+				},
+			},
+			Outputs = {
+				MainOutput1 = InstanceOutput {
+					SourceOp = "CaptionMerge",
+					Source = "Output",
+				}
+			},
+			Tools = ordered() {
+				TransparentBackground = Background {
+					Inputs = {
+						GlobalOut = Input { Value = 20000, },
+						Width = Input { Value = 1920, },
+						Height = Input { Value = 1080, },
+						UseFrameFormatSettings = Input { Value = 1, },
+						TopLeftAlpha = Input { Value = 0, },
+					},
+					ViewInfo = OperatorInfo { Pos = { -220, 0 } },
+				},
+				SourceCaption = TextPlus {
+					Inputs = {
+						GlobalOut = Input { Value = 20000, },
+						Width = Input { Value = 1920, },
+						Height = Input { Value = 1080, },
+						UseFrameFormatSettings = Input { Value = 1, },
+						StyledText = Input { Value = "SOURCE: ARCHIVE", },
+						Font = Input { Value = "IBM Plex Mono", },
+						Style = Input { Value = "Medium", },
+						Size = Input { Value = 0.024, },
+						HorizontalJustificationNew = Input { Value = 0, },
+						VerticalJustificationNew = Input { Value = 3, },
+						Center = Input { Value = { 0.055, 0.085 }, },
+						Red1 = Input { Value = 0.905, },
+						Green1 = Input { Value = 0.880, },
+						Blue1 = Input { Value = 0.806, },
+						ShadingElements = Input { Value = 2, },
+					},
+					ViewInfo = OperatorInfo { Pos = { -220, 90 } },
+				},
+				CaptionMerge = Merge {
+					Inputs = {
+						Background = Input {
+							SourceOp = "TransparentBackground",
+							Source = "Output",
+						},
+						Foreground = Input {
+							SourceOp = "SourceCaption",
+							Source = "Output",
+						},
+					},
+					ViewInfo = OperatorInfo { Pos = { 0, 35 } },
+				}
+			},
+		}
+	},
+	ActiveTool = "RabbitholeSource"
+}

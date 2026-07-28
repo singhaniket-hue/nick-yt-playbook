@@ -1,0 +1,9 @@
+{
+  "vhs-burst": {"category": "texture", "cadence_seconds": [3, 5], "trigger": "visual cut or archival transition"},
+  "static-crackle": {"category": "texture", "cadence_seconds": [3, 5], "trigger": "screenshot reveal"},
+  "sub-drop": {"category": "impact", "cadence_seconds": [30, 60], "trigger": "suspect reveal or graphic detail"},
+  "bass-thud": {"category": "impact", "cadence_seconds": [30, 60], "trigger": "chapter punctuation"},
+  "glitch-sting": {"category": "accent", "cadence_seconds": [10, 15], "trigger": "web screenshot zoom or text callout"},
+  "metal-scrape": {"category": "accent", "cadence_seconds": [10, 15], "trigger": "text callout"},
+  "heartbeat": {"category": "tension", "cadence_seconds": [45, 60], "trigger": "countdown or emergency audio"}
+}

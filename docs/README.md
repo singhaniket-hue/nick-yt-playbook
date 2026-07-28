@@ -6,6 +6,7 @@ Reference documents for the dark-documentary YouTube production project, extract
 |---|---|
 | [The Dark Documentary Playbook](./dark-documentary-playbook.md) | The complete manual: style analysis, topic selection, research workflow, scripting, narration, assets, music/sound design, DaVinci Resolve editing, VHS/analog-horror VFX, transitions, motion graphics, text & chapter cards, thumbnails, publishing, ethics, and the full free-tool toolkit. |
 | [The Crowley Pipeline — Automation Companion](./crowley-pipeline-automation-companion.md) | How the local AI pipeline (Claude Code / Codex CLI → MCP → Resolve scripting API) automates that style: the automation boundary, script tag vocabulary, asset generation rules, timeline assembly, audio/motion/style automation, `crowley_style.yaml`, and the build roadmap. |
+| [DaVinci Resolve Automation Workflow](./resolve-workflow.md) | The implemented Free/Studio workflow, immutable timeline model, render-safety rules, editor handoff format, CLI commands, and recovery procedure. |
 
 ## How they fit together
 

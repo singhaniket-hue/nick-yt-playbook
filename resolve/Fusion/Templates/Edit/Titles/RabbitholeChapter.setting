@@ -1,0 +1,106 @@
+{
+	Tools = ordered() {
+		RabbitholeChapter = GroupOperator {
+			NameSet = true,
+			Inputs = ordered() {
+				ChapterLabel = InstanceInput {
+					SourceOp = "ChapterLabelText",
+					Source = "StyledText",
+					Name = "Chapter label",
+					Default = "CHAPTER 01",
+				},
+				ChapterTitle = InstanceInput {
+					SourceOp = "ChapterTitleText",
+					Source = "StyledText",
+					Name = "Chapter title",
+					Default = "THE RABBIT HOLE",
+				},
+			},
+			Outputs = {
+				MainOutput1 = InstanceOutput {
+					SourceOp = "TitleMerge",
+					Source = "Output",
+				}
+			},
+			Tools = ordered() {
+				BlackBackground = Background {
+					Inputs = {
+						GlobalOut = Input { Value = 20000, },
+						Width = Input { Value = 1920, },
+						Height = Input { Value = 1080, },
+						UseFrameFormatSettings = Input { Value = 1, },
+						TopLeftRed = Input { Value = 0.0037, },
+						TopLeftGreen = Input { Value = 0.0048, },
+						TopLeftBlue = Input { Value = 0.0060, },
+					},
+					ViewInfo = OperatorInfo { Pos = { -330, 0 } },
+				},
+				ChapterLabelText = TextPlus {
+					Inputs = {
+						GlobalOut = Input { Value = 20000, },
+						Width = Input { Value = 1920, },
+						Height = Input { Value = 1080, },
+						UseFrameFormatSettings = Input { Value = 1, },
+						StyledText = Input { Value = "CHAPTER 01", },
+						Font = Input { Value = "IBM Plex Mono", },
+						Style = Input { Value = "Medium", },
+						Size = Input { Value = 0.035, },
+						HorizontalJustificationNew = Input { Value = 0, },
+						VerticalJustificationNew = Input { Value = 3, },
+						Center = Input { Value = { 0.12, 0.60 }, },
+						Red1 = Input { Value = 1, },
+						Green1 = Input { Value = 0.033, },
+						Blue1 = Input { Value = 0.078, },
+					},
+					ViewInfo = OperatorInfo { Pos = { -330, 90 } },
+				},
+				LabelMerge = Merge {
+					Inputs = {
+						Background = Input {
+							SourceOp = "BlackBackground",
+							Source = "Output",
+						},
+						Foreground = Input {
+							SourceOp = "ChapterLabelText",
+							Source = "Output",
+						},
+					},
+					ViewInfo = OperatorInfo { Pos = { -110, 25 } },
+				},
+				ChapterTitleText = TextPlus {
+					Inputs = {
+						GlobalOut = Input { Value = 20000, },
+						Width = Input { Value = 1920, },
+						Height = Input { Value = 1080, },
+						UseFrameFormatSettings = Input { Value = 1, },
+						StyledText = Input { Value = "THE RABBIT HOLE", },
+						Font = Input { Value = "IBM Plex Mono", },
+						Style = Input { Value = "SemiBold", },
+						Size = Input { Value = 0.072, },
+						HorizontalJustificationNew = Input { Value = 0, },
+						VerticalJustificationNew = Input { Value = 3, },
+						Center = Input { Value = { 0.12, 0.48 }, },
+						Red1 = Input { Value = 0.905, },
+						Green1 = Input { Value = 0.880, },
+						Blue1 = Input { Value = 0.806, },
+					},
+					ViewInfo = OperatorInfo { Pos = { -110, 115 } },
+				},
+				TitleMerge = Merge {
+					Inputs = {
+						Background = Input {
+							SourceOp = "LabelMerge",
+							Source = "Output",
+						},
+						Foreground = Input {
+							SourceOp = "ChapterTitleText",
+							Source = "Output",
+						},
+					},
+					ViewInfo = OperatorInfo { Pos = { 110, 45 } },
+				}
+			},
+		}
+	},
+	ActiveTool = "RabbitholeChapter"
+}

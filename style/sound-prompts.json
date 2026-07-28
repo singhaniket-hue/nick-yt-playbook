@@ -1,0 +1,31 @@
+{
+  "_comment": [
+    "Text prompts for the ElevenLabs sound-generation API, one per cue name in",
+    "sfx.json and per bed kind in sources/music.py. These live in style/ rather",
+    "than in code because the wording is an editorial choice the author should be",
+    "able to tune without touching the generator.",
+    "",
+    "Every prompt ends with negative guidance ('no music', 'no melody'). Without",
+    "it the model tends to score the cue -- it adds pads and tonal movement to a",
+    "one-second hit, which is exactly wrong for a documentary where the bed and",
+    "the SFX layer are mixed separately and ducked independently.",
+    "",
+    "Beds also say 'continuous' and 'unchanging': a bed is tiled to span length",
+    "(see soundgen.tile_to_duration), so anything with a beginning or an end",
+    "fights the tiling instead of surviving it."
+  ],
+  "sfx": {
+    "vhs-burst": "short burst of analog VHS tape static, harsh magnetic tape head noise, abrupt, dry, no music",
+    "static-crackle": "crackling analog radio static, electrical interference, dry hiss and pops, no music",
+    "sub-drop": "deep cinematic sub bass drop, descending low frequency sweep, dark, ominous, no music",
+    "bass-thud": "single deep bass drum thud, low muffled impact, tight, no reverb tail, no music",
+    "glitch-sting": "short digital glitch sting, data corruption artifact, harsh high frequency chatter, no music",
+    "metal-scrape": "harsh metal scrape, rusted steel dragging slowly across concrete, gritty, dry, no music",
+    "heartbeat": "slow human heartbeat heard through a chest, deep muffled double thump, no music"
+  },
+  "beds": {
+    "drone-low": "sustained low dark ambient drone, deep sub bass, minimal, unchanging, continuous texture, no melody, no rhythm, no percussion",
+    "drone-tense": "tense dark ambient drone, dissonant low strings, faint metallic ringing, unresolved dread, continuous, no melody, no rhythm, no percussion",
+    "pulse-slow": "slow pulsing dark ambient drone, deep sub bass swelling and receding, minimal, continuous, no melody, no percussion"
+  }
+}

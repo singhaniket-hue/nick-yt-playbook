@@ -1,0 +1,74 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Python environments, caches, and build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Episode workspaces and generated runtime state
+projects/
+output/
+renders/
+media/
+assets/
+.audit/
+audits/
+.tmp-*/
+.playwright-cli/
+
+# Vendored engines and generated style assets
+engine/
+style/reference/
+style/luts/
+
+# Generated media and binary installers
+*.aac
+*.ass
+*.avi
+*.cube
+*.exe
+*.flac
+*.gif
+*.jpg
+*.jpeg
+*.m4a
+*.mov
+*.mp3
+*.mp4
+*.png
+*.wav
+*.webm
+
+# Keep the reviewed, deterministic channel LUT in source control. Other
+# generated/downloaded LUTs remain ignored by the rules above.
+!style/luts/
+!style/luts/crowley-noir.cube
+
+# Resolve episode state and editor handoffs are generated locally. The
+# repository-level resolve/ directory contains only reusable templates/config.
+projects/**/resolve/
+examples/**/resolve/
+handoffs/
+*.dra
+*.drp
+*.drt
+*.dpx
+checksums.sha256
+
+# Editor and operating-system noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rabbithole.local/schemas/resolve-plan.v1.schema.json",
+  "title": "RabbitHole Resolve plan v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "compiler_version",
+    "build_id",
+    "timeline_name",
+    "project_root",
+    "media_root",
+    "output_paths",
+    "fps",
+    "resolution",
+    "sample_rate",
+    "duration_frames",
+    "render",
+    "timeline_validation",
+    "style",
+    "sources",
+    "checksums",
+    "tracks",
+    "clips",
+    "markers",
+    "subtitles",
+    "overlays",
+    "audio",
+    "provenance",
+    "missing_media",
+    "review_flags"
+  ],
+  "properties": {
+    "schema_version": {"const": "resolve-plan.v1"},
+    "compiler_version": {"const": "resolve-compiler.v3"},
+    "build_id": {"type": "string", "pattern": "^b-[0-9a-f]{12}$"},
+    "timeline_name": {"type": "string", "pattern": "^AUTO_BUILD_[0-9A-F]{12}$"},
+    "project_root": {"const": "."},
+    "media_root": {"type": "string"},
+    "output_paths": {
+      "type": "object",
+      "required": [
+        "plan",
+        "plan_path_kind",
+        "fcpxml",
+        "fcpxml_path_kind",
+        "fcpxml_sha256"
+      ],
+      "properties": {
+        "plan": {"type": "string"},
+        "plan_path_kind": {
+          "enum": ["project-relative", "external-absolute"]
+        },
+        "fcpxml": {"type": "string"},
+        "fcpxml_path_kind": {
+          "enum": ["project-relative", "external-absolute"]
+        },
+        "fcpxml_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "fps": {"const": 30},
+    "resolution": {
+      "type": "object",
+      "required": ["width", "height"],
+      "properties": {
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "sample_rate": {"type": "integer", "minimum": 1},
+    "duration_frames": {"type": "integer", "minimum": 0},
+    "render": {
+      "type": "object",
+      "required": ["format", "codec", "mode", "settings"],
+      "properties": {
+        "format": {"type": "string", "minLength": 1},
+        "codec": {"type": "string", "minLength": 1},
+        "mode": {"const": "single_clip"},
+        "settings": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "timeline_validation": {
+      "type": "object",
+      "required": [
+        "start_frame",
+        "end_frame",
+        "video_clip_count",
+        "video_title_count",
+        "audio_clip_count",
+        "subtitle_count"
+      ],
+      "properties": {
+        "start_frame": {"type": "integer", "minimum": 0},
+        "end_frame": {"type": "integer", "minimum": 0},
+        "video_clip_count": {"type": "integer", "minimum": 0},
+        "video_title_count": {"type": "integer", "minimum": 0},
+        "audio_clip_count": {"type": "integer", "minimum": 0},
+        "subtitle_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "style": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "contract_sha256",
+        "grade",
+        "fusion",
+        "texture"
+      ],
+      "properties": {
+        "schema_version": {"const": "resolve-style.v1"},
+        "contract_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "grade": {
+          "type": "object",
+          "required": [
+            "policy",
+            "grade_mode",
+            "eligible_slot_kinds",
+            "clip_ids",
+            "drx_path",
+            "installed_drx_path",
+            "drx_sha256",
+            "lut_path",
+            "installed_lut_path",
+            "lut_sha256"
+          ]
+        },
+        "fusion": {"type": "object"},
+        "texture": {"type": "object"}
+      }
+    },
+    "quality": {"type": "string"},
+    "mode": {"type": "string"},
+    "sources": {"type": "object"},
+    "checksums": {"type": "object"},
+    "tracks": {
+      "type": "object",
+      "required": ["video", "audio"],
+      "properties": {
+        "video": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {"$ref": "#/$defs/track"}
+        },
+        "audio": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "items": {"$ref": "#/$defs/track"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "statistics": {"type": "object"},
+    "timing": {"type": "object"},
+    "clips": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/clip"}
+    },
+    "markers": {"type": "array", "items": {"type": "object"}},
+    "subtitles": {"type": "array", "items": {"type": "object"}},
+    "overlays": {"type": "array", "items": {"type": "object"}},
+    "audio": {"type": "array", "items": {"type": "object"}},
+    "provenance": {"type": "array", "items": {"type": "object"}},
+    "highlights": {"type": "array", "items": {"type": "object"}},
+    "missing_media": {"type": "array", "items": {"type": "object"}},
+    "review_flags": {"type": "array", "items": {"$ref": "#/$defs/review"}}
+  },
+  "$defs": {
+    "track": {
+      "type": "object",
+      "required": ["id", "index", "intent"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[VA][1-5]$"},
+        "index": {"type": "integer", "minimum": 1},
+        "intent": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "clip": {
+      "type": "object",
+      "required": [
+        "id",
+        "index",
+        "slot_id",
+        "track",
+        "start_frame",
+        "end_frame",
+        "duration_frames",
+        "asset_id",
+        "media_path",
+        "transform",
+        "transition"
+      ],
+      "properties": {
+        "id": {"type": "string"},
+        "index": {"type": "integer"},
+        "slot_id": {"type": "string"},
+        "track": {"enum": ["V1", "V2"]},
+        "start_frame": {"type": "integer", "minimum": 0},
+        "end_frame": {"type": "integer", "minimum": 0},
+        "duration_frames": {"type": "integer", "minimum": 1},
+        "asset_id": {"type": ["string", "null"]},
+        "media_path": {"type": ["string", "null"]},
+        "transform": {"type": "object"},
+        "transition": {"type": "object"}
+      }
+    },
+    "review": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "severity",
+        "frame",
+        "message",
+        "resolved"
+      ],
+      "properties": {
+        "id": {"type": "string"},
+        "kind": {"type": "string"},
+        "severity": {"enum": ["error", "warning", "human"]},
+        "frame": {"type": "integer", "minimum": 0},
+        "message": {"type": "string"},
+        "resolved": {"type": "boolean"}
+      }
+    }
+  }
+}

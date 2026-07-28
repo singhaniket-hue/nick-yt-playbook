@@ -1,0 +1,296 @@
+# DaVinci Resolve automation workflow
+
+This repository keeps RabbitHole's narration timing, edit decisions, and media
+provenance as the source of truth, but makes DaVinci Resolve the primary editing
+and finishing environment.
+
+The integration is deliberately hybrid:
+
+- deterministic Python compiles `timing.json`, `edit/edl.json`, and
+  `provenance.json` into a versioned Resolve plan and FCPXML;
+- DaVinci Resolve Free executes the prepared job from its in-app Python console
+  or `Workspace > Scripts`;
+- DaVinci Resolve Studio may execute the same job through the external scripting
+  bridge;
+- FFmpeg remains available for media preparation, audio stems, generated plates,
+  and a documented legacy render fallback.
+
+The compiler never treats a Resolve timeline as the canonical data model. This
+makes rebuilds reproducible and editor handoffs auditable.
+
+## Prerequisites
+
+- Python 3.11 or newer
+- FFmpeg and ffprobe on `PATH` for media preparation and the legacy backend
+- DaVinci Resolve 21 or newer; the implementation targets its installed
+  scripting documentation, while the local live-application pilot remains a
+  release gate
+- source media bound in the episode's `provenance.json`
+- an approved `narration/timing.json` and `edit/edl.json`
+
+Install the Python project:
+
+```powershell
+uv sync
+uv run rabbithole --help
+```
+
+## Project contract
+
+A renderable episode has this minimum layout:
+
+```text
+projects/<slug>/
+  narration/
+    timing.json
+    vo.wav
+  edit/
+    edl.json
+  research/
+    source-audio.json        # optional
+    highlights.json          # optional
+  assets/
+  provenance.json
+```
+
+Resolve-specific generated state is isolated under `projects/<slug>/resolve/`.
+It is never written into `assets/`, `narration/`, `edit/`, or the append-only
+provenance ledger.
+
+## DaVinci Resolve Free
+
+Resolve Free can run supported scripting calls inside the application. It does
+not expose the external scripting connection used by an MCP server or a normal
+terminal process. The normal Free workflow is therefore prepare outside Resolve,
+execute inside Resolve:
+
+```powershell
+uv run rabbithole resolve preflight projects/<slug>
+uv run rabbithole resolve prepare projects/<slug>
+uv run rabbithole resolve build projects/<slug>
+```
+
+`build` writes a durable queued job and prints the exact one-line loader for that
+checkout. In Resolve:
+
+1. Open the project that should receive the generated timeline.
+2. Open `Workspace > Console`, select Python 3, paste the printed loader, and
+   press Enter.
+3. Alternatively, install the menu runner once:
+
+   ```powershell
+   uv run rabbithole resolve install-runner
+   ```
+
+   Restart Resolve, then run `Workspace > Scripts > Utility > RabbitHole Runner`.
+4. Inspect the result:
+
+   ```powershell
+   uv run rabbithole resolve status projects/<slug>
+   ```
+
+The in-app runner accepts the `resolve` object injected by Resolve, and also
+supports `app.GetResolve()` in Fusion-hosted sessions. It does not need the
+Studio-only external connection. This is API access inside the running
+application, not a promise that every API feature is licensed in Free:
+Studio-only calls may return `False` or an edition-specific error.
+
+The repository code requires Python 3.11 or newer, while some Resolve
+installations still expose an older Python Console. Before the first run, enter:
+
+```python
+import sys; print(sys.version)
+```
+
+If the result is older than 3.11, do not run the loader. Its Python-3.6-compatible
+bootstrap will refuse the job before importing RabbitHole or changing the
+project. Import the prepared FCPXML manually, use the FFmpeg backend, or use
+Resolve Studio's external bridge from Python 3.11+.
+
+## DaVinci Resolve Studio
+
+Studio can run the same queue through the external scripting bridge:
+
+```powershell
+uv run rabbithole resolve build projects/<slug> --mode studio
+uv run rabbithole resolve status projects/<slug>
+```
+
+External mode is explicitly gated. Selecting it on a Free installation produces
+an actionable error instead of silently falling back or attempting unsupported
+network control.
+
+## Generated timeline
+
+Each build has a content-derived identifier. Its generated timeline is named:
+
+```text
+AUTO_BUILD_<short-hash>
+```
+
+The build contains:
+
+- 1920 x 1080, 30 fps timeline settings
+- 48 kHz audio intent
+- V1 primary footage
+- V2 evidence, chapter, censor, and highlight overlays
+- V3 designed titles and graphics
+- V4 texture and finishing overlays
+- A1 narration
+- A2 original-source bites
+- A3 music
+- A4 sound effects
+- A5 room tone and utility audio
+- editable subtitle intent
+- provenance and review markers with machine-readable custom data
+
+FCPXML carries deterministic cuts, simple framing transforms, supported
+primary-story transitions, and title/subtitle timing. V1 is the primary
+storyline; V2–V4 are connected lanes above it, and A1–A5 are connected lanes
+below it. The Resolve scripting layer imports that timeline, names and validates
+the tracks, adds metadata markers, applies a checksum-matched archival grade
+when available, records manual Fusion/template intent, and configures the render
+job.
+
+Generated timelines are immutable. Re-running an identical build validates and
+reuses its `AUTO_BUILD_<hash>` timeline. It never rewrites or deletes a timeline.
+Editors should duplicate a generated timeline to:
+
+```text
+EDITORIAL_v1
+EDITORIAL_v2
+```
+
+Automation never mutates a timeline whose name starts with `EDITORIAL_`.
+
+## Primary render and fallback
+
+After reviewing the generated timeline:
+
+```powershell
+uv run rabbithole resolve render projects/<slug>
+```
+
+Resolve Free queues the render and waits for the in-app runner. Studio may execute
+it externally. The generated plan selects single-clip MP4/H.264, 1080p30,
+48 kHz AAC, and burned-in review subtitles instead of inheriting whichever
+Deliver-page format was last used. The general render command also exposes the
+explicit backend:
+
+```powershell
+uv run rabbithole render projects/<slug>/narration/timing.json --backend resolve
+uv run rabbithole render projects/<slug>/narration/timing.json --backend ffmpeg
+```
+
+FFmpeg remains the general-command default until the local Resolve Console,
+timeline import, style, and handoff pilot gates pass. `--backend resolve` is the
+explicit editable-timeline path; neither backend silently falls back to the
+other.
+
+## Safety model
+
+Every mutating operation uses a project-scoped lock containing:
+
+- process ID and process start time
+- operation stage
+- declared write roots
+- creation and heartbeat timestamps
+
+The runner fails closed when the lock belongs to a live process, when Resolve is
+already rendering, when the current project is unsafe for the requested job, or
+when a path escapes the episode or requested handoff directory. Each queued job
+also pins the plan and compiler-recorded FCPXML SHA-256 values plus the expected
+linked-media checksum set. Once compilation has prepared a bundle, the durable
+enqueue step reads only the small plan/FCPXML artifacts; it does not rescan large
+media. After Resolve reports idle, the runner authenticates the queue document
+and rechecks the plan, FCPXML, and every linked video/audio file before mutation.
+Before configuring a render, it validates the selected immutable timeline's
+identity marker, style marker, track contract, duration, and item counts again.
+
+The runner intentionally has no code path that calls:
+
+- `StopRendering`
+- `Quit`
+- `DeleteAllRenderJobs`
+- `DeleteRenderJob`
+- `DeleteProject`
+- `DeleteTimelines`
+- `SetCurrentDatabase`
+- `LoadProject`
+
+If another project is open, that current project remains authoritative; the
+runner only adds a new immutable generated timeline to it. If no project is
+open, it may create a uniquely named RabbitHole project. It never switches away
+from a user's open project.
+
+## Editor handoff
+
+Create a source-inclusive handoff:
+
+```powershell
+uv run rabbithole resolve handoff projects/<slug> --out D:\handoffs
+```
+
+The handoff job asks Resolve to create:
+
+- a `.dra` Project Archive with source media included
+- render cache excluded
+- proxies excluded unless explicitly requested
+- a `.drp` lightweight project export with stills and LUTs
+
+The portable ZIP also contains:
+
+- `resolve-plan.v1.json` and FCPXML
+- source timing, EDL, provenance, optional source-audio/highlight manifests
+- LUTs, Fusion templates, fonts supplied by the project, and their licence notes
+- chapter/credit/QC reports when the episode already contains them
+- a privacy-preserving inventory used for disk-space estimation; source media
+  itself is carried by the DRA
+- SHA-256 checksums
+- an editor README with import and relink instructions
+
+A `.drp` alone is not a media handoff. The source-inclusive `.dra` is the primary
+transfer artifact; the `.drp` is a small backup and inspection aid.
+
+On the editor's machine:
+
+1. Unzip the package without renaming its internal directories.
+2. Restore the `.dra` from Resolve's Project Manager.
+3. The DRA is source-inclusive. If Resolve still reports offline media, inspect
+   the restored archive and relink to the media copied by Resolve during restore.
+4. Install only the bundled fonts/templates whose licence notes permit it.
+5. Duplicate `AUTO_BUILD_<hash>` to `EDITORIAL_v1` before changing the cut.
+6. Verify `checksums.sha256` with the platform's SHA-256 tool if any file appears
+   missing.
+
+## Queue states
+
+Jobs are durable JSON documents under the episode's `resolve/queue/` directory.
+The status command reports:
+
+```text
+queued -> running -> succeeded
+                  \-> failed
+```
+
+Free-mode jobs may additionally report `awaiting_in_app_runner`. A succeeded job
+is not implicitly rerun. A failed job retains its error, attempt count, and
+timestamps for diagnosis. Queue files from an older integrity schema are counted
+as `legacy` but never executed; prepare and enqueue a fresh job to replace one.
+
+## Human review gates
+
+Automation deliberately stops short of editorial judgment. Before final delivery,
+review:
+
+- evidence accuracy and source context
+- redactions, privacy, defamation, and rights/clearance flags
+- deepest-point timing and chapter rhythm
+- original-source audio intelligibility
+- subtitle accuracy and line breaks
+- grade consistency across mixed sources
+- the restored handoff on a disposable project
+
+Optional per-episode adjustments belong in `resolve-overrides.json`. They augment
+the existing RabbitHole marker grammar; they do not replace `timing.json` or
+`edit/edl.json`.

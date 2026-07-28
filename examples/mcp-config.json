@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "rabbithole-resolve": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--extra",
+        "mcp",
+        "rabbithole-resolve-mcp"
+      ],
+      "cwd": "C:/path/to/nick-yt-playbook"
+    }
+  }
+}

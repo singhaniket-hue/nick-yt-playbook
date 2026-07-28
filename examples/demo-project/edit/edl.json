@@ -1,0 +1,55 @@
+{
+  "quality": "animatic",
+  "mode": "pinned",
+  "duration_seconds": 12.0,
+  "cut_count": 3,
+  "average_shot_length": 4.0,
+  "cuts": [
+    {
+      "index": 0,
+      "start": 0.0,
+      "end": 4.0,
+      "slot_id": "s001",
+      "origin": "script",
+      "framing": "wide",
+      "transition": "cut",
+      "reason": "opening evidence"
+    },
+    {
+      "index": 1,
+      "start": 4.0,
+      "end": 8.0,
+      "slot_id": "s002",
+      "origin": "script",
+      "framing": "push-in",
+      "transition": "cross_dissolve",
+      "reason": "chapter context"
+    },
+    {
+      "index": 2,
+      "start": 8.0,
+      "end": 12.0,
+      "slot_id": "s003",
+      "origin": "script",
+      "framing": "detail",
+      "transition": "dip_to_black",
+      "reason": "synthetic climax graphic"
+    }
+  ],
+  "overlays": [
+    {
+      "kind": "chapter",
+      "start": 4.0,
+      "end": 6.8,
+      "text": "CHAPTER 01 — THE LOG",
+      "detail": "fictional demo"
+    },
+    {
+      "kind": "keyword",
+      "start": 8.65,
+      "end": 9.75,
+      "text": "signal",
+      "detail": ""
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "backdrop": ["#000000", "#202020"],
+  "accent_red": "#E02020",
+  "accent_red_deep": ["#200000", "#402020"],
+  "warning_yellow": "#FFFF00",
+  "warm_grey": "#C0A080",
+  "text_light": "#E0E0E0",
+  "text_mid": "#404040",
+  "grade": {
+    "lut": null,
+    "brightness": 0.015,
+    "contrast": 1.04,
+    "saturation": 0.88,
+    "grain_strength": 0.025,
+    "vignette_strength": 0.08,
+    "scanline_opacity": 0.0
+  }
+}

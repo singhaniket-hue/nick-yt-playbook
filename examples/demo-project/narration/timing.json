@@ -1,0 +1,26 @@
+{
+  "duration_seconds": 12.0,
+  "word_count": 12,
+  "words": [
+    {"index": 0, "word": "Raat", "start": 0.0, "end": 0.55},
+    {"index": 1, "word": "ko", "start": 0.58, "end": 0.82},
+    {"index": 2, "word": "radio", "start": 0.86, "end": 1.35},
+    {"index": 3, "word": "chalu", "start": 1.39, "end": 1.88},
+    {"index": 4, "word": "hua.", "start": 1.92, "end": 2.45},
+    {"index": 5, "word": "Phir", "start": 4.0, "end": 4.45},
+    {"index": 6, "word": "logbook", "start": 4.5, "end": 5.2},
+    {"index": 7, "word": "mila.", "start": 5.25, "end": 5.85},
+    {"index": 8, "word": "Aakhri", "start": 8.0, "end": 8.6},
+    {"index": 9, "word": "signal", "start": 8.65, "end": 9.25},
+    {"index": 10, "word": "khud", "start": 9.3, "end": 9.75},
+    {"index": 11, "word": "ruka.", "start": 9.8, "end": 10.4}
+  ],
+  "markers": [
+    {"kind": "ACT", "arg": "1 Cold Open", "word_index": 0, "line": 1, "seconds": 0.0},
+    {"kind": "SHOT", "arg": "screenshot fictional signal room", "word_index": 0, "line": 3, "seconds": 0.0},
+    {"kind": "CHAPTER", "arg": "1 The Log", "word_index": 5, "line": 7, "seconds": 4.0},
+    {"kind": "SHOT", "arg": "archival empty radio studio", "word_index": 5, "line": 7, "seconds": 4.0},
+    {"kind": "SHOT", "arg": "graphic timeline 01:10 to 02:00", "word_index": 8, "line": 11, "seconds": 8.0},
+    {"kind": "KEY", "arg": "signal", "word_index": 9, "line": 11, "seconds": 8.65}
+  ]
+}
