@@ -88,6 +88,19 @@ uv run rabbithole assets projects/my-episode/narration/timing.json
 uv run rabbithole edl projects/my-episode/narration/timing.json
 ```
 
+For voice cloning, `script/05-devanagari.md` is deliberately mixed-script:
+write Hindi words in Devanagari, but keep English words, brands, acronyms, and
+technical terms in Latin. Never transliterate an English word into Devanagari.
+Good: `रात हो चुकी है, घर में finally silence है।` Bad:
+`रात हो चुकी है, घर में फाइनली साइलेंस है।` Write `account`, not `अकाउंट`.
+Maintain the episode's authoritative English-token list in
+`script/latin-terms.json` as `{"terms": ["account", "finally", "silence"],
+"occurrences": []}`. For a Hindi/English homograph such as `is`, omit the
+global term and declare only its English use with a one-based spoken-word
+position: `{"token": "is", "word_index": 705}`. Validation and narration
+refuse a TTS edition that converts a listed term or leaves an undeclared Latin
+word.
+
 `validate` and `narrate` both read the sibling episode `brief.json`. When it
 contains a positive numeric `target_duration_minutes`, they derive the spoken
 word target from `target_wpm` (or the configured/default WPM), allow the

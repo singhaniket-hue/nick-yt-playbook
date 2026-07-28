@@ -250,6 +250,9 @@ def test_narrate_dry_run_uses_the_same_brief_aware_profile(
     (script_path.parent / "05-devanagari.md").write_text(
         _script_for(profile, word="शब्द"), encoding="utf-8"
     )
+    (script_path.parent / "latin-terms.json").write_text(
+        json.dumps({"terms": []}), encoding="utf-8"
+    )
     (project / "claims.json").write_text("[]", encoding="utf-8")
 
     cfg = Config(

@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import math
 import re
+import unicodedata
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
+from typing import Collection, Mapping
 
 from rabbithole.jsonio import read_json
 from rabbithole.markers import SHOT_KINDS, ParsedScript, markers_of, word_count
@@ -26,6 +27,26 @@ REHOOK_MAX_MINUTES = 5
 
 class ValidationProfileError(ValueError):
     """A project brief exists but cannot safely define validation targets."""
+
+
+class LatinTermsError(ValueError):
+    """A strict mixed-script English lexicon is malformed or ambiguous."""
+
+
+@dataclass(frozen=True)
+class LatinTermOccurrence:
+    """One homograph-safe English declaration at a spoken-word position."""
+
+    token: str
+    word_index: int
+
+
+@dataclass(frozen=True)
+class LatinTerms:
+    """Global English tokens plus exact declarations for ambiguous homographs."""
+
+    terms: frozenset[str]
+    occurrences: tuple[LatinTermOccurrence, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -889,10 +910,10 @@ def check_transliterated_english(devanagari: ParsedScript) -> list[Finding]:
     phonetics forced onto it and comes out mangled. English words and terms
     belong in Latin script instead (see `darkdoc-lexicon.md`).
 
-    This is a heuristic check against a finite, hand-maintained blacklist of
-    commonly-transliterated English terms -- it cannot catch every possible
-    mistransliteration, only the ones it knows about -- so it reports
-    `severity="warning"`, not `"error"`.
+    This finite, hand-maintained blacklist cannot catch every possible
+    mistransliteration, so the project lexicon remains authoritative. A match
+    is nevertheless a known pronunciation defect and is therefore a hard
+    error, not a warning.
 
     One finding is emitted per distinct term found, not per occurrence: a
     script that says 'वीडियो' twelve times has one problem, not twelve.
@@ -903,7 +924,7 @@ def check_transliterated_english(devanagari: ParsedScript) -> list[Finding]:
             findings.append(
                 Finding(
                     gate="transliterated_english",
-                    severity="warning",
+                    severity="error",
                     message=(
                         f"{term!r} is an English word written in Devanagari; use "
                         f"{latin!r} instead. Devanagari script makes the TTS model "
@@ -911,6 +932,342 @@ def check_transliterated_english(devanagari: ParsedScript) -> list[Finding]:
                     ),
                 )
             )
+    return findings
+
+
+_TOKEN_EDGE_PUNCTUATION = "\"'.,!?;:()[]{}<>“”‘’…।॥"
+
+
+def _spoken_token(token: str) -> str:
+    """Remove sentence punctuation without damaging terms such as C++ or C#."""
+    return token.strip(_TOKEN_EDGE_PUNCTUATION)
+
+
+def _is_latin_letter(character: str) -> bool:
+    return character.isalpha() and "LATIN" in unicodedata.name(character, "")
+
+
+def _has_latin_letter(value: str) -> bool:
+    return any(_is_latin_letter(character) for character in value)
+
+
+def _validated_latin_token(value: object, *, source: str) -> str:
+    if not isinstance(value, str):
+        raise LatinTermsError(
+            f"{source} must be a string; got {type(value).__name__}."
+        )
+    token = value.strip()
+    if not token:
+        raise LatinTermsError(f"{source} is empty.")
+    if any(character.isspace() for character in token):
+        raise LatinTermsError(
+            f"{source} ({token!r}) contains whitespace; declare each spoken "
+            "token separately."
+        )
+    if any("\u0900" <= character <= "\u097f" for character in token):
+        raise LatinTermsError(
+            f"{source} ({token!r}) contains a Devanagari character; "
+            "English-token declarations must remain entirely in Latin script."
+        )
+    letters = [character for character in token if character.isalpha()]
+    if not _has_latin_letter(token):
+        raise LatinTermsError(f"{source} ({token!r}) has no Latin letter.")
+    non_latin_letters = [
+        character
+        for character in letters
+        if not _is_latin_letter(character)
+    ]
+    if non_latin_letters:
+        raise LatinTermsError(
+            f"{source} ({token!r}) contains non-Latin letter "
+            f"{non_latin_letters[0]!r}; English-token declarations must remain "
+            "entirely in Latin script."
+        )
+    return token
+
+
+def _validated_latin_terms(value: object, *, source: str) -> frozenset[str]:
+    """Validate one strict, token-level mixed-script English lexicon.
+
+    Terms are deliberately individual spoken tokens rather than phrases. Exact
+    word-index parity is load-bearing for editing, so accepting a multi-word
+    lexicon entry would make it unclear which aligned token must stay Latin.
+    Case-insensitive duplicates are rejected instead of silently choosing one
+    spelling.
+    """
+    if not isinstance(value, list):
+        raise LatinTermsError(
+            f"{source} must contain a JSON array of individual Latin-script tokens."
+        )
+
+    terms: dict[str, str] = {}
+    for position, raw_term in enumerate(value):
+        term = _validated_latin_token(
+            raw_term, source=f"{source} entry {position}"
+        )
+
+        key = term.casefold()
+        if key in terms:
+            raise LatinTermsError(
+                f"{source} declares {term!r} more than once "
+                f"(already declared as {terms[key]!r}); matching is "
+                "case-insensitive."
+            )
+        terms[key] = term
+
+    return frozenset(terms.values())
+
+
+def _validated_latin_occurrences(
+    value: object, *, source: str
+) -> tuple[LatinTermOccurrence, ...]:
+    if not isinstance(value, list):
+        raise LatinTermsError(f"{source} must contain a JSON array.")
+
+    occurrences: list[LatinTermOccurrence] = []
+    seen_indices: dict[int, str] = {}
+    for position, raw_occurrence in enumerate(value):
+        label = f"{source} entry {position}"
+        if not isinstance(raw_occurrence, dict):
+            raise LatinTermsError(
+                f"{label} must be an object; "
+                f"got {type(raw_occurrence).__name__}."
+            )
+
+        unknown = sorted(set(raw_occurrence) - {"token", "word_index"})
+        if unknown:
+            raise LatinTermsError(
+                f"{label} has unknown field(s): {', '.join(unknown)}."
+            )
+        missing = [
+            field
+            for field in ("token", "word_index")
+            if field not in raw_occurrence
+        ]
+        if missing:
+            raise LatinTermsError(
+                f"{label} is missing required field(s): {', '.join(missing)}."
+            )
+
+        token = _validated_latin_token(
+            raw_occurrence["token"], source=f"{label} token"
+        )
+        word_index = raw_occurrence["word_index"]
+        if (
+            isinstance(word_index, bool)
+            or not isinstance(word_index, int)
+            or word_index < 1
+        ):
+            raise LatinTermsError(
+                f"{label} word_index must be a positive 1-based integer."
+            )
+        if word_index in seen_indices:
+            raise LatinTermsError(
+                f"{label} duplicates spoken word {word_index}, already declared "
+                f"for {seen_indices[word_index]!r}."
+            )
+        seen_indices[word_index] = token
+        occurrences.append(
+            LatinTermOccurrence(token=token, word_index=word_index)
+        )
+
+    return tuple(occurrences)
+
+
+def load_latin_terms(
+    path: Path,
+) -> tuple[LatinTerms | None, list[Finding]]:
+    """Load the authoritative English-token list without leaking exceptions.
+
+    The self-documenting project format is:
+
+        {
+          "terms": ["account", "finally", "silence", "YouTube"],
+          "occurrences": [{"token": "is", "word_index": 123}]
+        }
+
+    ``terms`` apply globally to every matching canonical token.
+    ``occurrences`` apply only at one 1-based spoken-word index, which makes
+    an English/Hindi homograph such as ``is`` auditable without globally
+    classifying every Hindi ``is`` as English. A top-level array remains
+    accepted as global terms for compatibility. Missing files, malformed JSON,
+    unknown object keys, and invalid entries all become hard validation
+    findings so CLI callers can refuse narration cleanly.
+
+    Merely finding Latin text in the canonical Romanized-Hindi edition cannot
+    tell whether it is Hindi or English. A project lexicon makes that language
+    decision explicit instead of pretending a heuristic can infer it.
+    """
+    path = Path(path)
+
+    def failed(message: str) -> tuple[None, list[Finding]]:
+        return None, [
+            Finding(
+                gate="mixed_script_english",
+                severity="error",
+                message=message,
+            )
+        ]
+
+    if not path.exists():
+        return failed(
+            f"Missing strict English-token lexicon {path}; create "
+            "script/latin-terms.json before validating or narrating the final "
+            "mixed-script edition."
+        )
+
+    try:
+        value = read_json(path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return failed(f"Cannot read strict English-token lexicon {path}: {exc}")
+
+    if isinstance(value, dict):
+        unknown = sorted(set(value) - {"terms", "occurrences"})
+        if unknown:
+            return failed(
+                f"{path} has unknown field(s): {', '.join(unknown)}; only "
+                "'terms' and 'occurrences' are allowed."
+            )
+        if "terms" not in value:
+            return failed(f"{path} must contain a 'terms' array.")
+        raw_terms = value["terms"]
+        raw_occurrences = value.get("occurrences", [])
+    else:
+        raw_terms = value
+        raw_occurrences = []
+
+    try:
+        terms = _validated_latin_terms(raw_terms, source=f"{path} terms")
+        occurrences = _validated_latin_occurrences(
+            raw_occurrences, source=f"{path} occurrences"
+        )
+    except LatinTermsError as exc:
+        return failed(str(exc))
+    return LatinTerms(terms=terms, occurrences=occurrences), []
+
+
+def _strict_mixed_script_findings(
+    romanized: ParsedScript,
+    devanagari: ParsedScript,
+    latin_terms: LatinTerms | Collection[str] | None,
+) -> list[Finding]:
+    """Enforce an explicit Latin-token contract across aligned editions."""
+    findings: list[Finding] = []
+
+    def flag(message: str) -> None:
+        findings.append(
+            Finding(gate="mixed_script_english", severity="error", message=message)
+        )
+
+    if latin_terms is None:
+        flag(
+            "Strict mixed-script validation requires an explicit English-token "
+            "lexicon; no latin_terms were supplied."
+        )
+        return findings
+    if isinstance(latin_terms, (str, bytes, Mapping)):
+        flag(
+            "latin_terms must be a LatinTerms lexicon or a collection of "
+            "individual global tokens."
+        )
+        return findings
+
+    # Validate programmatic callers too. File-based callers normally enter
+    # through load_latin_terms(), but accepting an unchecked collection here
+    # would make strict mode silently weaker depending on call site.
+    try:
+        if isinstance(latin_terms, LatinTerms):
+            declared = _validated_latin_terms(
+                list(latin_terms.terms), source="latin_terms terms"
+            )
+            occurrences = _validated_latin_occurrences(
+                [
+                    {
+                        "token": occurrence.token,
+                        "word_index": occurrence.word_index,
+                    }
+                    for occurrence in latin_terms.occurrences
+                ],
+                source="latin_terms occurrences",
+            )
+        else:
+            declared = _validated_latin_terms(
+                list(latin_terms), source="latin_terms"
+            )
+            occurrences = ()
+    except LatinTermsError as exc:
+        flag(str(exc))
+        return findings
+
+    declared_by_key = {term.casefold(): term for term in declared}
+    roman_words = romanized.text.split()
+    mixed_words = devanagari.text.split()
+    occurrence_by_index: dict[int, str] = {}
+
+    for occurrence in occurrences:
+        word_index = occurrence.word_index
+        if word_index > len(roman_words):
+            flag(
+                f"Occurrence declaration for {occurrence.token!r} uses spoken "
+                f"word {word_index}, but the canonical edition has only "
+                f"{len(roman_words)} words."
+            )
+            continue
+        canonical_token = _spoken_token(roman_words[word_index - 1])
+        if canonical_token != occurrence.token:
+            flag(
+                f"Occurrence declaration at spoken word {word_index} names "
+                f"{occurrence.token!r}, but the canonical token there is "
+                f"{canonical_token!r}. Occurrence tokens must match the "
+                "canonical spelling and case exactly."
+            )
+            continue
+        occurrence_by_index[word_index] = occurrence.token
+
+    # Alignment is only meaningful when the existing exact parity gate passes.
+    # It already emits the actionable count error, so do not manufacture
+    # position-level mismatches after either edition inserted or removed words.
+    if len(roman_words) != len(mixed_words):
+        return findings
+
+    # In strict mode the lexicon is authoritative in both directions. Any
+    # undeclared Latin token left in the mixed edition is more likely to be
+    # unconverted Romanized Hindi than safely intentional English.
+    undeclared: dict[str, tuple[str, int, int]] = {}
+    for word_index, (roman_raw, mixed_raw) in enumerate(
+        zip(roman_words, mixed_words), start=1
+    ):
+        roman_token = _spoken_token(roman_raw)
+        mixed_token = _spoken_token(mixed_raw)
+        globally_declared = roman_token.casefold() in declared_by_key
+        occurrence_declared = occurrence_by_index.get(word_index) == roman_token
+        covered = globally_declared or occurrence_declared
+
+        if covered and mixed_token != roman_token:
+            flag(
+                f"English token {roman_token!r} at spoken word {word_index} "
+                "must stay identically spelled in Latin script in "
+                f"05-devanagari.md; found {mixed_token!r}. Use "
+                f"{roman_token!r} at the same word position."
+            )
+        elif _has_latin_letter(mixed_token) and not covered:
+            key = mixed_token.casefold()
+            if key in undeclared:
+                display, first_index, count = undeclared[key]
+                undeclared[key] = (display, first_index, count + 1)
+            else:
+                undeclared[key] = (mixed_token, word_index, 1)
+
+    for mixed_token, first_index, count in undeclared.values():
+        suffix = "occurrence" if count == 1 else "occurrences"
+        flag(
+            f"Latin-script token {mixed_token!r} is not declared for its "
+            f"canonical position; first appears at spoken word {first_index} "
+            f"({count} {suffix}). If it is English, a brand, acronym, or "
+            "technical term, declare it globally or as an exact occurrence; "
+            "otherwise write the Hindi word in Devanagari."
+        )
+
     return findings
 
 
@@ -930,7 +1287,11 @@ def _devanagari_ratio(text: str) -> float:
 
 
 def check_transliteration(
-    romanized: ParsedScript, devanagari: ParsedScript | None
+    romanized: ParsedScript,
+    devanagari: ParsedScript | None,
+    *,
+    latin_terms: LatinTerms | Collection[str] | None = None,
+    strict_latin_terms: bool = False,
 ) -> list[Finding]:
     """Prove the Devanagari TTS edition faithfully mirrors the canonical script.
 
@@ -1001,6 +1362,15 @@ def check_transliteration(
                 f"Marker {position} ({left.kind}) argument differs between editions: "
                 f"canonical has {left.arg!r}, Devanagari has {right.arg!r}."
             )
+
+    if strict_latin_terms:
+        findings.extend(
+            _strict_mixed_script_findings(
+                romanized,
+                devanagari,
+                latin_terms,
+            )
+        )
 
     return findings
 

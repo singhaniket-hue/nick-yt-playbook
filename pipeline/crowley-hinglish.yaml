@@ -166,10 +166,15 @@ stages:
       The marked-up narration script: five acts, [SHOT:]/[SILENCE:]/[SFX:]/
       [MUSIC:]/[REHOOK]/[CHAPTER:]/[CENSOR:]/[KEY:] markers, aap-register
       Hinglish throughout. Reviewed by rabbithole.validate.validate_all plus
-      the romanized/Devanagari transliteration-parity gates.
+      the canonical/TTS parity gates. The TTS edition writes Hindi in
+      Devanagari while preserving every English word, brand, acronym, and
+      technical term in Latin, as declared by script/latin-terms.json; English
+      must never be transliterated into Devanagari. Hindi/English homographs
+      are declared by one-based spoken-word occurrence rather than globally.
     required_artifacts_in:
       - brief
       - claims_ledger
+      - latin_terms_lexicon  # script/latin-terms.json
     produces:
       - script
     tools_available: []
@@ -181,19 +186,23 @@ stages:
       - Act III [REHOOK] markers spaced 3-5 minutes apart
       - No aap-register violation (tum/yaar/bhai/casual tokens) survives
       - Every assertion of wrongdoing about a named person has a claims_ledger entry
-      - Devanagari TTS edition mirrors the romanized canonical script exactly
+      - Mixed-script TTS edition mirrors the romanized canonical script exactly
+      - Every Hindi word is Devanagari and every declared English term remains Latin
 
   - name: narrate
     cli: rabbithole narrate <script.md> --out narration/vo.wav
     description: >
-      ElevenLabs TTS from the Devanagari edition (voice selected with
+      ElevenLabs TTS from the mixed-script TTS edition (voice selected with
       RABBITHOLE_VOICE_ID, model eleven_multilingual_v2), chunked on paragraph boundaries with
       previous_text/next_text for prosody continuity, [SILENCE:] realised as
       true digital silence. Writes narration_audio AND timing_spine in one
       call (rabbithole.pipeline:render_narration writes narration/timing.json
       beside the output WAV) -- they are not two separate CLI invocations.
+      Narration refuses lexicon/script mismatches so Hindi receives Hindi
+      phonetics and English remains English.
     required_artifacts_in:
-      - script  # must pass the script stage's gates, or --force
+      - script
+      - latin_terms_lexicon
     produces:
       - narration_audio
       - timing_spine

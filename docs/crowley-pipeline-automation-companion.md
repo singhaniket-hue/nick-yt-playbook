@@ -111,6 +111,24 @@ The Project Overview treats the script as "a de facto cut sheet." For this genre
 
 The Playbook's naming convention (`ch3_012_profile_screenshot.png`) is now a **hard interface**, not just hygiene: `{chapter}_{beat}_{slug}.{ext}`. The ingest stage validates that every `[ASSET:]` tag resolves to exactly one file and reports gaps — the gap list is what feeds stage 2. Narration is delivered as one cleaned WAV per chapter (`ch3_vo.wav`), which keeps re-records surgical.
 
+### Voice-clone text contract
+
+The canonical `script/04-final.md` remains Romanized Hinglish. Its matching
+`script/05-devanagari.md` is mixed-script by design: Hindi words use
+Devanagari, while English words, brands, acronyms, and technical terms remain
+Latin. Never transliterate English into Devanagari. Good:
+`रात हो चुकी है, घर में finally silence है।` Bad:
+`रात हो चुकी है, घर में फाइनली साइलेंस है।` Use `account`, not `अकाउंट`.
+
+`script/latin-terms.json` is the episode's authoritative list of allowed Latin
+tokens, stored as `{"terms": ["account", "finally", "silence"],
+"occurrences": []}`. Unambiguous tokens belong in `terms`; a Hindi/English
+homograph belongs only in an occurrence record such as
+`{"token": "is", "word_index": 705}` for its English use. Validation and
+narration stop when the TTS edition converts a listed token or contains an
+undeclared Latin word; the script or lexicon must be corrected before
+voice-clone synthesis.
+
 > **WHY PER-CHAPTER NARRATION FILES**
 >
 > The review loop in the Project Overview ("preview → note fixes → re-run affected stage") works best when a fix to chapter 4's narration only re-renders chapter 4's segment. Chapters are the genre's natural unit — of story, of style (the glitch break), and now of incremental builds.

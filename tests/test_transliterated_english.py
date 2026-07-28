@@ -5,13 +5,13 @@ from rabbithole.markers import parse
 from rabbithole.validate import TRANSLITERATED_ENGLISH, check_transliterated_english
 
 
-def test_english_loanword_in_devanagari_warns():
+def test_english_loanword_in_devanagari_is_a_hard_error():
     parsed = parse("Yeh ek वीडियो hai.")
 
     findings = check_transliterated_english(parsed)
 
     assert len(findings) == 1
-    assert findings[0].severity == "warning"
+    assert findings[0].severity == "error"
     assert findings[0].gate == "transliterated_english"
 
 
@@ -76,8 +76,8 @@ def test_term_at_start_and_end_of_string_is_still_detected():
 
 
 def test_check_runs_as_part_of_validating_a_devanagari_edition(tmp_path, capsys):
-    # End-to-end: `rabbithole.cli validate` on a script with a 05-devanagari.md
-    # sitting beside it must surface this warning without being asked to.
+    # End-to-end: the strict project lexicon turns this pronunciation mistake
+    # into a blocking validation error rather than a best-effort warning.
     script_dir = tmp_path / "project" / "script"
     script_dir.mkdir(parents=True)
     roman_path = script_dir / "04-final.md"
@@ -85,9 +85,14 @@ def test_check_runs_as_part_of_validating_a_devanagari_edition(tmp_path, capsys)
 
     roman_path.write_text("[ACT:1 Cold Open] Uske paas ek video tha.", encoding="utf-8")
     deva_path.write_text("[ACT:1 Cold Open] उसके पास एक वीडियो था।", encoding="utf-8")
+    (script_dir / "latin-terms.json").write_text(
+        '{"terms": ["video"]}', encoding="utf-8"
+    )
 
-    cli.cmd_validate(argparse.Namespace(script=str(roman_path), wpm=177))
+    result = cli.cmd_validate(argparse.Namespace(script=str(roman_path), wpm=177))
 
     report = capsys.readouterr().out
-    assert "[transliterated_english]" in report
-    assert "[WARNING]" in report
+    assert result == 1
+    assert "[mixed_script_english] [ERROR]" in report
+    assert "'video'" in report
+    assert "'वीडियो'" in report

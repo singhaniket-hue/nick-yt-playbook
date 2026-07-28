@@ -152,6 +152,24 @@ Calm documentary narration runs about **130–150 words per minute**. A 25–30 
 
 ## 05 Recording the Narration
 
+### Voice-clone script contract
+
+Keep two matching editions: `script/04-final.md` is the canonical Romanized
+Hinglish script, and `script/05-devanagari.md` is the pronunciation edition.
+In the pronunciation edition, write Hindi words in Devanagari and leave every
+English word, brand, acronym, and technical term in Latin. Never transliterate
+English into Devanagari: `रात हो चुकी है, घर में finally silence है।` is
+correct; `रात हो चुकी है, घर में फाइनली साइलेंस है।` is not. Write `account`,
+not `अकाउंट`.
+
+Record the allowed Latin tokens in `script/latin-terms.json` as
+`{"terms": ["account", "finally", "silence"], "occurrences": []}`. If a spelling
+can be Romanized Hindi or English, declare only its English occurrence by
+one-based spoken-word position instead of making it a global term. Validation
+and narration must stop if a declared English term was converted to
+Devanagari or if the TTS edition contains an undeclared Latin word. Fix the
+script or its lexicon; do not bypass this gate.
+
 ### Gear (in order of upgrade priority)
 
 | Budget | Setup |

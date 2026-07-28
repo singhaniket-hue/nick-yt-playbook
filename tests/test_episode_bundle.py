@@ -22,6 +22,11 @@ def _episode(root: Path) -> Path:
     (root / "assets" / "clip.mp4").write_bytes(b"portable media")
     (root / "narration").mkdir()
     (root / "narration" / "vo.wav").write_bytes(b"voice")
+    (root / "script").mkdir()
+    (root / "script" / "latin-terms.json").write_text(
+        json.dumps({"terms": ["account", "YouTube"]}),
+        encoding="utf-8",
+    )
     (root / "empty").mkdir()
     (root / "brief.json").write_text(
         json.dumps({"title": "Portable episode"}), encoding="utf-8"
@@ -76,6 +81,7 @@ def test_package_is_deterministic_portable_and_excludes_machine_state(
         names = archive.namelist()
         assert names == sorted(names)
         assert "project/assets/clip.mp4" in names
+        assert "project/script/latin-terms.json" in names
         assert "project/empty/" in names
         assert "project/.rabbithole-bundle/manifest.json" in names
         assert "project/.rabbithole-bundle/checksums.sha256" in names
@@ -101,6 +107,9 @@ def test_restore_preserves_project_tree_and_refuses_overwrite(tmp_path: Path) ->
     assert result["valid"] is True
     assert (destination / "assets" / "clip.mp4").read_bytes() == b"portable media"
     assert (destination / "narration" / "vo.wav").read_bytes() == b"voice"
+    assert json.loads(
+        (destination / "script" / "latin-terms.json").read_text(encoding="utf-8")
+    ) == {"terms": ["account", "YouTube"]}
     assert (destination / "empty").is_dir()
     assert (destination / ".rabbithole-bundle" / "manifest.json").is_file()
 

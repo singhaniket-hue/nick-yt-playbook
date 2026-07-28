@@ -31,7 +31,7 @@ from rabbithole.highlights import (
     window_highlights,
 )
 from rabbithole.jsonio import read_json
-from rabbithole.markers import parse
+from rabbithole.markers import ParsedScript, parse
 from rabbithole.narrate import estimate_characters, plan_narration
 from rabbithole.overlays import Overlay, build_overlays, check_overlays
 from rabbithole.pipeline import render_narration
@@ -70,6 +70,7 @@ from rabbithole.validate import (
     check_transliteration,
     format_report,
     load_claims,
+    load_latin_terms,
     load_sfx_names,
     validation_profile_for_script,
     validate_all,
@@ -107,6 +108,35 @@ def _quality_mode(args: argparse.Namespace) -> str:
 def _devanagari_for(script_path: Path) -> Path:
     """The Devanagari TTS edition that pairs with a canonical script."""
     return script_path.parent / "05-devanagari.md"
+
+
+_FINAL_SCRIPT_NAME = "04-final.md"
+
+
+def _mixed_script_findings(
+    script_path: Path,
+    romanized: ParsedScript,
+    devanagari: ParsedScript | None,
+) -> list[Finding]:
+    """Validate a final TTS edition against its explicit English lexicon.
+
+    Draft and legacy script filenames retain the pre-lexicon parity check.
+    The production workflow's canonical ``04-final.md`` fails closed.
+    """
+    if script_path.name.casefold() != _FINAL_SCRIPT_NAME:
+        return check_transliteration(romanized, devanagari)
+
+    latin_terms, lexicon_findings = load_latin_terms(
+        script_path.parent / "latin-terms.json"
+    )
+    findings = list(lexicon_findings)
+    findings += check_transliteration(
+        romanized,
+        devanagari,
+        latin_terms=latin_terms,
+        strict_latin_terms=not lexicon_findings,
+    )
+    return findings
 
 
 def _validation_profile(
@@ -177,7 +207,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         claims=_claims_for(script_path),
         profile=profile,
     )
-    findings += check_transliteration(parsed, deva_parsed)
+    findings += _mixed_script_findings(script_path, parsed, deva_parsed)
     if deva_parsed is not None:
         findings += check_transliterated_english(deva_parsed)
     print(format_report(findings))
@@ -212,9 +242,27 @@ def cmd_narrate(args: argparse.Namespace) -> int:
         claims=_claims_for(script_path),
         profile=profile,
     )
-    findings += check_transliteration(parsed, deva_parsed)
+    findings += _mixed_script_findings(script_path, parsed, deva_parsed)
     if deva_parsed is not None:
         findings += check_transliterated_english(deva_parsed)
+    pronunciation_errors = [
+        finding
+        for finding in findings
+        if finding.severity == "error"
+        and finding.gate
+        in {
+            "transliteration",
+            "mixed_script_english",
+            "transliterated_english",
+        }
+    ]
+    if pronunciation_errors:
+        print(format_report(findings))
+        print(
+            "\nRefusing to narrate because the mixed-script pronunciation "
+            "contract failed. --force cannot bypass this safety gate."
+        )
+        return 1
     if any(f.severity == "error" for f in findings) and not args.force:
         print(format_report(findings))
         print("\nRefusing to narrate a script that fails the gates. Use --force to override.")
@@ -1215,7 +1263,14 @@ def main(argv: list[str] | None = None) -> int:
     narrate.add_argument("script", help="Path to the marked-up narration script")
     narrate.add_argument("--out", required=True, help="Output WAV path")
     narrate.add_argument("--dry-run", action="store_true", help="Report cost only")
-    narrate.add_argument("--force", action="store_true", help="Narrate despite failing gates")
+    narrate.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Narrate despite overridable content gates; brief and mixed-script "
+            "pronunciation safety gates remain enforced"
+        ),
+    )
     narrate.add_argument(
         "--wpm",
         type=int,

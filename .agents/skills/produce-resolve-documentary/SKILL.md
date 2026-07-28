@@ -86,9 +86,22 @@ brief/research approval before writing the final script.
 ## Author and narrate
 
 Write `script/04-final.md` as the canonical Romanized Hinglish edition and
-`script/05-devanagari.md` as the matching TTS edition. Use only supported
-markers: `ACT`, `CHAPTER`, `SHOT`, `SILENCE`, `SFX`, `MUSIC`, `REHOOK`,
-`CENSOR`, and `KEY`.
+`script/05-devanagari.md` as the matching, mixed-script TTS edition. In the TTS
+edition, write Hindi words in Devanagari and preserve every English word,
+brand, acronym, and technical term in Latin. Never transliterate an English
+word into Devanagari. Good: `रात हो चुकी है, घर में finally silence है।` Bad:
+`रात हो चुकी है, घर में फाइनली साइलेंस है।` Write `account`, not `अकाउंट`.
+
+Create and review the episode's authoritative Latin-token lexicon at
+`script/latin-terms.json`, using `{"terms": ["account", "finally", "silence"],
+"occurrences": []}`. Put unambiguous English tokens in `terms`. If one spelling
+can be either Romanized Hindi or English, omit it from `terms` and declare only
+the English use with its one-based spoken-word position, for example
+`{"token": "is", "word_index": 705}` in `occurrences`. Validation and narration
+must refuse a TTS edition that converts a declared English term or contains an
+undeclared Latin word. Correct the script or lexicon; never bypass this
+pronunciation gate. Use only supported markers: `ACT`, `CHAPTER`, `SHOT`,
+`SILENCE`, `SFX`, `MUSIC`, `REHOOK`, `CENSOR`, and `KEY`.
 
 ```text
 uv run rabbithole validate projects/<slug>/script/04-final.md

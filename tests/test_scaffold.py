@@ -36,6 +36,14 @@ def test_new_project_writes_the_act_skeleton(tmp_path):
         assert f"[ACT:{act} " in skeleton
 
 
+def test_new_project_seeds_the_strict_latin_term_lexicon(tmp_path):
+    root = new_project(tmp_path, "aviloop-hindi")
+
+    assert json.loads(
+        (root / "script" / "latin-terms.json").read_text(encoding="utf-8")
+    ) == {"terms": [], "occurrences": []}
+
+
 def test_new_project_refuses_to_clobber(tmp_path):
     new_project(tmp_path, "aviloop-hindi")
 

@@ -62,5 +62,9 @@ def new_project(projects_dir: Path, slug: str) -> Path:
         encoding="utf-8",
     )
     (root / "script" / "01-beat-sheet.md").write_text(ACT_SKELETON, encoding="utf-8")
+    (root / "script" / "latin-terms.json").write_text(
+        json.dumps({"terms": [], "occurrences": []}, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     return root
