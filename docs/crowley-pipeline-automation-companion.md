@@ -94,6 +94,13 @@ The Project Overview treats the script as "a de facto cut sheet." For this genre
 
 ### Script tag vocabulary
 
+The table below is the target design vocabulary, not the current parser
+contract. The implemented grammar accepts only `ACT`, `CHAPTER`, `SHOT`,
+`SILENCE`, `SFX`, `MUSIC`, `REHOOK`, `CENSOR`, and `KEY`. In particular, the
+earlier `[SRC:]` proposal is retired: current source captions are derived from
+approved provenance, where source identity and dates can be validated without
+duplicating script metadata.
+
 | Tag | Meaning | Pipeline action |
 |---|---|---|
 | `[CH:3 "The Second Account"]` | Chapter boundary + title | Insert glitch break + chapter card macro; start YouTube chapter timestamp |
@@ -104,7 +111,7 @@ The Project Overview treats the script as "a de facto cut sheet." For this genre
 | `[TEXT:"..."]` | Hard-cut text card | Black screen + white line + boom SFX (Playbook §12, animation #5) |
 | `[ZOOM:asset@x2,y1]` | Push-in target on a still | Ken Burns push-in toward the given region instead of default center |
 | `[REC]` / `[VHS]` | Treat clip as recreation / archive | Apply full VHS degradation stack + "RECREATION" caption where tagged |
-| `[SRC:"Wayback, Mar 2021"]` | Source of the current evidence | Auto-generate the monospace source caption, lower-left |
+| Provenance source metadata *(not a script tag)* | Source title/provider and publication date for direct evidence | Generate an editable lower-left V3 source caption for uncovered source spans |
 | `[MUSIC:tension_02]` | Music bed change | Crossfade A2 to the named bed from the music bin |
 
 ### Asset naming contract
@@ -141,7 +148,28 @@ Stage 2 generates whatever the script calls for that doesn't exist. In this genr
 
 > **THE EVIDENCE RULE**
 >
-> Generated media may only ever be **atmosphere** or **labeled recreation** — never evidence. The pipeline enforces this structurally: generated assets are written to `/assets/generated/`, are barred from carrying `[SRC:]` captions, and anything tagged `[REC]` gets an on-screen "RECREATION" label automatically. Real evidence lives in `/assets/evidence/` and is never modified beyond crop/zoom/redaction.
+> Generated media may only ever be **atmosphere** or **labeled recreation** —
+> never evidence. The current pipeline enforces the evidence boundary through
+> provenance tiers and the final source-quality gate: generated cards and
+> plates do not count toward sourced-evidence coverage and receive no
+> provenance-derived source caption. Automatic `[REC]` treatment remains a
+> target-state feature, not a supported script marker.
+
+### Implemented acquisition safety
+
+The current `rabbithole assets` stage checkpoints each successful slot, supports
+repeatable exact `--slot` selection and bounded `--batch-size` runs, and resumes
+the remaining work when rerun. Explicit `--refresh --slot ...` transactions
+retain replaced media in project-local quarantine and preserve retired
+provenance instead of deleting history.
+
+Browser evidence supports authored selector/text/scroll/crop targets, adaptive
+target-centric framing, same-page navigation reuse with distinct slot pixels,
+and fail-closed consent/challenge/blank-frame checks. Exact frames can also be
+derived from already retained source video. Primary yt-dlp footage is pinned to
+a Resolve-portable H.264 MP4 profile and probed before acceptance. The complete
+operator contract and JSON examples live in
+[Asset acquisition and visual QA](./asset-acquisition-workflow.md).
 
 ### What each generator is for
 
@@ -180,7 +208,10 @@ A5  ambience / room tone            # utility audio; silence only when authored
 1. **Narration skeleton.** Place chapter VO files on A1 in order, inserting `[PAUSE]` gaps. Timeline length is now fixed. Compute each paragraph's in/out timecodes from the VO segments (silence detection between paragraphs, validated against script word counts at 130–150 wpm).
 2. **Chapter infrastructure.** At each `[CH:]` boundary: insert the glitch-break macro (Sec. 08), then the chapter-card compound clip on V3 (2.5–4s), then a marker that later exports as a YouTube timestamp.
 3. **Visual coverage.** For each paragraph, place its `[ASSET:]` file: stills and screenshots → V2 over a blurred-dark backdrop; footage → V1. Rule check: **no uncovered narration** — any paragraph without a resolvable asset gets a slated placeholder (dark ambient loop + "MISSING: ch3_014" text) so gaps are visible in the draft, never silent.
-4. **Music & ambience.** Lay `[MUSIC:]` beds on A2 with 2s crossfades at changes; room-tone loop on A3; cut both at `[SILENCE]` tags. Add riser SFX ending at each chapter's final beat.
+4. **Music & ambience.** Lay `[MUSIC:]` beds on A3 with 2s
+   constant-power crossfades at changes; reserve A5 for room tone/utility
+   ambience; duck both at `[SILENCE]` tags. Add riser SFX ending at each
+   chapter's final beat.
 5. **SFX pass.** Boom at every chapter card and `[TEXT:]` card; static burst at every static-cut transition; shutter/click when a V2 evidence item appears.
 
 ---
@@ -188,8 +219,15 @@ A5  ambience / room tone            # utility audio; silence only when authored
 ## 06 Audio Pass — Fairlight Automation
 
 This section is a target-state Fairlight specification. The current reusable
-pipeline can prepare/mix deterministic stems with FFmpeg; it does not yet build
-this complete Fairlight chain through Resolve's scripting API.
+pipeline prepares content-addressed A3/A4 stems before FCPXML compilation:
+constant-power bed tiling and style gain are baked into A3; cue placement and
+category-specific levels are baked into A4; both carry the authored 30 ms
+click-safe silence-drop ramps. A manifest-recorded shared volume adjustment on
+A1/A3/A4 preserves the final mix peak ceiling. The raw sound library remains
+portable for editor replacements. Source-audio bites still use the FFmpeg
+renderer because their narration/music duck automation is not yet represented
+by the Resolve stems. The pipeline does not yet build the complete Fairlight
+processor chain through Resolve's scripting API.
 
 - **Narration chain** (per Playbook §05), applied as a saved Fairlight preset: high-pass 80 Hz → mud cut ~300–400 Hz → presence lift 2–5 kHz → compression ~3:1 targeting 4–6 dB reduction → normalize dialogue to **−15 LUFS ±1**.
 - **Ducking:** sidechain compressor on A2 keyed from A1, ~−15 dB under speech, slow release so beds swell gently in pauses — mimicking the manual keyframing the Playbook describes.
@@ -276,10 +314,15 @@ SFX, and final credit/description generation are not yet complete.
 
 - **Chapter cards:** one Fusion template (Playbook §12): red monospace "CHAPTER 03" typewriter-animated at top, white title glitch-in below, grain + vignette pulse, boom. The assembler instantiates it per `[CH:]` tag — text is data, design is fixed.
 - **Typewriter engine:** Text+ with Write-On/Follower animation as a macro; per-character click SFX auto-laid on A4 at low volume.
-- **Source captions:** every `[SRC:]` tag renders the small monospace lower-left caption with fade in/out — automated sourcing on screen, the genre's credibility marker, now impossible to forget.
+- **Source captions:** direct-source provenance generates an editable lower-left V3 Basic Title carrying source title/provider and publication date. Continuous spans are coalesced, authored `source_caption` overlays cover their own ranges without duplicates, and media with burned attribution receives no second caption.
+- **Signal-comparison cards:** an opt-in `signal comparison - ...` graphic renders one of four reference/processed motifs (`edge baseline`, `processed change`, `timing and audio`, or `automated flag`). Every frame identifies itself as a local illustration of general testing logic and states that it is not Webdriver Torso's published algorithm.
 - **Hard-cut text cards:** `[TEXT:"..."]` → black screen, one line of white type, no animation, one boom. The pipeline's simplest template is the genre's most powerful moment.
 - **Redactions:** `[REDACT:asset@region]` draws solid black rectangles on V3 over the region; for video, a tracked blur is applied and **always flagged for human verification** (a slipped redaction is an ethics failure, not a style bug).
-- **Credits & description:** at render time the pipeline concatenates every `[MUSIC:]` and `[SRC:]` reference plus generated-asset disclosures into `credits.txt`, and exports chapter markers as YouTube timestamps — the Playbook §14 upload checklist, half-done automatically.
+- **Credits & description:** the target publishing stage concatenates `[MUSIC:]`
+  references, provenance source records, and generated-asset disclosures into
+  `credits.txt`, then exports chapter markers as YouTube timestamps. Current
+  handoff packaging includes these files only when the episode has already
+  generated them.
 
 ---
 
@@ -345,16 +388,17 @@ when the episode already generated them.
 
 ### The review loop, genre edition
 
-1. Watch the draft once at 1× for story; note fixes against script line IDs ("ch3_014: wrong screenshot; ch5: silence 2s later").
-2. Agent re-runs only the affected chapters/stages; re-render.
-3. Human pass in Resolve for the judgment work: deepest-point timing, evidence verification, redaction check, the final ±5% on silences.
-4. Final render at full quality; description assembled from chapters + credits + content warning template.
+1. Generate graphics and evidence contact sheets; resolve every red missing/unreadable card and verify source context, derived-frame crops, and editorial caveats.
+2. Watch the draft once at 1× for story; note fixes against script line IDs ("ch3_014: wrong screenshot; ch5: silence 2s later").
+3. Agent re-runs only the affected exact asset slots, chapters, or stages; re-render.
+4. Human pass in Resolve for the judgment work: deepest-point timing, evidence and editable source-caption verification, redaction check, the final ±5% on silences.
+5. Final render at full quality; description assembled from chapters + credits + content warning template.
 
 ### Implementation status
 
 | # | Milestone | Status |
 |---|---|---|
-| 1 | Local media preparation, capture, source-audio, plate, music, and SFX tooling | Built |
+| 1 | Resumable local media preparation, target-aware capture, retained-source derivation, contact-sheet QA, source-audio, plate, music, and SFX tooling | Built |
 | 2 | Versioned Resolve plan and FCPXML compiler with CLI and local MCP entry points | Built |
 | 3 | Resolve Free in-app runner, explicit Studio external bridge, durable queue, and fail-closed safety locks | Built and fake-API tested; Free Console still requires Python 3.11+ confirmation |
 | 4 | Portable style pack: `crowley_style.yaml`, deterministic LUT, Fusion titles, and glitch transition | Built; the baseline LUT is applied to eligible archival V1 clips, while Fusion/V4 placement and optional PowerGrade/DRX capture remain manual |

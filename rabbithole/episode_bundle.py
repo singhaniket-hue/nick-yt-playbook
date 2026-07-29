@@ -10,13 +10,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
 import stat
 import tempfile
-from typing import Any
+from typing import Any, Callable
 import unicodedata
 import zipfile
 
@@ -61,6 +62,11 @@ _RESOLVE_GENERATED_NAMES = frozenset(
         "state.json",
     }
 )
+_RESOLVE_ROOT_GENERATED_NAMES = frozenset(
+    {
+        "current.json",
+    }
+)
 _RESOLVE_GENERATED_DIRECTORIES = frozenset(
     {
         "build",
@@ -99,6 +105,14 @@ _PATH_CONTAINER_KEYS = frozenset(
         "source_paths",
     }
 )
+_AUDIO_STEMS_ROOT = "resolve/audio-stems"
+_AUDIO_STEM_POINTER = f"{_AUDIO_STEMS_ROOT}/current.json"
+_AUDIO_STEM_SCHEMA = "resolve-audio-stems.v1"
+_AUDIO_STEM_MANIFEST_NAME = "manifest.json"
+_AUDIO_STEM_FILES = {
+    "music": ("A3", "music-stem.wav"),
+    "sfx": ("A4", "sfx-stem.wav"),
+}
 
 
 class EpisodeBundleError(RuntimeError):
@@ -282,6 +296,10 @@ def _is_excluded(relative: str, *, is_directory: bool) -> bool:
             if not is_directory and (
                 tail[-1] in _RESOLVE_GENERATED_NAMES
                 or tail[-1].endswith(".lock")
+                or (
+                    len(tail) == 1
+                    and tail[-1] in _RESOLVE_ROOT_GENERATED_NAMES
+                )
             ):
                 return True
     if not is_directory and parts[-1] in {".ds_store", "thumbs.db"}:
@@ -513,8 +531,311 @@ def _audit_json_metadata(
         )
 
 
+def _audio_json_object(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise EpisodeBundleValidationError(f"{label} must contain a JSON object")
+    return value
+
+
+def _audio_portable_path(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise EpisodeBundleValidationError(
+            f"{label} must be a non-empty portable path"
+        )
+    return _validate_portable_relative(value, label=label)
+
+
+def _audio_positive_number(value: Any, *, label: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0
+    ):
+        raise EpisodeBundleValidationError(
+            f"{label} must be a finite positive number"
+        )
+    return float(value)
+
+
+def _audit_audio_stem_selection(
+    *,
+    included_files: set[str],
+    read_json_value: Callable[[str], Any],
+    sha256_for: Callable[[str], str],
+) -> None:
+    """Validate the complete portable chain selected by audio-stems/current.json.
+
+    Project inputs are required in the episode and checked against the immutable
+    stem contract. Repository inputs (currently ``style/sfx.json``) retain their
+    hash in that contract but are deliberately not required inside the episode
+    bundle: a destination checkout can either reuse the stem set with the same
+    style or prepare a new content-addressed set from the bundled raw sources.
+    """
+
+    if _AUDIO_STEM_POINTER not in included_files:
+        return
+
+    pointer = _audio_json_object(
+        read_json_value(_AUDIO_STEM_POINTER),
+        label=_AUDIO_STEM_POINTER,
+    )
+    if pointer.get("schema_version") != _AUDIO_STEM_SCHEMA:
+        raise EpisodeBundleValidationError(
+            f"{_AUDIO_STEM_POINTER}: unsupported schema_version "
+            f"{pointer.get('schema_version')!r}"
+        )
+    fingerprint = pointer.get("fingerprint")
+    if not isinstance(fingerprint, str) or not _HASH_RE.fullmatch(fingerprint):
+        raise EpisodeBundleValidationError(
+            f"{_AUDIO_STEM_POINTER}: fingerprint must be a full SHA-256 digest"
+        )
+    expected_manifest_path = f"{fingerprint}/{_AUDIO_STEM_MANIFEST_NAME}"
+    manifest_path = _audio_portable_path(
+        pointer.get("manifest_path"),
+        label=f"{_AUDIO_STEM_POINTER} manifest_path",
+    )
+    if manifest_path != expected_manifest_path:
+        raise EpisodeBundleValidationError(
+            f"{_AUDIO_STEM_POINTER}: manifest_path must select the immutable "
+            f"fingerprint directory {expected_manifest_path!r}"
+        )
+    manifest_relative = f"{_AUDIO_STEMS_ROOT}/{manifest_path}"
+    if manifest_relative not in included_files:
+        raise EpisodeBundleValidationError(
+            f"{_AUDIO_STEM_POINTER}: selected audio-stem manifest is missing "
+            f"from the portable bundle: {manifest_relative!r}"
+        )
+    manifest_sha = pointer.get("manifest_sha256")
+    if not isinstance(manifest_sha, str) or not _HASH_RE.fullmatch(manifest_sha):
+        raise EpisodeBundleValidationError(
+            f"{_AUDIO_STEM_POINTER}: manifest_sha256 must be a full SHA-256 digest"
+        )
+    if sha256_for(manifest_relative) != manifest_sha:
+        raise EpisodeBundleValidationError(
+            f"{_AUDIO_STEM_POINTER}: selected audio-stem manifest checksum changed"
+        )
+
+    manifest = _audio_json_object(
+        read_json_value(manifest_relative),
+        label=manifest_relative,
+    )
+    if manifest.get("schema_version") != _AUDIO_STEM_SCHEMA:
+        raise EpisodeBundleValidationError(
+            f"{manifest_relative}: unsupported audio-stem schema"
+        )
+    if manifest.get("fingerprint") != fingerprint:
+        raise EpisodeBundleValidationError(
+            f"{manifest_relative}: fingerprint does not match current.json"
+        )
+    contract = manifest.get("contract")
+    if not isinstance(contract, dict):
+        raise EpisodeBundleValidationError(
+            f"{manifest_relative}: contract must be an object"
+        )
+    observed_fingerprint = _sha256_bytes(
+        json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    if observed_fingerprint != fingerprint:
+        raise EpisodeBundleValidationError(
+            f"{manifest_relative}: contract fingerprint does not match its "
+            "immutable directory"
+        )
+
+    inputs = contract.get("inputs")
+    if not isinstance(inputs, list):
+        raise EpisodeBundleValidationError(
+            f"{manifest_relative}: contract.inputs must be an array"
+        )
+    seen_inputs: set[tuple[str, str]] = set()
+    for index, raw_input in enumerate(inputs):
+        label = f"{manifest_relative} contract.inputs[{index}]"
+        if not isinstance(raw_input, dict):
+            raise EpisodeBundleValidationError(f"{label} must be an object")
+        location = raw_input.get("location")
+        if location not in {"project", "repository"}:
+            raise EpisodeBundleValidationError(
+                f"{label}.location must be 'project' or 'repository'"
+            )
+        input_path = _audio_portable_path(
+            raw_input.get("path"),
+            label=f"{label}.path",
+        )
+        input_sha = raw_input.get("sha256")
+        if not isinstance(input_sha, str) or not _HASH_RE.fullmatch(input_sha):
+            raise EpisodeBundleValidationError(
+                f"{label}.sha256 must be a full SHA-256 digest"
+            )
+        identity = (location, input_path)
+        if identity in seen_inputs:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: duplicate audio-stem input {identity!r}"
+            )
+        seen_inputs.add(identity)
+        if location == "project":
+            if input_path not in included_files:
+                raise EpisodeBundleValidationError(
+                    f"{label}: project input is missing from the portable bundle: "
+                    f"{input_path!r}"
+                )
+            if sha256_for(input_path) != input_sha:
+                raise EpisodeBundleValidationError(
+                    f"{label}: project input is stale or changed: {input_path!r}"
+                )
+
+    entries = manifest.get("entries")
+    if not isinstance(entries, dict) or set(entries) != set(_AUDIO_STEM_FILES):
+        raise EpisodeBundleValidationError(
+            f"{manifest_relative}: entries must contain exactly music and sfx"
+        )
+    manifest_seconds = _audio_positive_number(
+        manifest.get("duration_seconds"),
+        label=f"{manifest_relative} duration_seconds",
+    )
+    manifest_directory = str(PurePosixPath(manifest_relative).parent)
+    seen_stems: set[str] = set()
+    for name, (expected_track, expected_name) in _AUDIO_STEM_FILES.items():
+        label = f"{manifest_relative} entries[{name!r}]"
+        entry = entries[name]
+        if not isinstance(entry, dict):
+            raise EpisodeBundleValidationError(f"{label} must be an object")
+        if entry.get("track") != expected_track or entry.get("kind") != name:
+            raise EpisodeBundleValidationError(
+                f"{label} must identify {name!r} on track {expected_track}"
+            )
+        stem_path = _audio_portable_path(
+            entry.get("path"),
+            label=f"{label}.path",
+        )
+        if stem_path != expected_name:
+            raise EpisodeBundleValidationError(
+                f"{label}.path must be {expected_name!r}"
+            )
+        stem_relative = f"{manifest_directory}/{stem_path}"
+        if stem_relative in seen_stems:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: stem entries select the same file"
+            )
+        seen_stems.add(stem_relative)
+        if stem_relative not in included_files:
+            raise EpisodeBundleValidationError(
+                f"{label}: stem file is missing from the portable bundle: "
+                f"{stem_relative!r}"
+            )
+        expected_sha = entry.get("sha256")
+        if not isinstance(expected_sha, str) or not _HASH_RE.fullmatch(expected_sha):
+            raise EpisodeBundleValidationError(
+                f"{label}.sha256 must be a full SHA-256 digest"
+            )
+        if sha256_for(stem_relative) != expected_sha:
+            raise EpisodeBundleValidationError(
+                f"{label}: stem checksum changed: {stem_relative!r}"
+            )
+        stem_seconds = _audio_positive_number(
+            entry.get("duration_seconds"),
+            label=f"{label}.duration_seconds",
+        )
+        if abs(stem_seconds - manifest_seconds) > 0.075:
+            raise EpisodeBundleValidationError(
+                f"{label}: stem duration does not match the selected manifest"
+            )
+        for field in ("channels", "sample_rate"):
+            field_value = entry.get(field)
+            if (
+                isinstance(field_value, bool)
+                or not isinstance(field_value, int)
+                or field_value <= 0
+            ):
+                raise EpisodeBundleValidationError(
+                    f"{label}.{field} must be a positive integer"
+                )
+
+
+def _audit_local_audio_stems(root: Path, included_files: set[str]) -> None:
+    def read_value(relative: str) -> Any:
+        path = root.joinpath(*PurePosixPath(relative).parts)
+        try:
+            return json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise EpisodeBundleValidationError(
+                f"cannot audit audio-stem metadata {relative}: {exc}"
+            ) from exc
+
+    def checksum(relative: str) -> str:
+        return _sha256_file(root.joinpath(*PurePosixPath(relative).parts))
+
+    _audit_audio_stem_selection(
+        included_files=included_files,
+        read_json_value=read_value,
+        sha256_for=checksum,
+    )
+
+
+def _select_current_audio_stem_paths(
+    root: Path,
+    paths: list[Path],
+    directory_paths: list[Path],
+) -> tuple[list[Path], list[Path]]:
+    """Exclude historical immutable stem sets from a portable episode.
+
+    The selected set is already content-addressed and fully audited through
+    ``current.json``. Carrying every older set doubles the bundle after each
+    mix revision and provides no receiving-host value.
+    """
+
+    stems_root = root.joinpath(*PurePosixPath(_AUDIO_STEMS_ROOT).parts)
+    pointer_path = root.joinpath(*PurePosixPath(_AUDIO_STEM_POINTER).parts)
+    selected_fingerprint: str | None = None
+    if pointer_path.is_file():
+        try:
+            pointer = json.loads(pointer_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pointer = None
+        if isinstance(pointer, dict):
+            candidate = pointer.get("fingerprint")
+            if isinstance(candidate, str) and _HASH_RE.fullmatch(candidate):
+                selected_fingerprint = candidate
+
+    def selected(path: Path, *, is_directory: bool) -> bool:
+        try:
+            tail = path.relative_to(stems_root).parts
+        except ValueError:
+            return True
+        if not tail:
+            return True
+        if not is_directory and tail == ("current.json",):
+            return True
+        return (
+            selected_fingerprint is not None
+            and tail[0] == selected_fingerprint
+        )
+
+    return (
+        [path for path in paths if selected(path, is_directory=False)],
+        [
+            path
+            for path in directory_paths
+            if selected(path, is_directory=True)
+        ],
+    )
+
+
 def _collect_sources(root: Path) -> tuple[list[_SourceFile], list[str]]:
     paths, directory_paths = _scan_tree(root)
+    paths, directory_paths = _select_current_audio_stem_paths(
+        root,
+        paths,
+        directory_paths,
+    )
     portable_paths: dict[str, str] = {}
     relative_files: set[str] = set()
     for path in [*directory_paths, *paths]:
@@ -533,6 +854,7 @@ def _collect_sources(root: Path) -> tuple[list[_SourceFile], list[str]]:
         if path in paths:
             relative_files.add(relative)
 
+    _audit_local_audio_stems(root, relative_files)
     _audit_json_metadata(root, paths, relative_files)
 
     sources: list[_SourceFile] = []
@@ -991,6 +1313,47 @@ def _audit_bundled_json_metadata(
         )
 
 
+def _audit_bundled_audio_stems(
+    archive: zipfile.ZipFile,
+    infos: dict[str, zipfile.ZipInfo],
+    file_records: list[dict[str, Any]],
+) -> None:
+    records_by_path = {record["path"]: record for record in file_records}
+    included_files = set(records_by_path)
+
+    def read_value(relative: str) -> Any:
+        member = f"{ARCHIVE_ROOT}/{relative}"
+        try:
+            return json.loads(
+                _read_small_member(
+                    archive,
+                    infos[member],
+                    label=f"audio-stem metadata {relative!r}",
+                    maximum=64 * 1024 * 1024,
+                ).decode("utf-8-sig")
+            )
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise EpisodeBundleValidationError(
+                f"cannot audit audio-stem metadata {relative}: {exc}"
+            ) from exc
+
+    def checksum(relative: str) -> str:
+        record = records_by_path.get(relative)
+        if record is None:
+            raise EpisodeBundleValidationError(
+                f"audio-stem file is missing from bundle manifest: {relative!r}"
+            )
+        # validate_episode_bundle has already compared this manifest digest with
+        # the exact ZIP member bytes before invoking the semantic audit.
+        return str(record["sha256"])
+
+    _audit_audio_stem_selection(
+        included_files=included_files,
+        read_json_value=read_value,
+        sha256_for=checksum,
+    )
+
+
 def validate_episode_bundle(
     bundle: os.PathLike[str] | str,
 ) -> dict[str, Any]:
@@ -1100,6 +1463,7 @@ def validate_episode_bundle(
             if record is not None:
                 total_bytes += info.file_size
 
+        _audit_bundled_audio_stems(archive, infos, file_records)
         _audit_bundled_json_metadata(archive, infos, file_records)
 
     return {

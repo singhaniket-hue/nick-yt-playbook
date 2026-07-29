@@ -56,6 +56,16 @@ def _frame(video: Path, at: float = 0.8) -> np.ndarray:
     return np.asarray(Image.open(png).convert("L")).astype(np.float64)
 
 
+def _rgb_frame(video: Path, at: float = 0.8) -> np.ndarray:
+    png = video.with_name(video.stem + f"-rgb-{at}.png")
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", str(video),
+         "-ss", str(at), "-frames:v", "1", str(png)],
+        check=True,
+    )
+    return np.asarray(Image.open(png).convert("RGB"))
+
+
 def _ink_fraction(frame: np.ndarray, threshold: float = 110.0) -> float:
     """Share of pixels bright enough to be text rather than graded plate."""
     return float((frame > threshold).mean())
@@ -102,6 +112,91 @@ def test_every_classified_kind_has_an_event_builder():
 def test_explicit_items_are_used():
     spec, _ = parse_detail("criteria: unemployed | lazy | online", 4.0)
     assert spec.items == ("unemployed", "lazy", "online")
+
+
+def test_signal_comparison_marker_remains_a_comparison_with_explicit_items():
+    spec, findings = parse_detail(
+        "signal comparison - processed change: "
+        "REFERENCE - SHARP EDGE | PROCESSED - BLUR + COLOUR SHIFT",
+        4.0,
+    )
+
+    assert findings == []
+    assert spec.kind == "comparison"
+    assert spec.heading == "signal comparison - processed change"
+    assert spec.items == (
+        "REFERENCE - SHARP EDGE",
+        "PROCESSED - BLUR + COLOUR SHIFT",
+    )
+
+
+def test_signal_comparison_rejects_an_undocumented_variant():
+    spec, findings = parse_detail(
+        "signal comparison - secret decoder: REFERENCE | PROCESSED",
+        4.0,
+    )
+
+    assert spec.heading == "signal comparison - secret decoder"
+    assert any(
+        finding.severity == "error"
+        and "unsupported variant 'secret decoder'" in finding.message
+        and "edge baseline" in finding.message
+        and "automated flag" in finding.message
+        for finding in findings
+    )
+
+
+@pytest.mark.parametrize(
+    "detail,expected_count,actual_count",
+    [
+        (
+            "signal comparison - edge baseline: REFERENCE",
+            2,
+            1,
+        ),
+        (
+            "signal comparison - processed change: "
+            "REFERENCE | PROCESSED | EXTRA",
+            2,
+            3,
+        ),
+        (
+            "signal comparison - timing and audio: "
+            "REFERENCE | PROCESSED | EXTRA",
+            2,
+            3,
+        ),
+        (
+            "signal comparison - automated flag: EDGE | COLOUR | TIMING",
+            4,
+            3,
+        ),
+    ],
+)
+def test_signal_comparison_enforces_variant_item_cardinality(
+    detail, expected_count, actual_count
+):
+    _spec, findings = parse_detail(detail, 4.0)
+
+    assert any(
+        finding.severity == "error"
+        and f"requires exactly {expected_count} authored items" in finding.message
+        and f"supplies {actual_count}" in finding.message
+        for finding in findings
+    )
+
+
+def test_card_ass_refuses_an_invalid_signal_spec(style):
+    typo, pal, _ = style
+    spec = CardSpec(
+        kind="comparison",
+        heading="signal comparison - unknown",
+        duration=3.0,
+        items=("REFERENCE", "PROCESSED"),
+    )
+
+    with pytest.raises(ValueError, match="unsupported variant"):
+        card_ass(spec, typo, pal)
 
 
 def test_unstructured_content_after_a_colon_is_kept_as_one_item():
@@ -180,6 +275,20 @@ def test_a_callout_with_no_items_does_not_warn():
     assert findings == []
 
 
+def test_headingless_callout_promotes_its_first_authored_item():
+    """Regression for s212: generic `callout` was stripped and left a nearly
+    blank frame with all useful text compressed into one small body line."""
+    spec, findings = parse_detail(
+        "three labels confirmed date | playful reference | broader intent uncertain",
+        4.0,
+    )
+
+    assert findings == []
+    assert spec.kind == "callout"
+    assert spec.heading == "three labels confirmed date"
+    assert spec.items == ("playful reference", "broader intent uncertain")
+
+
 @pytest.mark.parametrize(
     "detail",
     [
@@ -256,6 +365,69 @@ def test_ass_carries_every_item(style):
         assert item in doc
 
 
+def test_document_disclosure_is_rendered_inside_the_card(style):
+    typo, pal, _ = style
+    disclosure = "EDITORIAL PARAPHRASE · SOURCE-ATTRIBUTED"
+    doc = card_ass(
+        CardSpec(
+            kind="document",
+            heading="Source headline",
+            duration=3.0,
+            items=("Slot-specific summary", "23 Sep 2013", "SOURCE · example.com"),
+            disclosure=disclosure,
+        ),
+        typo,
+        pal,
+    )
+
+    disclosure_events = [
+        line
+        for line in doc.splitlines()
+        if line.startswith("Dialogue:") and ",CardDisclosure," in line
+    ]
+    assert len(disclosure_events) == 1
+    assert disclosure in disclosure_events[0]
+
+
+def test_heading_rule_sits_below_the_actual_wrapped_title_block(style):
+    import re
+
+    typo, pal, _ = style
+    height = 1080
+    doc = card_ass(
+        CardSpec(
+            kind="document",
+            heading=(
+                "A deliberately long source title that wraps across multiple "
+                "lines before its evidence summary begins"
+            ),
+            duration=3.0,
+            items=("Summary",),
+        ),
+        typo,
+        pal,
+        width=1920,
+        height=height,
+    )
+    events = [line for line in doc.splitlines() if line.startswith("Dialogue:")]
+    heading_event = next(line for line in events if ",CardHead," in line)
+    rule_event = next(line for line in events if ",CardShape," in line)
+    heading_y = int(re.search(r"\\pos\(-?\d+,(-?\d+)\)", heading_event).group(1))
+    rule_y = int(re.search(r"\\pos\(-?\d+,(-?\d+)\)", rule_event).group(1))
+    heading_size = int(
+        re.search(r"^Style: CardHead,[^,]+,(\d+),", doc, re.MULTILINE).group(1)
+    )
+    line_count = heading_event.count(r"\N") + 1
+
+    assert line_count >= 2
+    # A centred title needs at least half a font-size per rendered line below
+    # its anchor, followed by visible padding. This rejects the former fixed
+    # 5.5%-of-frame rule offset, which crossed the last line.
+    assert rule_y >= (
+        heading_y + line_count * heading_size * 0.5 + height * 0.01
+    )
+
+
 def test_ass_positions_everything_inside_the_title_safe_box(style):
     """Arithmetic guard on the constraint the pixel test below proves."""
     import re
@@ -284,6 +456,268 @@ def test_braces_in_content_cannot_open_an_ass_override_block(style):
     events = [line for line in doc.splitlines() if line.startswith("Dialogue:")]
     body = "".join(events)
     assert "{\\b1}" not in body
+
+
+def test_timeline_endpoint_labels_anchor_inward_and_wrap_inside_safe(style):
+    typo, pal, _ = style
+    spec = CardSpec(
+        kind="timeline",
+        heading="upload history",
+        duration=3.0,
+        items=(
+            "first observed public upload with unexplained test pattern",
+            "final documented confirmation of automated quality testing",
+        ),
+    )
+    doc = card_ass(spec, typo, pal)
+    body_events = [
+        line for line in doc.splitlines() if line.startswith("Dialogue:") and ",CardBody," in line
+    ]
+
+    assert len(body_events) == 2
+    assert r"\an4" in body_events[0], "first endpoint must grow right, into the axis"
+    assert r"\an6" in body_events[1], "last endpoint must grow left, into the axis"
+    assert all(r"\clip(" in line for line in body_events)
+    assert all(r"\N" in line for line in body_events), "long endpoints were not wrapped"
+
+
+def test_short_timeline_labels_keep_single_line_text(style):
+    typo, pal, _ = style
+    doc = card_ass(
+        CardSpec(
+            kind="timeline",
+            heading="dates",
+            duration=3.0,
+            items=("May 15", "May 16"),
+        ),
+        typo,
+        pal,
+    )
+    body_events = [
+        line for line in doc.splitlines() if line.startswith("Dialogue:") and ",CardBody," in line
+    ]
+
+    assert len(body_events) == 2
+    assert all(r"\N" not in line for line in body_events)
+
+
+def test_comparison_items_wrap_and_are_clipped_to_their_own_columns(style):
+    import re
+
+    typo, pal, _ = style
+    width = 1920
+    spec = CardSpec(
+        kind="comparison",
+        heading="viewer interpretation",
+        duration=3.0,
+        items=(
+            "ordinary software testing behaviour encountered without any specification",
+            "sinister coded message inferred from repeated rectangles and electronic tones",
+        ),
+    )
+    doc = card_ass(spec, typo, pal, width=width, height=1080)
+    body_events = [
+        line for line in doc.splitlines() if line.startswith("Dialogue:") and ",CardBody," in line
+    ]
+
+    assert len(body_events) == 2
+    assert all(r"\N" in line for line in body_events)
+    clips = [
+        tuple(map(int, re.search(r"\\clip\((\d+),(\d+),(\d+),(\d+)\)", line).groups()))
+        for line in body_events
+    ]
+    assert clips[0][2] < width // 2
+    assert clips[1][0] > width // 2
+
+
+@pytest.mark.parametrize(
+    "variant,items",
+    [
+        (
+            "edge baseline",
+            ("REFERENCE - SHARP RED/BLUE EDGES", "PROCESSED - SAME TEST SIGNAL"),
+        ),
+        (
+            "processed change",
+            ("REFERENCE - SHARP EDGE", "PROCESSED - BLUR + COLOUR SHIFT"),
+        ),
+        (
+            "timing and audio",
+            ("EXPECTED - FRAME 00 + TONE A", "PROCESSED - FRAME +02 + TONE DELTA"),
+        ),
+        (
+            "automated flag",
+            ("EDGE FLAGGED", "COLOUR FLAGGED", "TIMING FLAGGED", "AUDIO FLAGGED"),
+        ),
+    ],
+)
+def test_signal_comparison_variants_burn_caveats_and_processed_effects(
+    variant, items, style
+):
+    typo, pal, _ = style
+    doc = card_ass(
+        CardSpec(
+            kind="comparison",
+            heading=f"signal comparison - {variant}",
+            duration=3.0,
+            items=items,
+        ),
+        typo,
+        pal,
+    )
+
+    assert "REFERENCE / PROCESSED" in doc
+    assert "SIGNAL COMPARISON" not in doc
+    assert r"\blur6" in doc
+    assert "LOCAL ILLUSTRATION · GENERAL TESTING LOGIC" in doc
+    assert "NOT WEBDRIVER TORSO'S PUBLISHED ALGORITHM" in doc
+    visible_text = doc.replace(r"\N", " ")
+    for item in items:
+        assert item in visible_text
+
+
+def test_each_signal_comparison_variant_has_distinct_shape_geometry(style):
+    typo, pal, _ = style
+    variants = {
+        "edge baseline": (
+            "REFERENCE - SHARP RED/BLUE EDGES",
+            "PROCESSED - SAME TEST SIGNAL",
+        ),
+        "processed change": (
+            "REFERENCE - SHARP EDGE",
+            "PROCESSED - BLUR + COLOUR SHIFT",
+        ),
+        "timing and audio": (
+            "EXPECTED - FRAME 00 + TONE A",
+            "PROCESSED - FRAME +02 + TONE DELTA",
+        ),
+        "automated flag": (
+            "EDGE FLAGGED",
+            "COLOUR FLAGGED",
+            "TIMING FLAGGED",
+            "AUDIO FLAGGED",
+        ),
+    }
+
+    shape_fingerprints = []
+    for variant, items in variants.items():
+        doc = card_ass(
+            CardSpec(
+                kind="comparison",
+                heading=f"signal comparison - {variant}",
+                duration=3.0,
+                items=items,
+            ),
+            typo,
+            pal,
+        )
+        shape_fingerprints.append("\n".join(
+            line
+            for line in doc.splitlines()
+            if line.startswith("Dialogue:") and ",CardShape," in line
+        ))
+
+    assert len(set(shape_fingerprints)) == len(variants)
+
+
+def test_signal_comparison_shapes_stay_inside_title_safe(style):
+    import re
+
+    typo, pal, _ = style
+    width = 1920
+    height = 1080
+    doc = card_ass(
+        CardSpec(
+            kind="comparison",
+            heading="signal comparison - automated flag",
+            duration=3.0,
+            items=(
+                "EDGE FLAGGED",
+                "COLOUR FLAGGED",
+                "TIMING FLAGGED",
+                "AUDIO FLAGGED",
+            ),
+        ),
+        typo,
+        pal,
+        width=width,
+        height=height,
+    )
+    margin_x = width * (1 - TITLE_SAFE_FRACTION) / 2
+    margin_y = height * (1 - TITLE_SAFE_FRACTION) / 2
+
+    shape_events = [
+        line
+        for line in doc.splitlines()
+        if line.startswith("Dialogue:") and ",CardShape," in line
+    ]
+    assert shape_events
+    for event in shape_events:
+        position = re.search(r"\\pos\((-?\d+),(-?\d+)\)", event)
+        rectangle = re.search(
+            r"\{\\p1\}m 0 0 l (-?\d+) 0 (-?\d+) (-?\d+) 0 (-?\d+)",
+            event,
+        )
+        assert position and rectangle
+        x, y = map(int, position.groups())
+        width_from_top, width_from_bottom, height_from_side = (
+            int(rectangle.group(1)),
+            int(rectangle.group(2)),
+            int(rectangle.group(4)),
+        )
+        assert width_from_top == width_from_bottom
+        assert margin_x - 1 <= x
+        assert margin_y - 1 <= y
+        assert x + width_from_top <= width - margin_x + 1
+        assert y + height_from_side <= height - margin_y + 1
+
+
+def test_regular_comparison_does_not_opt_into_signal_visuals(style):
+    typo, pal, _ = style
+    doc = card_ass(
+        CardSpec(
+            kind="comparison",
+            heading="viewer interpretation",
+            duration=3.0,
+            items=("normal software testing", "sinister coded message"),
+        ),
+        typo,
+        pal,
+    )
+
+    assert "viewer interpretation" in doc or "VIEWER INTERPRETATION" in doc
+    assert "REFERENCE / PROCESSED" not in doc
+    assert "LOCAL ILLUSTRATION" not in doc
+    assert r"\blur6" not in doc
+
+
+def test_long_nonnumeric_stat_uses_readable_heading_body_fallback(style):
+    """Regression for s016: its prose item was set in the giant CardStat style."""
+    typo, pal, _ = style
+    spec, _ = parse_detail(
+        "anatomy of one standard upload: ten numbered one-second slides red block "
+        "blue block labels tones",
+        3.0,
+    )
+    assert spec.kind == "stat"
+
+    doc = card_ass(spec, typo, pal)
+    events = [line for line in doc.splitlines() if line.startswith("Dialogue:")]
+
+    assert not any(",CardStat," in line for line in events)
+    assert any(",CardHead," in line for line in events)
+    assert any(",CardBody," in line for line in events)
+    assert any(r"\N" in line for line in events if ",CardBody," in line)
+
+
+def test_normal_numeric_stat_keeps_the_large_figure_layout(style):
+    typo, pal, _ = style
+    spec, _ = parse_detail("2.279 million registered candidates", 3.0)
+    doc = card_ass(spec, typo, pal)
+    events = [line for line in doc.splitlines() if line.startswith("Dialogue:")]
+
+    assert any(",CardStat," in line for line in events)
+    assert not any(",CardHead," in line for line in events)
 
 
 # --- real renders ----------------------------------------------------------------
@@ -334,6 +768,44 @@ def test_every_template_actually_draws_something(kind, detail, style, tmp_path):
         f"{kind} rendered but drew essentially nothing "
         f"(card {card_ink:.6f} vs bare plate {plate_ink:.6f})"
     )
+
+
+def test_signal_comparison_renders_visible_red_and_blue_blocks(style, tmp_path):
+    typo, pal, grade = style
+    spec = CardSpec(
+        kind="comparison",
+        heading="signal comparison - processed change",
+        duration=1.0,
+        items=(
+            "REFERENCE - SHARP EDGE",
+            "PROCESSED - BLUR + COLOUR SHIFT",
+        ),
+    )
+    out = build_card(
+        spec,
+        tmp_path / "signal-comparison.mp4",
+        typo,
+        pal,
+        grade,
+        tmp_path / "signal-work",
+        width=640,
+        height=360,
+        fps=12,
+    )
+    frame = _rgb_frame(out, 0.5).astype(np.float64)
+    red_pixels = (
+        (frame[:, :, 0] > 80)
+        & (frame[:, :, 0] > frame[:, :, 1] * 1.20)
+        & (frame[:, :, 0] > frame[:, :, 2] * 1.20)
+    )
+    blue_pixels = (
+        (frame[:, :, 2] > 80)
+        & (frame[:, :, 2] > frame[:, :, 0] * 1.20)
+        & (frame[:, :, 2] > frame[:, :, 1] * 1.20)
+    )
+
+    assert red_pixels.mean() > 0.005
+    assert blue_pixels.mean() > 0.005
 
 
 def test_a_card_spans_its_requested_duration(style, tmp_path):

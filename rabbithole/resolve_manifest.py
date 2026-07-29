@@ -7,23 +7,38 @@ canonical timing, EDL, and provenance documents into a relocatable JSON plan.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
 import os
 import re
+import subprocess
 import tempfile
+import wave
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import urlparse
+
+from rabbithole.audiomix import bed_spans, sfx_events, silence_windows
+from rabbithole.resolve_audio import ResolveAudioStemError, load_current_audio_stems
+from rabbithole.sources.music import resolve_cue
+from rabbithole.sources.soundgen import (
+    BED_EDGE_TRIM_SECONDS,
+    CHANNELS as SOUND_CHANNELS,
+    SAMPLE_RATE as SOUND_SAMPLE_RATE,
+    Library,
+)
 
 
 SCHEMA_VERSION = "resolve-plan.v1"
-COMPILER_VERSION = "resolve-compiler.v3"
+COMPILER_VERSION = "resolve-compiler.v4"
 DEFAULT_FPS = 30
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
 DEFAULT_SAMPLE_RATE = 48_000
+_SOURCE_CAPTION_POLICY_VERSION = "source-caption.v1"
 
 _VIDEO_TRACKS = (
     ("V1", "base_footage"),
@@ -75,6 +90,15 @@ _EVIDENCE_TERMS = {
 }
 _V4_TERMS = {"film_grain", "grain", "texture", "vhs_overlay"}
 _GRADE_ELIGIBLE_SLOT_KINDS = {"archival"}
+_ATTRIBUTION_BURNED_PROVIDERS = {
+    "rabbithole-evidence-card",
+    "rabbithole-source-frame",
+    "rabbithole-source-image",
+}
+_PROJECT_AUTHORED_PROVIDERS = {
+    "rabbithole-cards",
+    "rabbithole-evidence-card",
+}
 _AUDIO_KIND_TRACKS = {
     "dialogue": "A1",
     "narration": "A1",
@@ -143,6 +167,59 @@ class ResolveManifestError(ValueError):
     """Raised when canonical compiler input is absent or malformed."""
 
 
+def _discover_sound_manifest(root: Path) -> Path | None:
+    """Return an explicitly configured or conventional project-local library.
+
+    Generated sound-library manifests store cue paths relative to their own
+    directory.  The manifest itself must remain inside the episode so every
+    compiled media path can be serialized relative to ``project_root`` and
+    restored unchanged on Windows or macOS.
+    """
+
+    default = root / "assets" / "soundlib" / "manifest.json"
+    brief_path = root / "brief.json"
+    configured: Any = None
+    if brief_path.is_file():
+        brief = _load_json(brief_path)
+        if isinstance(brief, Mapping):
+            sound_design = brief.get("sound_design")
+            if isinstance(sound_design, Mapping):
+                configured = sound_design.get("manifest_path")
+
+    if configured is None or configured == "":
+        return default if default.is_file() else None
+    if not isinstance(configured, str):
+        raise ResolveManifestError(
+            "brief.sound_design.manifest_path must be a project-relative string"
+        )
+
+    portable = _portable_string(configured)
+    if _looks_absolute_portable(portable):
+        raise ResolveManifestError(
+            "brief.sound_design.manifest_path must stay project-relative: "
+            f"{configured!r}"
+        )
+    parts = PurePosixPath(portable).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ResolveManifestError(
+            "brief.sound_design.manifest_path contains an escaping or ambiguous "
+            f"component: {configured!r}"
+        )
+    candidate = root.joinpath(*parts).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ResolveManifestError(
+            "brief.sound_design.manifest_path escapes the project root: "
+            f"{configured!r}"
+        ) from exc
+    if not candidate.is_file():
+        raise ResolveManifestError(
+            f"configured sound manifest does not exist: {candidate}"
+        )
+    return candidate
+
+
 def compile_resolve_plan(
     project_root: Path,
     *,
@@ -160,7 +237,8 @@ def compile_resolve_plan(
     * ``edit/edl.json``
     * ``provenance.json``
 
-    ``research/source-audio.json`` and ``highlights.json`` are optional.
+    ``research/source-audio.json``, ``highlights.json``, and a project-local
+    generated sound-library manifest are optional.
     ``overrides_path`` is an optional JSON object with the narrow override
     fields documented by ``schemas/resolve-overrides.v1.schema.json``.
     """
@@ -181,6 +259,18 @@ def compile_resolve_plan(
     }
     if not optional_paths["highlights"].is_file():
         optional_paths["highlights"] = root / "highlights.json"
+    sound_manifest_path = _discover_sound_manifest(root)
+    if sound_manifest_path is not None:
+        optional_paths["sound_manifest"] = sound_manifest_path
+    audio_stems_path: Path | None = None
+    if sound_manifest_path is not None:
+        try:
+            selected_stems = load_current_audio_stems(root, verify=True)
+        except ResolveAudioStemError as exc:
+            raise ResolveManifestError(str(exc)) from exc
+        if selected_stems is not None:
+            audio_stems_path, _ = selected_stems
+            optional_paths["audio_stems"] = audio_stems_path
     missing_inputs = [str(path) for path in paths.values() if not path.is_file()]
     if missing_inputs:
         joined = ", ".join(missing_inputs)
@@ -218,6 +308,10 @@ def compile_resolve_plan(
         loaded["edl"],
         loaded["provenance"],
         source_audio=loaded.get("source_audio"),
+        sound_manifest=loaded.get("sound_manifest"),
+        sound_manifest_path=sound_manifest_path,
+        audio_stems=loaded.get("audio_stems"),
+        audio_stems_path=audio_stems_path,
         highlights=loaded.get("highlights"),
         overrides=loaded["overrides"],
         sources=source_records,
@@ -314,6 +408,10 @@ def _compile_loaded(
     provenance_raw: Any,
     *,
     source_audio: Any,
+    sound_manifest: Any,
+    sound_manifest_path: Path | None,
+    audio_stems: Any,
+    audio_stems_path: Path | None,
     highlights: Any,
     overrides: Any,
     sources: Mapping[str, Mapping[str, str]],
@@ -328,10 +426,46 @@ def _compile_loaded(
     provenance = _normalize_provenance(provenance_raw, root, overrides_map)
     slot_metadata = _slot_metadata(timing_raw)
     audio = _compile_audio(source_audio, root, fps, timing["duration_frames"])
+    if audio_stems is not None and audio_stems_path is not None:
+        if any(item.get("track") == "A2" for item in audio):
+            raise ResolveManifestError(
+                "prepared Resolve sound stems cannot be combined with "
+                "research/source-audio.json yet: the approved FFmpeg mix also "
+                "ducks narration and music around each source bite. Remove the "
+                "source-audio bites or use the FFmpeg renderer until "
+                "source-aware Resolve stems are implemented."
+            )
+        stem_audio = _compile_mixed_sound_stems(
+            audio_stems,
+            audio_stems_path,
+            root,
+            fps,
+            timing["duration_frames"],
+        )
+        master_gain_db = stem_audio[0]["gain_db"] if stem_audio else 0.0
+        for item in audio:
+            if item.get("track") == "A1":
+                item["gain_db"] = round(
+                    float(item.get("gain_db", 0.0)) + master_gain_db,
+                    4,
+                )
+        audio.extend(stem_audio)
+    else:
+        audio.extend(
+            _compile_generated_sound_audio(
+                timing_raw,
+                sound_manifest,
+                sound_manifest_path,
+                root,
+                fps,
+                timing["duration_frames"],
+            )
+        )
     style_base = _resolve_style_contract()
 
     fingerprint_payload = {
         "compiler": COMPILER_VERSION,
+        "source_caption_policy": _SOURCE_CAPTION_POLICY_VERSION,
         "schema_version": SCHEMA_VERSION,
         "fps": fps,
         "width": width,
@@ -575,6 +709,9 @@ def _compile_loaded(
             )
 
     overlays, explicit_subtitles = _compile_overlays(edl["overlays"], fps)
+    overlays.extend(
+        _compile_source_caption_overlays(clips, provenance, overlays)
+    )
     for overlay in overlays:
         if "redact" in overlay["kind"]:
             _add_review(
@@ -695,6 +832,11 @@ def _compile_loaded(
             ),
         )
 
+    active_asset_ids = {
+        str(clip["asset_id"])
+        for clip in clips
+        if clip.get("asset_id") and clip.get("media_path")
+    }
     for asset in provenance:
         if asset["path_kind"] == "external-absolute":
             _add_review(
@@ -708,7 +850,11 @@ def _compile_loaded(
                 ),
                 asset_id=asset["asset_id"],
             )
-        if not asset["license"]:
+        if (
+            asset["asset_id"] in active_asset_ids
+            and not asset["license"]
+            and asset["provider"].lower() not in _PROJECT_AUTHORED_PROVIDERS
+        ):
             _add_review(
                 review_flags,
                 "license_missing",
@@ -1029,6 +1175,150 @@ def _normalize_edl(raw: Any, fps: int) -> dict[str, Any]:
     }
 
 
+def _catalogue_metadata(notes: Any) -> dict[str, str]:
+    """Recover the structured artifact fields carried in ledger notes.
+
+    Asset acquisition serializes the originating artifact as Python-literal
+    values separated by semicolons. Split only outside quotes so punctuation
+    in a title or rights note cannot corrupt the fields that follow it.
+    """
+
+    if not isinstance(notes, str):
+        return {}
+    marker = "catalogue metadata:"
+    marker_at = notes.find(marker)
+    if marker_at < 0:
+        return {}
+    payload = notes[marker_at + len(marker):].strip()
+    fields: list[str] = []
+    start = 0
+    quote_char = ""
+    escaped = False
+    for index, char in enumerate(payload):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote_char:
+            escaped = True
+            continue
+        if char in {"'", '"'}:
+            if not quote_char:
+                quote_char = char
+            elif quote_char == char:
+                quote_char = ""
+            continue
+        if char == ";" and not quote_char:
+            fields.append(payload[start:index].strip())
+            start = index + 1
+    fields.append(payload[start:].strip())
+
+    result: dict[str, str] = {}
+    for field in fields:
+        key, separator, raw_value = field.partition("=")
+        key = key.strip()
+        if not separator or not re.fullmatch(r"[a-z][a-z0-9_]*", key):
+            continue
+        raw_value = raw_value.strip()
+        try:
+            value = ast.literal_eval(raw_value)
+        except (SyntaxError, ValueError):
+            continue
+        if isinstance(value, str):
+            result[key] = value
+    return result
+
+
+def _clean_source_value(value: Any, *, max_length: int) -> str:
+    if isinstance(value, bool) or value is None:
+        return ""
+    if not isinstance(value, (str, int, float)):
+        return ""
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    if (
+        not text
+        or len(text) > max_length
+        or text.lower()
+        in {"n/a", "none", "not recorded", "null", "tbd", "undated", "unknown"}
+    ):
+        return ""
+    return text
+
+
+def _true_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return False
+
+
+def _source_metadata(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize attribution metadata without treating retrieval as publication."""
+
+    nested = item.get("source")
+    source = nested if isinstance(nested, Mapping) else {}
+    catalogue = _catalogue_metadata(item.get("notes"))
+
+    def first_value(
+        candidates: Sequence[Any], *, max_length: int
+    ) -> str:
+        for candidate in candidates:
+            value = _clean_source_value(candidate, max_length=max_length)
+            if value:
+                return value
+        return ""
+
+    title = first_value(
+        (
+            source.get("attribution"),
+            source.get("title"),
+            item.get("source_attribution"),
+            item.get("source_title"),
+            item.get("title"),
+            catalogue.get("source_attribution"),
+            catalogue.get("title"),
+        ),
+        max_length=180,
+    )
+    # Intentionally omit retrieved_at. It is acquisition audit metadata, never
+    # a publication/upload date.
+    date = first_value(
+        (
+            source.get("date_label"),
+            source.get("date"),
+            source.get("publication_date"),
+            item.get("source_date_label"),
+            item.get("source_date"),
+            item.get("publication_date"),
+            item.get("date"),
+            catalogue.get("source_date_label"),
+            catalogue.get("date"),
+        ),
+        max_length=80,
+    )
+    role = first_value(
+        (
+            source.get("role"),
+            item.get("source_role"),
+            catalogue.get("source_role"),
+        ),
+        max_length=80,
+    )
+    provider = _clean_source_value(item.get("provider"), max_length=120).lower()
+    burned = (
+        provider in _ATTRIBUTION_BURNED_PROVIDERS
+        or _true_flag(source.get("attribution_burned"))
+        or _true_flag(item.get("source_attribution_burned"))
+        or _true_flag(item.get("attribution_burned"))
+    )
+    return {
+        "title": title,
+        "date": date,
+        "role": role,
+        "attribution_burned": burned,
+    }
+
+
 def _normalize_provenance(
     raw: Any, root: Path, overrides: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
@@ -1049,6 +1339,7 @@ def _normalize_provenance(
         portable_path, path_kind = _path_for_plan(local_path, root)
         resolved_path = _resolve_media_path(local_path, root)
         exists = bool(resolved_path and resolved_path.is_file())
+        source_metadata = _source_metadata(item)
         used = item.get("used_in_slots")
         if isinstance(used, str):
             used_in_slots = [used]
@@ -1068,6 +1359,12 @@ def _normalize_provenance(
                 "original_url": _string_or_empty(item.get("original_url")),
                 "license": _string_or_empty(item.get("license")),
                 "retrieved_at": _string_or_empty(item.get("retrieved_at")),
+                "source_title": source_metadata["title"],
+                "source_date": source_metadata["date"],
+                "source_role": source_metadata["role"],
+                "source_attribution_burned": source_metadata[
+                    "attribution_burned"
+                ],
                 "local_path": portable_path or None,
                 "path_kind": path_kind,
                 "media_type": _media_type(portable_path),
@@ -1333,6 +1630,172 @@ def _compile_overlays(
     return overlays, subtitles
 
 
+def _source_caption_text(asset: Mapping[str, Any]) -> str:
+    if (
+        asset.get("media_type") != "video"
+        or not _string_or_empty(asset.get("original_url")).strip()
+        or bool(asset.get("source_attribution_burned"))
+    ):
+        return ""
+
+    title = _clean_source_value(asset.get("source_title"), max_length=180)
+    if not title:
+        provider = _clean_source_value(asset.get("provider"), max_length=120)
+        if provider.lower() not in {"", "local", "unknown"}:
+            title = provider
+        else:
+            title = urlparse(
+                _string_or_empty(asset.get("original_url"))
+            ).netloc
+    if not title:
+        return ""
+    date = _clean_source_value(asset.get("source_date"), max_length=80)
+    parts = ("SOURCE", title, date)
+    return " · ".join(part for part in parts if part)
+
+
+def _uncovered_caption_spans(
+    start_frame: int,
+    end_frame: int,
+    authored: Sequence[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    cursor = start_frame
+    uncovered: list[tuple[int, int]] = []
+    for covered_start, covered_end in authored:
+        if covered_end <= cursor or covered_start >= end_frame:
+            continue
+        if covered_start > cursor:
+            uncovered.append((cursor, min(covered_start, end_frame)))
+        cursor = max(cursor, covered_end)
+        if cursor >= end_frame:
+            break
+    if cursor < end_frame:
+        uncovered.append((cursor, end_frame))
+    return [(start, end) for start, end in uncovered if end > start]
+
+
+def _compile_source_caption_overlays(
+    clips: Sequence[Mapping[str, Any]],
+    provenance: Sequence[Mapping[str, Any]],
+    authored_overlays: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build one editable V3 attribution per contiguous direct-source span."""
+
+    assets = {str(asset["asset_id"]): asset for asset in provenance}
+    candidates: list[dict[str, Any]] = []
+    for clip in clips:
+        asset_id = _string_or_empty(clip.get("asset_id"))
+        asset = assets.get(asset_id)
+        if asset is None:
+            continue
+        text = _source_caption_text(asset)
+        if not text:
+            continue
+        candidates.append(
+            {
+                "asset_id": asset_id,
+                "start_frame": int(clip["start_frame"]),
+                "end_frame": int(clip["end_frame"]),
+                "source_start_frame": int(clip.get("source_start_frame", 0)),
+                "source_end_frame": int(clip.get("source_end_frame", 0)),
+                "text": text,
+                "source_title": asset.get("source_title") or "",
+                "source_date": asset.get("source_date") or "",
+                "clip_ids": [str(clip["id"])],
+                "slot_ids": [str(clip.get("slot_id") or "")],
+            }
+        )
+    candidates.sort(
+        key=lambda item: (
+            item["asset_id"],
+            item["start_frame"],
+            item["end_frame"],
+            item["source_start_frame"],
+        )
+    )
+
+    runs: list[dict[str, Any]] = []
+    for candidate in candidates:
+        previous = runs[-1] if runs else None
+        if (
+            previous is not None
+            and previous["asset_id"] == candidate["asset_id"]
+            and previous["text"] == candidate["text"]
+            and previous["end_frame"] == candidate["start_frame"]
+            and previous["source_end_frame"]
+            == candidate["source_start_frame"]
+        ):
+            previous["end_frame"] = candidate["end_frame"]
+            previous["source_end_frame"] = candidate["source_end_frame"]
+            previous["clip_ids"].extend(candidate["clip_ids"])
+            previous["slot_ids"].extend(candidate["slot_ids"])
+        else:
+            runs.append(dict(candidate))
+
+    authored = sorted(
+        (
+            (int(overlay["start_frame"]), int(overlay["end_frame"]))
+            for overlay in authored_overlays
+            if _slug(_string_or_empty(overlay.get("kind")))
+            == "source_caption"
+            and _string_or_empty(overlay.get("text")).strip()
+        ),
+        key=lambda span: (span[0], span[1]),
+    )
+
+    overlays: list[dict[str, Any]] = []
+    for run in runs:
+        for start_frame, end_frame in _uncovered_caption_spans(
+            run["start_frame"], run["end_frame"], authored
+        ):
+            source_start_frame = (
+                run["source_start_frame"]
+                + start_frame
+                - run["start_frame"]
+            )
+            source_end_frame = source_start_frame + end_frame - start_frame
+            detail = {
+                "position": "lower-left",
+                "source": "provenance",
+                "synthesized": True,
+                "asset_id": run["asset_id"],
+                "source_title": run["source_title"],
+                "source_date": run["source_date"],
+                "source_start_frame": source_start_frame,
+                "source_end_frame": source_end_frame,
+                "clip_ids": list(run["clip_ids"]),
+                "slot_ids": [
+                    slot_id for slot_id in run["slot_ids"] if slot_id
+                ],
+            }
+            payload = {
+                "kind": "source_caption",
+                "track": "V3",
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "duration_frames": end_frame - start_frame,
+                "text": run["text"],
+                "detail": detail,
+                "editable": True,
+                "generated": True,
+                "asset_id": run["asset_id"],
+            }
+            payload["id"] = _stable_id(
+                "overlay",
+                {
+                    "policy": _SOURCE_CAPTION_POLICY_VERSION,
+                    "asset_id": run["asset_id"],
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "source_start_frame": source_start_frame,
+                    "source_end_frame": source_end_frame,
+                    "text": run["text"],
+                },
+            )
+            overlays.append(payload)
+    return overlays
+
+
 def _subtitles_from_words(
     words: Sequence[Mapping[str, Any]], fps: int
 ) -> list[dict[str, Any]]:
@@ -1386,6 +1849,442 @@ def _join_caption_words(words: Sequence[str]) -> str:
     return text.strip()
 
 
+def _sound_manifest_entries(raw: Any) -> Mapping[str, Any]:
+    manifest = _require_mapping(raw, "sound_manifest")
+    entries = manifest.get("entries")
+    if not isinstance(entries, Mapping):
+        raise ResolveManifestError("sound_manifest.entries must be an object")
+    return entries
+
+
+def _sound_duration(entry: Mapping[str, Any], label: str) -> float:
+    duration = _finite_number(entry.get("duration_seconds"), f"{label}.duration_seconds")
+    if duration <= 0:
+        raise ResolveManifestError(f"{label}.duration_seconds must be positive")
+    return duration
+
+
+def _project_local_sound_path(
+    raw_path: Any,
+    *,
+    manifest_root: Path,
+    project_root: Path,
+    label: str,
+) -> tuple[Path, str, str]:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ResolveManifestError(f"{label}.path must be a non-empty string")
+    portable = _portable_string(raw_path.strip())
+    if _looks_absolute_portable(portable):
+        raise ResolveManifestError(
+            f"{label}.path must be relative to the sound manifest: {raw_path!r}"
+        )
+    parts = PurePosixPath(portable).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ResolveManifestError(
+            f"{label}.path contains an escaping or ambiguous component: {raw_path!r}"
+        )
+    resolved = manifest_root.joinpath(*parts).resolve()
+    try:
+        resolved.relative_to(project_root)
+    except ValueError as exc:
+        raise ResolveManifestError(
+            f"{label}.path escapes the project root: {raw_path!r}"
+        ) from exc
+    plan_path, path_kind = _path_for_plan(resolved, project_root)
+    if path_kind != "project-relative":
+        raise ResolveManifestError(
+            f"{label}.path is not portable: {raw_path!r}"
+        )
+    return resolved, plan_path, path_kind
+
+
+def _playable_bed_seconds(generated_seconds: float) -> float:
+    """Mirror ``soundgen.trim_edges`` without probing media during compile."""
+
+    trim = max(0.0, min(BED_EDGE_TRIM_SECONDS, generated_seconds / 4.0))
+    return generated_seconds - (2.0 * trim)
+
+
+def _audible_frame_ranges(
+    start_frame: int,
+    end_frame: int,
+    silence_ranges: Sequence[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    cursor = start_frame
+    audible: list[tuple[int, int]] = []
+    for silence_start, silence_end in silence_ranges:
+        if silence_end <= cursor:
+            continue
+        if silence_start >= end_frame:
+            break
+        if silence_start > cursor:
+            audible.append((cursor, min(silence_start, end_frame)))
+        cursor = max(cursor, silence_end)
+        if cursor >= end_frame:
+            break
+    if cursor < end_frame:
+        audible.append((cursor, end_frame))
+    return [(start, end) for start, end in audible if end > start]
+
+
+def _compile_mixed_sound_stems(
+    raw_manifest: Any,
+    manifest_path: Path,
+    root: Path,
+    fps: int,
+    duration_frames: int,
+) -> list[dict[str, Any]]:
+    """Compile the render-faithful A3/A4 stems selected during prepare.
+
+    The stem builder has already baked the approved constant-power bed joins,
+    style-pack levels, cue placement, and silence-drop ramps.  Resolve should
+    therefore import each stem once rather than reconstructing those decisions
+    from raw generated clips.  ``master_gain_db`` is the uniform attenuation
+    the approved FFmpeg mix applies after summing all three layers; the caller
+    applies the same value to narration and these two stems.
+    """
+
+    manifest = _require_mapping(raw_manifest, "audio_stems")
+    if manifest.get("schema_version") != "resolve-audio-stems.v1":
+        raise ResolveManifestError(
+            "audio_stems.schema_version must be 'resolve-audio-stems.v1'"
+        )
+    entries = manifest.get("entries")
+    if not isinstance(entries, Mapping):
+        raise ResolveManifestError("audio_stems.entries must be an object")
+    fingerprint = manifest.get("fingerprint")
+    if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+        raise ResolveManifestError(
+            "audio_stems.fingerprint must be a full SHA-256 string"
+        )
+    declared_seconds = _finite_number(
+        manifest.get("duration_seconds"),
+        "audio_stems.duration_seconds",
+    )
+    declared_frames = max(1, _seconds_to_frame(declared_seconds, fps))
+    if abs(declared_frames - duration_frames) > 2:
+        raise ResolveManifestError(
+            "audio stems do not match the narration duration; run "
+            "`rabbithole resolve prepare` to build a fresh immutable stem set"
+        )
+    mix_semantics = _require_mapping(
+        manifest.get("mix_semantics"),
+        "audio_stems.mix_semantics",
+    )
+    master_gain_db = _finite_number(
+        mix_semantics.get("master_gain_db"),
+        "audio_stems.mix_semantics.master_gain_db",
+    )
+    if not -80.0 <= master_gain_db <= 0.0:
+        raise ResolveManifestError(
+            "audio_stems.mix_semantics.master_gain_db must be between "
+            "-80 and 0 dB"
+        )
+
+    compiled: list[dict[str, Any]] = []
+    for sequence, (name, expected_track) in enumerate(
+        (("music", "A3"), ("sfx", "A4"))
+    ):
+        entry = entries.get(name)
+        if not isinstance(entry, Mapping):
+            raise ResolveManifestError(
+                f"audio_stems.entries[{name!r}] must be an object"
+            )
+        label = f"audio_stems.entries[{name!r}]"
+        track = entry.get("track")
+        if track != expected_track:
+            raise ResolveManifestError(
+                f"{label}.track must be {expected_track!r}, got {track!r}"
+            )
+        source, media_path, path_kind = _project_local_sound_path(
+            entry.get("path"),
+            manifest_root=Path(manifest_path).parent.resolve(),
+            project_root=root,
+            label=label,
+        )
+        actual_sha = _sha256_file(source) if source.is_file() else None
+        expected_sha = entry.get("sha256")
+        if actual_sha is not None and expected_sha != actual_sha:
+            raise ResolveManifestError(
+                f"{label} checksum changed after audio-stem validation: {source}"
+            )
+        source_rate = entry.get("sample_rate")
+        if isinstance(source_rate, bool) or not isinstance(source_rate, int):
+            raise ResolveManifestError(f"{label}.sample_rate must be an integer")
+        channels = entry.get("channels")
+        if isinstance(channels, bool) or not isinstance(channels, int):
+            raise ResolveManifestError(f"{label}.channels must be an integer")
+
+        asset_id = f"sound-stem-{name}"
+        payload = {
+            "asset_id": asset_id,
+            "track": expected_track,
+            "kind": name,
+            "start_frame": 0,
+            "end_frame": duration_frames,
+            "duration_frames": duration_frames,
+            "source_start_frame": 0,
+            "media_path": media_path,
+            "path_kind": path_kind,
+            "exists": source.is_file(),
+            "sha256": actual_sha,
+            "channels": channels,
+            "source_sample_rate": source_rate,
+            "gain_db": round(master_gain_db, 4),
+            "duck_vo_db": 0.0,
+            "loop": False,
+            "mix_baked": True,
+            "stem_fingerprint": fingerprint,
+        }
+        payload["id"] = _stable_id(
+            "audio",
+            {
+                "sequence": sequence,
+                "asset_id": asset_id,
+                "track": expected_track,
+                "start_frame": 0,
+                "end_frame": duration_frames,
+                "stem_fingerprint": fingerprint,
+            },
+        )
+        compiled.append(payload)
+    return compiled
+
+
+def _compile_generated_sound_audio(
+    timing_raw: Any,
+    sound_manifest: Any,
+    sound_manifest_path: Path | None,
+    root: Path,
+    fps: int,
+    duration_frames: int,
+) -> list[dict[str, Any]]:
+    """Place generated MUSIC/SFX cues as editable A3/A4 source clips.
+
+    A script without generated sound markers can remain A1/A2-only. If MUSIC
+    or SFX was authored, however, a missing manifest is a blocking preparation
+    error rather than a silent omission. Once a manifest is present, every cue
+    must have a generated entry; missing playable files remain in the plan so
+    preflight can surface them as blocking media errors.
+    """
+
+    if sound_manifest is None or sound_manifest_path is None:
+        authored_cues = [
+            marker
+            for marker in (
+                timing_raw.get("markers", [])
+                if isinstance(timing_raw, Mapping)
+                else []
+            )
+            if isinstance(marker, Mapping)
+            and marker.get("kind") in {"MUSIC", "SFX"}
+        ]
+        if authored_cues:
+            kinds = sorted({str(marker.get("kind")) for marker in authored_cues})
+            raise ResolveManifestError(
+                "narration timing contains authored "
+                f"{'/'.join(kinds)} cues but no project-local generated sound "
+                "manifest. Run the approved sound-generation step before "
+                "`rabbithole resolve prepare`; Resolve will not silently drop "
+                "authored audio."
+            )
+        return []
+
+    entries = _sound_manifest_entries(sound_manifest)
+    manifest_root = sound_manifest_path.parent.resolve()
+    library = Library(manifest_root)
+    checksum_cache: dict[Path, str] = {}
+
+    def checksum(path: Path) -> str | None:
+        if not path.is_file():
+            return None
+        if path not in checksum_cache:
+            checksum_cache[path] = _sha256_file(path)
+        return checksum_cache[path]
+
+    try:
+        spans = bed_spans(timing_raw)
+        events = sfx_events(timing_raw)
+        windows = silence_windows(timing_raw)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise ResolveManifestError(f"cannot place generated sound markers: {exc}") from exc
+
+    silence_ranges = sorted(
+        (
+            max(0, _seconds_to_frame(window.start, fps)),
+            min(duration_frames, _seconds_to_frame(window.end, fps)),
+        )
+        for window in windows
+        if window.end > window.start
+    )
+
+    audio: list[dict[str, Any]] = []
+    sequence = 0
+    for span_index, span in enumerate(spans):
+        bed_kind = resolve_cue(str(span.cue))
+        declared_variants: list[tuple[int, Mapping[str, Any]]] = []
+        prefix = f"beds/{bed_kind}/"
+        for key, raw_entry in entries.items():
+            if not isinstance(key, str) or not key.startswith(prefix):
+                continue
+            suffix = key[len(prefix) :]
+            if not suffix.isdigit():
+                continue
+            if not isinstance(raw_entry, Mapping):
+                raise ResolveManifestError(
+                    f"sound_manifest.entries[{key!r}] must be an object"
+                )
+            declared_variants.append((int(suffix), raw_entry))
+        declared_variants.sort(key=lambda item: item[0])
+        if not declared_variants:
+            raise ResolveManifestError(
+                f"sound manifest has no generated variants for "
+                f"[MUSIC:{span.cue}] (bed kind {bed_kind!r})"
+            )
+
+        variants: list[dict[str, Any]] = []
+        for variant, entry in declared_variants:
+            label = f"sound_manifest.entries[{f'beds/{bed_kind}/{variant}'!r}]"
+            playable_seconds = _playable_bed_seconds(_sound_duration(entry, label))
+            if playable_seconds <= 0:
+                raise ResolveManifestError(
+                    f"{label} produces no playable audio after edge trimming"
+                )
+            playable = library.bed_path(bed_kind, variant).resolve()
+            try:
+                playable.relative_to(root)
+            except ValueError as exc:
+                raise ResolveManifestError(
+                    f"{label} resolves outside the project: {playable}"
+                ) from exc
+            media_path, path_kind = _path_for_plan(playable, root)
+            if path_kind != "project-relative":
+                raise ResolveManifestError(
+                    f"{label} resolves to a non-portable path: {playable}"
+                )
+            variants.append(
+                {
+                    "variant": variant,
+                    "path": playable,
+                    "media_path": media_path,
+                    "path_kind": path_kind,
+                    "duration_frames": max(
+                        1, _seconds_to_frame(playable_seconds, fps)
+                    ),
+                }
+            )
+
+        span_start = max(0, _seconds_to_frame(span.start, fps))
+        span_end = min(duration_frames, _seconds_to_frame(span.end, fps))
+        variant_cursor = 0
+        for audible_start, audible_end in _audible_frame_ranges(
+            span_start, span_end, silence_ranges
+        ):
+            cursor = audible_start
+            while cursor < audible_end:
+                variant_data = variants[variant_cursor % len(variants)]
+                clip_end = min(
+                    audible_end,
+                    cursor + int(variant_data["duration_frames"]),
+                )
+                playable = Path(variant_data["path"])
+                payload = {
+                    "asset_id": (
+                        f"sound-bed-{_slug(bed_kind)}-"
+                        f"{int(variant_data['variant']):02d}"
+                    ),
+                    "track": "A3",
+                    "kind": "music",
+                    "cue": str(span.cue),
+                    "start_frame": cursor,
+                    "end_frame": clip_end,
+                    "duration_frames": clip_end - cursor,
+                    "source_start_frame": 0,
+                    "media_path": str(variant_data["media_path"]),
+                    "path_kind": str(variant_data["path_kind"]),
+                    "exists": playable.is_file(),
+                    "sha256": checksum(playable),
+                    "channels": SOUND_CHANNELS,
+                    "source_sample_rate": SOUND_SAMPLE_RATE,
+                    "gain_db": 0.0,
+                    "duck_vo_db": -15.0,
+                    "loop": True,
+                    "span_index": span_index,
+                    "variant": int(variant_data["variant"]),
+                }
+                payload["id"] = _stable_id(
+                    "audio",
+                    {
+                        "sequence": sequence,
+                        "asset_id": payload["asset_id"],
+                        "track": payload["track"],
+                        "start_frame": cursor,
+                        "end_frame": clip_end,
+                    },
+                )
+                audio.append(payload)
+                sequence += 1
+                variant_cursor += 1
+                cursor = clip_end
+
+    for event_index, event in enumerate(events):
+        cue = str(event.name)
+        key = f"sfx/{cue}"
+        raw_entry = entries.get(key)
+        if not isinstance(raw_entry, Mapping):
+            raise ResolveManifestError(
+                f"sound manifest has no generated entry for [SFX:{cue}]"
+            )
+        label = f"sound_manifest.entries[{key!r}]"
+        source, media_path, path_kind = _project_local_sound_path(
+            raw_entry.get("path"),
+            manifest_root=manifest_root,
+            project_root=root,
+            label=label,
+        )
+        start_frame = max(0, _seconds_to_frame(event.seconds, fps))
+        if start_frame >= duration_frames:
+            continue
+        source_duration = max(
+            1, _seconds_to_frame(_sound_duration(raw_entry, label), fps)
+        )
+        end_frame = min(duration_frames, start_frame + source_duration)
+        payload = {
+            "asset_id": f"sound-sfx-{_slug(cue)}",
+            "track": "A4",
+            "kind": "sfx",
+            "cue": cue,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "duration_frames": end_frame - start_frame,
+            "source_start_frame": 0,
+            "media_path": media_path,
+            "path_kind": path_kind,
+            "exists": source.is_file(),
+            "sha256": checksum(source),
+            "channels": SOUND_CHANNELS,
+            "source_sample_rate": SOUND_SAMPLE_RATE,
+            "gain_db": 0.0,
+            "duck_vo_db": 0.0,
+            "loop": False,
+            "event_index": event_index,
+        }
+        payload["id"] = _stable_id(
+            "audio",
+            {
+                "event_index": event_index,
+                "asset_id": payload["asset_id"],
+                "track": payload["track"],
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+            },
+        )
+        audio.append(payload)
+
+    audio.sort(key=lambda item: (item["start_frame"], item["track"], item["id"]))
+    return audio
+
+
 def _compile_audio(
     raw: Any, root: Path, fps: int, default_duration_frames: int
 ) -> list[dict[str, Any]]:
@@ -1393,6 +2292,9 @@ def _compile_audio(
     narration_path = root / "narration" / "vo.wav"
     narration_portable, narration_path_kind = _path_for_plan(narration_path, root)
     narration_exists = narration_path.is_file()
+    narration_metadata = (
+        _probe_audio_metadata(narration_path) if narration_exists else None
+    )
     narration_payload = {
         "asset_id": "narration-vo",
         "track": "A1",
@@ -1405,8 +2307,14 @@ def _compile_audio(
         "path_kind": narration_path_kind,
         "exists": narration_exists,
         "sha256": _sha256_file(narration_path) if narration_exists else None,
-        "channels": None,
-        "source_sample_rate": None,
+        "channels": (
+            narration_metadata["channels"] if narration_metadata is not None else None
+        ),
+        "source_sample_rate": (
+            narration_metadata["sample_rate"]
+            if narration_metadata is not None
+            else None
+        ),
         "gain_db": 0.0,
         "duck_vo_db": 0.0,
     }
@@ -1450,6 +2358,11 @@ def _compile_audio(
         local_path, path_kind = _path_for_plan(_string_or_empty(raw_path), root)
         resolved = _resolve_media_path(_string_or_empty(raw_path), root)
         exists = bool(resolved and resolved.is_file())
+        source_metadata = (
+            _probe_audio_metadata(resolved)
+            if exists and resolved is not None
+            else None
+        )
         start_seconds = _first_number(
             item,
             ("timeline_start", "start_seconds", "start"),
@@ -1506,8 +2419,16 @@ def _compile_audio(
             "path_kind": path_kind,
             "exists": exists,
             "sha256": _sha256_file(resolved) if exists and resolved else None,
-            "channels": item.get("channels"),
-            "source_sample_rate": item.get("sample_rate"),
+            "channels": (
+                source_metadata["channels"]
+                if source_metadata is not None
+                else item.get("channels")
+            ),
+            "source_sample_rate": (
+                source_metadata["sample_rate"]
+                if source_metadata is not None
+                else item.get("sample_rate")
+            ),
             "gain_db": _finite_number(
                 item.get("gain_db", 0), f"source_audio[{position}].gain_db"
             ),
@@ -1528,6 +2449,63 @@ def _compile_audio(
         )
         result.append(payload)
     return result
+
+
+def _probe_audio_metadata(path: Path) -> dict[str, int] | None:
+    """Return source channel/rate metadata without changing the media.
+
+    Narration is normally PCM WAV, so use the standard-library parser first.
+    Source bites can be embedded in video containers; those fall back to
+    ffprobe, which is already a required pipeline dependency.  A malformed
+    legacy fixture or unavailable probe returns ``None`` so compilation can
+    still report the existing media diagnostics instead of crashing here.
+    """
+
+    path = Path(path)
+    if path.suffix.lower() in {".wav", ".wave"}:
+        try:
+            with wave.open(str(path), "rb") as handle:
+                channels = int(handle.getnchannels())
+                sample_rate = int(handle.getframerate())
+            if channels > 0 and sample_rate > 0:
+                return {"channels": channels, "sample_rate": sample_rate}
+        except (EOFError, OSError, wave.Error):
+            return None
+        return None
+
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=channels,sample_rate",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+        stream = payload["streams"][0]
+        channels = int(stream["channels"])
+        sample_rate = int(stream["sample_rate"])
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if channels <= 0 or sample_rate <= 0:
+        return None
+    return {"channels": channels, "sample_rate": sample_rate}
 
 
 def _compile_highlights(raw: Any, fps: int) -> list[dict[str, Any]]:

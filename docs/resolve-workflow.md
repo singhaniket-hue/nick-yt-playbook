@@ -74,7 +74,11 @@ projects/<slug>/
 
 Resolve-specific generated state is isolated under `projects/<slug>/resolve/`.
 It is never written into `assets/`, `narration/`, `edit/`, or the append-only
-provenance ledger.
+provenance audit trail. The one deliberate provenance exception is the
+recoverable `assets --refresh --slot ...` workflow: it retains old media in
+project-local quarantine and converts its record into an unclaimed retirement
+entry instead of deleting history. See
+[Asset acquisition and visual QA](./asset-acquisition-workflow.md).
 
 ## DaVinci Resolve Free
 
@@ -161,10 +165,12 @@ The build contains:
 - V4 texture and finishing overlays
 - A1 narration
 - A2 original-source bites
-- A3 music
-- A4 sound effects
+- A3 a full-length music stem with the approved constant-power
+  bed joins, level, and silence-drop ramps already baked
+- A4 a full-length SFX stem with cue timing, category levels, and
+  silence-drop ramps already baked
 - A5 room tone and utility audio
-- editable subtitle intent
+- editable subtitle and source-caption intent
 - provenance and review markers with machine-readable custom data
 
 FCPXML carries deterministic cuts, simple framing transforms, supported
@@ -174,6 +180,29 @@ below it. The Resolve scripting layer imports that timeline, names and validates
 the tracks, adds metadata markers, applies a checksum-matched archival grade
 when available, records manual Fusion/template intent, and configures the render
 job.
+
+`resolve prepare` creates A3/A4 under
+`resolve/audio-stems/<content-sha256>/`. The directory is immutable: changing
+timing, a generated sound, the sound manifest, or the SFX style map creates a
+new stem set instead of overwriting audio that a running render may have open.
+The raw project-local sound library is retained for editors who want to replace
+individual cues. Resolve imports the stems by default because FCPXML cannot
+faithfully express RabbitHole's constant-power tiling and per-cue automation.
+The stem manifest also records the non-positive peak-ceiling gain calculated
+from the summed A1/A3/A4 mix. FCPXML applies that same editable volume
+adjustment to all three tracks, matching the approved FFmpeg master without
+flattening the handoff. Authored source-audio bites are rejected by Resolve
+stem preparation for now because their A1/A3 duck automation is not yet baked;
+those projects remain supported by the FFmpeg renderer.
+
+For direct-source media carrying an original URL, the compiler also derives an
+editable lower-left V3 source caption from provenance. It uses the authored
+source title (or provider/host fallback) and source/publication date; retrieval
+time is never presented as a publication date. Continuous cuts from the same
+source span are coalesced. An authored non-empty `source_caption` overlay
+suppresses generation over its covered span, and media with attribution already
+burned into a citation card, source frame, or source image receives no duplicate
+caption. FCPXML represents these as editable Basic Title items.
 
 Generated timelines are immutable. Re-running an identical build validates and
 reuses its `AUTO_BUILD_<hash>` timeline. It never rewrites or deletes a timeline.
@@ -263,7 +292,16 @@ The bundle preserves the project-relative tree and verifies every file with
 SHA-256. It refuses absolute/escaping media paths, symlinks, missing referenced
 media, case-colliding names, unsafe ZIP members, and overwrites. It excludes
 `.env` files, credentials, caches, prior renders/handoffs, stale locks/queues,
-and generated Resolve builds.
+and generated Resolve builds. The content-addressed A3/A4 stems are media
+inputs, not queue/build state, so the set selected by `current.json` is
+included and checksum-verified; historical stem directories are omitted.
+Bundle creation and verification also follow `audio-stems/current.json` into
+the selected immutable manifest, verify its fingerprint, both exact stem files,
+and every project-local source-input checksum. Repository implementation/style
+hashes remain part of the contract but are not copied into the episode ZIP;
+clone the same Git revision on the receiving host, then run `prepare`.
+Recoverably quarantined media remains project-relative and travels with its
+retired provenance record.
 
 On the receiving Windows or macOS host, recreate `.env` locally and run
 `resolve doctor`, `resolve preflight`, and `resolve prepare` again. Recompiling
@@ -318,24 +356,35 @@ The status command reports:
 
 ```text
 queued -> running -> succeeded
-                  \-> failed
+   |        |      \-> failed
+   |        \-> rendering -> succeeded
+   |                       \-> failed
+   \-> superseded (older queued build only)
 ```
 
-Free-mode jobs may additionally report `awaiting_in_app_runner`. A succeeded job
-is not implicitly rerun. A failed job retains its error, attempt count, and
-timestamps for diagnosis. Queue files from an older integrity schema are counted
-as `legacy` but never executed; prepare and enqueue a fresh job to replace one.
+An asynchronous render stays in `rendering` until that exact Resolve render job
+positively reports `Complete`; an idle Resolve session alone is not treated as
+success. Free-mode jobs may additionally report `awaiting_in_app_runner`. A
+succeeded job is not implicitly rerun. A failed job retains its error, attempt
+count, and timestamps for diagnosis. Queue files from an older integrity schema
+are counted as `legacy` but never executed; prepare and enqueue a fresh job to
+replace one. Enqueuing a new build supersedes only older build jobs that are
+still queued; it never changes running/rendering jobs or non-build work.
 
 ## Human review gates
 
 Automation deliberately stops short of editorial judgment. Before final delivery,
 review:
 
+- graphics and evidence contact sheets, including every red missing/unreadable
+  card
 - evidence accuracy and source context
 - redactions, privacy, defamation, and rights/clearance flags
 - deepest-point timing and chapter rhythm
 - original-source audio intelligibility
 - subtitle accuracy and line breaks
+- editable source-caption text, publication date, placement, duration, and
+  duplicate suppression
 - grade consistency across mixed sources
 - the restored handoff on a disposable project
 

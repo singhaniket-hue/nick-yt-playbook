@@ -8,11 +8,13 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
+import stat
 import tempfile
 from typing import Any
+import unicodedata
 from uuid import uuid4
 import zipfile
 
@@ -35,6 +37,48 @@ CHECKSUM_FILENAME = "checksums.sha256"
 MANIFEST_FILENAME = "manifest.json"
 README_FILENAME = "README.txt"
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_WINDOWS_FORBIDDEN_RE = re.compile(r'[<>:"\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+)
+_ZIP_STORED_SUFFIXES = frozenset(
+    {
+        ".3gp",
+        ".7z",
+        ".aac",
+        ".avif",
+        ".bz2",
+        ".dra",
+        ".drp",
+        ".flac",
+        ".gif",
+        ".gz",
+        ".heic",
+        ".jpeg",
+        ".jpg",
+        ".m4a",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp3",
+        ".mp4",
+        ".ogg",
+        ".png",
+        ".rar",
+        ".webm",
+        ".webp",
+        ".xz",
+        ".zip",
+    }
+)
+_COPY_BUFFER_BYTES = 1024 * 1024
 
 
 class ResolveHandoffError(RuntimeError):
@@ -74,6 +118,91 @@ def _canonical(path: os.PathLike[str] | str) -> Path:
 def _safe_name(value: str, *, fallback: str) -> str:
     cleaned = _SAFE_NAME_RE.sub("_", value).strip("._-")
     return (cleaned or fallback)[:96]
+
+
+def _validate_portable_relative(value: str, *, label: str) -> str:
+    """Validate a relative name on Windows and case-insensitive macOS volumes."""
+
+    if not value or value != value.strip():
+        raise HandoffValidationError(
+            f"{label} must be a non-empty relative path without edge whitespace"
+        )
+    if "\\" in value:
+        raise HandoffValidationError(
+            f"{label} uses a Windows-only separator; use '/': {value!r}"
+        )
+    windows = PureWindowsPath(value)
+    posix = PurePosixPath(value)
+    if windows.drive or windows.is_absolute() or posix.is_absolute():
+        raise HandoffValidationError(
+            f"{label} must not be absolute or drive-qualified: {value!r}"
+        )
+    if value.startswith("~"):
+        raise HandoffValidationError(
+            f"{label} must not be home-relative: {value!r}"
+        )
+    raw_parts = value.split("/")
+    if (
+        any(part in {"", ".", ".."} for part in raw_parts)
+        or posix.as_posix() != value
+    ):
+        raise HandoffValidationError(
+            f"{label} contains an escaping or ambiguous component: {value!r}"
+        )
+    if len(value) > 240:
+        raise HandoffValidationError(
+            f"{label} exceeds the portable 240-character path limit: {value!r}"
+        )
+    for part in posix.parts:
+        if unicodedata.normalize("NFC", part) != part:
+            raise HandoffValidationError(
+                f"{label} must use NFC-normalized names: {value!r}"
+            )
+        if len(part.encode("utf-8")) > 255:
+            raise HandoffValidationError(
+                f"{label} has a component longer than 255 bytes: {value!r}"
+            )
+        if _WINDOWS_FORBIDDEN_RE.search(part) or part.endswith((" ", ".")):
+            raise HandoffValidationError(
+                f"{label} is not valid on Windows: {value!r}"
+            )
+        if part.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
+            raise HandoffValidationError(
+                f"{label} uses a Windows-reserved name: {value!r}"
+            )
+    return posix.as_posix()
+
+
+def _portable_key(value: str) -> str:
+    return "/".join(
+        unicodedata.normalize("NFC", part).casefold()
+        for part in PurePosixPath(value).parts
+    )
+
+
+def _validate_portable_tree(root: Path) -> None:
+    """Reject links, non-portable names, and cross-platform name collisions."""
+
+    portable_paths: dict[str, str] = {}
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix().casefold()):
+        if path.is_symlink() or (
+            callable(getattr(path, "is_junction", None)) and path.is_junction()
+        ):
+            raise HandoffValidationError(
+                f"handoff package cannot contain links: {path}"
+            )
+        relative = _validate_portable_relative(
+            path.relative_to(root).as_posix(),
+            label="handoff package path",
+        )
+        collision_key = _portable_key(relative)
+        previous = portable_paths.get(collision_key)
+        if previous is not None and previous != relative:
+            raise HandoffValidationError(
+                "handoff paths collide on a case-insensitive or "
+                f"Unicode-normalizing filesystem: {previous!r} and {relative!r}"
+            )
+        portable_paths[collision_key] = relative
 
 
 def validate_handoff_output_root(
@@ -207,6 +336,18 @@ def _copy_source(source: Path, target: Path) -> int:
             shutil.copy2(child, destination)
             count += 1
     return count
+
+
+def _remove_owned_path(path: Path) -> None:
+    """Remove one exact runner-owned artifact, tolerating only absence."""
+
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _copy_category(
@@ -397,6 +538,7 @@ def _file_manifest(root: Path, *, exclude: set[str] | None = None) -> list[dict[
 
 
 def _write_checksums(root: Path) -> tuple[Path, int]:
+    _validate_portable_tree(root)
     checksum_path = root / CHECKSUM_FILENAME
     records = _file_manifest(root, exclude={CHECKSUM_FILENAME})
     lines = [f"{record['sha256']}  {record['path']}" for record in records]
@@ -404,19 +546,49 @@ def _write_checksums(root: Path) -> tuple[Path, int]:
     return checksum_path, len(records) + 1
 
 
+def _zip_compression(path: Path) -> int:
+    return (
+        zipfile.ZIP_STORED
+        if path.suffix.casefold() in _ZIP_STORED_SUFFIXES
+        else zipfile.ZIP_DEFLATED
+    )
+
+
 def _zip_tree(source: Path, target: Path, archive_root_name: str) -> None:
+    _validate_portable_tree(source)
+    root_name = _validate_portable_relative(
+        archive_root_name,
+        label="handoff ZIP root",
+    )
     with zipfile.ZipFile(
-        target, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+        target,
+        mode="x",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+        allowZip64=True,
     ) as archive:
         for path in sorted(item for item in source.rglob("*") if item.is_file()):
             relative = path.relative_to(source).as_posix()
+            member_name = _validate_portable_relative(
+                f"{root_name}/{relative}",
+                label="handoff ZIP member",
+            )
             info = zipfile.ZipInfo(
-                f"{archive_root_name}/{relative}",
+                member_name,
                 date_time=(1980, 1, 1, 0, 0, 0),
             )
-            info.compress_type = zipfile.ZIP_DEFLATED
+            info.compress_type = _zip_compression(path)
             info.external_attr = 0o100644 << 16
-            archive.writestr(info, path.read_bytes())
+            with path.open("rb") as source_stream, archive.open(
+                info,
+                mode="w",
+                force_zip64=True,
+            ) as target_stream:
+                shutil.copyfileobj(
+                    source_stream,
+                    target_stream,
+                    length=_COPY_BUFFER_BYTES,
+                )
 
 
 def _resolve_version(resolve: Any) -> str | None:
@@ -435,7 +607,11 @@ def _timeline_from_plan(plan: Mapping[str, Any]) -> str | None:
     return str(value) if isinstance(value, str) and value else None
 
 
-def _require_plan_timeline(project: Any, timeline_name: str | None) -> None:
+def _require_plan_timeline(
+    project: Any,
+    plan: Mapping[str, Any],
+) -> Any:
+    timeline_name = _timeline_from_plan(plan)
     if (
         timeline_name is None
         or not re.fullmatch(
@@ -448,7 +624,7 @@ def _require_plan_timeline(project: Any, timeline_name: str | None) -> None:
     count = _call_required(project, "GetTimelineCount")
     if isinstance(count, bool) or not isinstance(count, int) or count < 0:
         raise ResolveHandoffError(f"GetTimelineCount() returned {count!r}")
-    matches = 0
+    matches: list[Any] = []
     for index in range(1, count + 1):
         timeline = _call_required(project, "GetTimelineByIndex", index)
         if timeline is None:
@@ -457,12 +633,24 @@ def _require_plan_timeline(project: Any, timeline_name: str | None) -> None:
             )
         name = _call_required(timeline, "GetName")
         if name == timeline_name:
-            matches += 1
-    if matches != 1:
+            matches.append(timeline)
+    if len(matches) != 1:
         raise ResolveHandoffError(
             f"current project must contain exactly one {timeline_name!r} timeline; "
-            f"found {matches}. Refusing to archive a possibly wrong open project."
+            f"found {len(matches)}. Refusing to archive a possibly wrong open project."
         )
+    # Import lazily because resolve_runner invokes package_handoff lazily too.
+    # Handoff must authenticate the immutable build, not merely trust a name
+    # that an unrelated or edited timeline could be given.
+    from .resolve_runner import ResolveRunnerError, _validate_expected_timeline
+
+    try:
+        _validate_expected_timeline(matches[0], plan, ())
+    except ResolveRunnerError as exc:
+        raise ResolveHandoffError(
+            f"timeline {timeline_name!r} does not match the immutable plan: {exc}"
+        ) from exc
+    return matches[0]
 
 
 def _media_size_estimate(
@@ -591,7 +779,7 @@ def package_handoff(
     require_render_idle(project)
     actual_project_name = project_name(project)
     timeline_name = _timeline_from_plan(plan_data)
-    _require_plan_timeline(project, timeline_name)
+    _require_plan_timeline(project, plan_data)
     build_token = str(
         plan_data.get("build_id")
         or plan_data.get("build_hash")
@@ -627,6 +815,7 @@ def package_handoff(
     # templates and Windows still commonly enforces MAX_PATH in copy APIs.
     staging = output_root / f".rh-{uuid4().hex[:12]}"
     temporary_zip = output_root / f".rh-{uuid4().hex[:12]}.zip.tmp"
+    temporary_zip_checksum = output_root / f".rh-{uuid4().hex[:12]}.sha256.tmp"
     write_roots = (root / "resolve", output_root)
     lock_context = (
         nullcontext(operation_lock)
@@ -642,9 +831,11 @@ def package_handoff(
         if lock is None:
             raise ResolveHandoffError("handoff operation lock is unavailable")
         # A queue-owned lock must have declared the requested external root.
-        lock.assert_write_path(final_directory)
+        for final_target in (final_directory, final_zip, final_zip_checksum):
+            lock.assert_write_path(final_target)
         staging = lock.assert_write_path(staging)
         temporary_zip = lock.assert_write_path(temporary_zip)
+        temporary_zip_checksum = lock.assert_write_path(temporary_zip_checksum)
         output_root.mkdir(parents=True, exist_ok=True)
         for target in (final_directory, final_zip, final_zip_checksum):
             if target.exists():
@@ -658,6 +849,7 @@ def package_handoff(
                 f"need at least {required_free_bytes} bytes, have {free_bytes} bytes"
             )
         staging.mkdir(parents=False, exist_ok=False)
+        published: list[Path] = []
         try:
             current_now = get_current_project(manager)
             if current_now is None or project_name(current_now) != actual_project_name:
@@ -665,7 +857,7 @@ def package_handoff(
                     "current Resolve project changed before archive; operation refused"
                 )
             require_render_idle(current_now)
-            _require_plan_timeline(current_now, timeline_name)
+            _require_plan_timeline(current_now, plan_data)
             dra_path = staging / "project.dra"
             drp_path = staging / "project.drp"
             archived = _call_required(
@@ -786,21 +978,43 @@ def package_handoff(
             validate_handoff(staging)
             _zip_tree(staging, temporary_zip, final_name)
             zip_digest = _sha256(temporary_zip)
-
-            os.replace(staging, final_directory)
-            os.replace(temporary_zip, final_zip)
             _atomic_text(
-                final_zip_checksum,
+                temporary_zip_checksum,
                 f"{zip_digest}  {final_zip.name}\n",
             )
-        except Exception:
-            # Only unique, runner-owned staging paths are removed.
-            if staging.exists():
-                shutil.rmtree(staging)
-            try:
-                temporary_zip.unlink()
-            except FileNotFoundError:
-                pass
+
+            # Publish as a small transaction. If any later promotion fails,
+            # remove only the exact artifacts successfully promoted by this
+            # lock holder; an incomplete handoff must never look immutable.
+            for source, target in (
+                (staging, final_directory),
+                (temporary_zip, final_zip),
+                (temporary_zip_checksum, final_zip_checksum),
+            ):
+                if target.exists():
+                    raise ResolveHandoffError(
+                        f"immutable handoff target appeared before publish: {target}"
+                    )
+                os.replace(source, target)
+                published.append(target)
+        except Exception as exc:
+            cleanup_errors: list[str] = []
+            # Only exact published or unique runner-owned paths are removed.
+            for cleanup in (
+                *reversed(published),
+                staging,
+                temporary_zip,
+                temporary_zip_checksum,
+            ):
+                try:
+                    _remove_owned_path(cleanup)
+                except OSError as cleanup_exc:
+                    cleanup_errors.append(f"{cleanup}: {cleanup_exc}")
+            if cleanup_errors:
+                raise ResolveHandoffError(
+                    "handoff publication failed and rollback was incomplete: "
+                    + "; ".join(cleanup_errors)
+                ) from exc
             raise
 
     result = HandoffResult(
@@ -824,6 +1038,7 @@ create_handoff = package_handoff
 
 def _parse_checksums(path: Path) -> dict[str, str]:
     checksums: dict[str, str] = {}
+    portable_paths: dict[str, str] = {}
     try:
         lines = path.read_text(encoding="utf-8-sig").splitlines()
     except OSError as exc:
@@ -840,14 +1055,21 @@ def _parse_checksums(path: Path) -> dict[str, str]:
             raise HandoffValidationError(
                 f"invalid checksum line {line_number} in {path}"
             )
-        pure = PurePosixPath(relative)
-        if pure.is_absolute() or ".." in pure.parts:
+        normalized = _validate_portable_relative(
+            relative,
+            label=f"checksum path on line {line_number}",
+        )
+        if normalized in checksums:
+            raise HandoffValidationError(f"duplicate checksum path: {normalized}")
+        collision_key = _portable_key(normalized)
+        previous = portable_paths.get(collision_key)
+        if previous is not None and previous != normalized:
             raise HandoffValidationError(
-                f"unsafe checksum path on line {line_number}: {relative!r}"
+                "checksum paths collide on a case-insensitive or "
+                f"Unicode-normalizing filesystem: {previous!r} and {normalized!r}"
             )
-        if relative in checksums:
-            raise HandoffValidationError(f"duplicate checksum path: {relative}")
-        checksums[relative] = digest
+        portable_paths[collision_key] = normalized
+        checksums[normalized] = digest
     return checksums
 
 
@@ -857,6 +1079,7 @@ def _validate_directory(
     hooks: Iterable[Callable[[HandoffValidationContext], Any]],
     restored_project: Any = None,
 ) -> dict[str, Any]:
+    _validate_portable_tree(root)
     manifest_path = root / MANIFEST_FILENAME
     checksum_path = root / CHECKSUM_FILENAME
     dra_path = root / "project.dra"
@@ -933,19 +1156,111 @@ def _validate_directory(
     }
 
 
-def _safe_zip_members(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+def _safe_zip_members(
+    archive: zipfile.ZipFile,
+) -> tuple[str, list[zipfile.ZipInfo]]:
     members = archive.infolist()
     if not members:
         raise HandoffValidationError("handoff ZIP is empty")
+    root_name: str | None = None
+    member_names: dict[str, str] = {}
+    portable_names: dict[str, str] = {}
+    file_names: set[str] = set()
     for info in members:
-        normalized = info.filename.replace("\\", "/")
-        path = PurePosixPath(normalized)
-        drive_like = bool(path.parts and path.parts[0].endswith(":"))
-        if path.is_absolute() or drive_like or ".." in path.parts:
-            raise HandoffValidationError(
-                f"unsafe path in handoff ZIP: {info.filename!r}"
+        raw = info.filename
+        directory = info.is_dir()
+        candidate = raw[:-1] if directory else raw
+        try:
+            normalized = _validate_portable_relative(
+                candidate,
+                label="handoff ZIP member",
             )
-    return members
+        except HandoffValidationError as exc:
+            raise HandoffValidationError(
+                f"unsafe path in handoff ZIP: {info.filename!r}: {exc}"
+            ) from exc
+        path = PurePosixPath(normalized)
+        if len(path.parts) == 1 and not directory:
+            raise HandoffValidationError(
+                "handoff ZIP members must live below one exact top-level "
+                f"package root: {info.filename!r}"
+            )
+        current_root = path.parts[0]
+        if root_name is None:
+            root_name = current_root
+        elif current_root != root_name:
+            raise HandoffValidationError(
+                "handoff ZIP must contain one exact top-level package root; "
+                f"found {root_name!r} and {current_root!r}"
+            )
+
+        previous_exact = member_names.get(normalized)
+        if previous_exact is not None:
+            raise HandoffValidationError(
+                f"duplicate handoff ZIP member: {info.filename!r}"
+            )
+        member_names[normalized] = raw
+
+        collision_key = _portable_key(normalized)
+        previous_portable = portable_names.get(collision_key)
+        if previous_portable is not None and previous_portable != normalized:
+            raise HandoffValidationError(
+                "handoff ZIP members collide on a case-insensitive or "
+                "Unicode-normalizing filesystem: "
+                f"{previous_portable!r} and {normalized!r}"
+            )
+        portable_names[collision_key] = normalized
+
+        unix_mode = (info.external_attr >> 16) & 0xFFFF
+        if unix_mode and stat.S_ISLNK(unix_mode):
+            raise HandoffValidationError(
+                f"handoff ZIP cannot contain symbolic links: {info.filename!r}"
+            )
+        if not directory:
+            file_names.add(normalized)
+
+    if root_name is None:
+        raise HandoffValidationError("handoff ZIP has no package root")
+    for file_name in file_names:
+        prefix = f"{file_name}/"
+        if any(name.startswith(prefix) for name in member_names):
+            raise HandoffValidationError(
+                "handoff ZIP contains a file that is also a parent directory: "
+                f"{file_name!r}"
+            )
+    return root_name, members
+
+
+def _extract_zip_members(
+    archive: zipfile.ZipFile,
+    destination: Path,
+    members: Iterable[zipfile.ZipInfo],
+) -> None:
+    for info in members:
+        raw = info.filename
+        candidate = raw[:-1] if info.is_dir() else raw
+        normalized = _validate_portable_relative(
+            candidate,
+            label="handoff ZIP member",
+        )
+        target = destination.joinpath(*PurePosixPath(normalized).parts)
+        if info.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with archive.open(info, mode="r") as source_stream, target.open(
+                "xb"
+            ) as target_stream:
+                shutil.copyfileobj(
+                    source_stream,
+                    target_stream,
+                    length=_COPY_BUFFER_BYTES,
+                )
+        except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+            raise HandoffValidationError(
+                f"cannot extract handoff ZIP member {info.filename!r}: {exc}"
+            ) from exc
 
 
 def validate_handoff(
@@ -968,15 +1283,17 @@ def validate_handoff(
     with tempfile.TemporaryDirectory(prefix="rabbithole-handoff-validate-") as temp:
         destination = Path(temp)
         with zipfile.ZipFile(source, "r") as archive:
-            members = _safe_zip_members(archive)
-            archive.extractall(destination, members=members)
-        roots = [path for path in destination.iterdir() if path.is_dir()]
-        if len(roots) != 1:
+            root_name, members = _safe_zip_members(archive)
+            _extract_zip_members(archive, destination, members)
+        package_root = destination / root_name
+        if not package_root.is_dir():
             raise HandoffValidationError(
-                "handoff ZIP must contain exactly one package root directory"
+                "handoff ZIP top-level package root is not a directory"
             )
         result = _validate_directory(
-            roots[0], hooks=hooks, restored_project=restored_project
+            package_root,
+            hooks=hooks,
+            restored_project=restored_project,
         )
         result["zip_path"] = os.fspath(source)
         return result
@@ -1006,42 +1323,68 @@ def restore_handoff(
         raise ResolveHandoffError(
             f"restore destination already exists; refusing overwrite: {target}"
         )
+    _validate_portable_relative(
+        target.name,
+        label="restore destination name",
+    )
     if source.is_dir() and is_path_within(target, source):
         raise UnsafeWriteError(
             f"restore destination cannot be inside source package: {target}"
         )
     target.parent.mkdir(parents=True, exist_ok=True)
-
-    if source.is_dir():
-        shutil.copytree(source, target)
-        package_root = target
-    elif source.is_file() and source.suffix.lower() == ".zip":
-        target.mkdir()
-        with zipfile.ZipFile(source, "r") as archive:
-            members = _safe_zip_members(archive)
-            archive.extractall(target, members=members)
-        roots = [path for path in target.iterdir() if path.is_dir()]
-        if len(roots) != 1:
-            shutil.rmtree(target)
-            raise HandoffValidationError(
-                "handoff ZIP must contain exactly one package root directory"
-            )
-        package_root = roots[0]
-    else:
-        raise HandoffValidationError(
-            f"handoff must be a package directory or ZIP: {source}"
+    staging = target.parent / f".rh-restore-{uuid4().hex[:12]}"
+    if staging.exists():
+        raise ResolveHandoffError(
+            f"unique restore staging path already exists: {staging}"
         )
+    promoted = False
     try:
+        package_relative = Path()
+        if source.is_dir():
+            _validate_portable_tree(source)
+            shutil.copytree(source, staging, symlinks=True)
+            package_root = staging
+        elif source.is_file() and source.suffix.lower() == ".zip":
+            staging.mkdir(parents=False, exist_ok=False)
+            with zipfile.ZipFile(source, "r") as archive:
+                root_name, members = _safe_zip_members(archive)
+                _extract_zip_members(archive, staging, members)
+            package_relative = Path(root_name)
+            package_root = staging / package_relative
+            if not package_root.is_dir():
+                raise HandoffValidationError(
+                    "handoff ZIP top-level package root is not a directory"
+                )
+        else:
+            raise HandoffValidationError(
+                f"handoff must be a package directory or ZIP: {source}"
+            )
         result = _validate_directory(
             package_root, hooks=hooks, restored_project=restored_project
         )
-    except Exception:
-        # The target was uniquely created by this call and failed validation.
-        shutil.rmtree(target)
+        if target.exists():
+            raise ResolveHandoffError(
+                f"restore destination appeared before publish: {target}"
+            )
+        os.replace(staging, target)
+        promoted = True
+        final_package_root = target / package_relative
+        result["package_root"] = os.fspath(final_package_root)
+        result["restore_directory"] = os.fspath(target)
+        result["resolve_import_performed"] = False
+        return result
+    except Exception as exc:
+        # Staging is a unique sibling of the requested target. If promotion
+        # succeeded and a later step failed, remove only that exact target.
+        cleanup = target if promoted else staging
+        try:
+            _remove_owned_path(cleanup)
+        except OSError as cleanup_exc:
+            raise ResolveHandoffError(
+                "handoff restore failed and rollback was incomplete for "
+                f"{cleanup}: {cleanup_exc}"
+            ) from exc
         raise
-    result["restore_directory"] = os.fspath(target)
-    result["resolve_import_performed"] = False
-    return result
 
 
 __all__ = [

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import rabbithole.sources.ytdlp as ytdlp_module
 from rabbithole.provenance import AssetRecord
 from rabbithole.sources.ytdlp import claim_citing, fetch_primary, normalize_url
 
@@ -25,13 +26,57 @@ def _ok_runner(argv):
 
 
 class _RecordingRunner:
-    def __init__(self, result=(0, b"", b"")):
+    def __init__(self, result=(0, b"", b""), *, write_output=True):
         self.result = result
+        self.write_output = write_output
         self.calls = []
 
     def __call__(self, argv):
         self.calls.append(argv)
+        if self.result[0] == 0 and self.write_output:
+            output = Path(argv[argv.index("-o") + 1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"stand-in video")
         return self.result
+
+
+class _TimedOutProcess:
+    def __init__(self, *, pid=4321):
+        self.pid = pid
+        self.returncode = None
+        self.stdout = None
+        self.stderr = None
+        self.communicate_calls = 0
+        self.wait_calls = []
+        self.kill_calls = 0
+        self.terminate_calls = 0
+
+    def communicate(self, timeout=None):
+        self.communicate_calls += 1
+        if self.communicate_calls == 1:
+            raise ytdlp_module.subprocess.TimeoutExpired(
+                cmd=["yt-dlp"],
+                timeout=timeout,
+                output=b"partial stdout",
+                stderr=b"partial stderr",
+            )
+        return b"complete stdout", b"complete stderr"
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        self.returncode = -9
+        return self.returncode
+
+    def kill(self):
+        self.kill_calls += 1
+        self.returncode = -9
+
+    def terminate(self):
+        self.terminate_calls += 1
+        self.returncode = -15
 
 
 
@@ -162,16 +207,230 @@ def test_fetch_primary_succeeds_when_a_claim_cites_the_url_and_invokes_runner_on
     assert len(runner.calls) == 1
 
 
-def test_runner_argv_includes_out_path_and_no_playlist(tmp_path):
+def test_runner_argv_uses_an_isolated_attempt_path_and_no_playlist(tmp_path):
     claims = [_claim("c1", sources=(URL,))]
     runner = _RecordingRunner()
     out_path = tmp_path / "out.mp4"
+    probed = []
 
-    fetch_primary(URL, out_path, claims, runner=runner, prober=_is_video)
+    def prober(path):
+        probed.append(path)
+        return path.read_bytes() == b"stand-in video"
+
+    fetch_primary(URL, out_path, claims, runner=runner, prober=prober)
 
     argv = runner.calls[0]
-    assert str(out_path) in argv
+    attempt_path = Path(argv[argv.index("-o") + 1])
+    assert attempt_path != out_path
+    assert attempt_path.name == "download.mp4"
+    assert attempt_path.parent.parent == tmp_path
+    assert not attempt_path.parent.exists()
+    assert out_path.read_bytes() == b"stand-in video"
+    assert probed == [attempt_path]
     assert "--no-playlist" in argv
+    assert argv[argv.index("--socket-timeout") + 1] == "30"
+    assert argv[argv.index("--retries") + 1] == "3"
+    assert argv[argv.index("--format") + 1] == ytdlp_module.PORTABLE_VIDEO_FORMAT
+    assert argv[argv.index("--merge-output-format") + 1] == "mp4"
+    assert argv[argv.index("--remux-video") + 1] == "mp4"
+
+
+def test_failed_attempt_cleans_fragments_and_preserves_existing_final(tmp_path):
+    claims = [_claim("c1", sources=(URL,))]
+    out_path = tmp_path / "out.mp4"
+    out_path.write_bytes(b"previous validated file")
+    observed = {}
+
+    def fragmented_failure(argv):
+        attempt = Path(argv[argv.index("-o") + 1])
+        observed["attempt_dir"] = attempt.parent
+        attempt.parent.mkdir(parents=True, exist_ok=True)
+        attempt.with_suffix(".mp4.part").write_bytes(b"partial")
+        (attempt.parent / "download.f137.mp4").write_bytes(b"video fragment")
+        (attempt.parent / "download.f140.m4a").write_bytes(b"audio fragment")
+        return 1, b"", b"merge failed"
+
+    with pytest.raises(RuntimeError, match="merge failed"):
+        fetch_primary(
+            URL,
+            out_path,
+            claims,
+            runner=fragmented_failure,
+            prober=_is_video,
+        )
+
+    assert out_path.read_bytes() == b"previous validated file"
+    assert not observed["attempt_dir"].exists()
+
+
+def test_zero_exit_without_an_output_is_refused_and_cleaned(tmp_path):
+    claims = [_claim("c1", sources=(URL,))]
+    runner = _RecordingRunner(write_output=False)
+    out_path = tmp_path / "out.mp4"
+
+    with pytest.raises(RuntimeError, match="wrote no non-empty MP4"):
+        fetch_primary(URL, out_path, claims, runner=runner, prober=_is_video)
+
+    attempt_path = Path(runner.calls[0][runner.calls[0].index("-o") + 1])
+    assert not attempt_path.parent.exists()
+    assert not out_path.exists()
+
+
+def test_portable_format_prefers_h264_aac_mp4_and_allows_silent_video():
+    selector = ytdlp_module.PORTABLE_VIDEO_FORMAT
+
+    assert "[ext=mp4]" in selector
+    assert "[vcodec^=avc1]" in selector
+    assert "[ext=m4a][acodec^=mp4a]" in selector
+    assert selector.endswith("bv[ext=mp4][vcodec^=avc1]")
+
+
+def test_default_runner_uses_an_isolated_posix_group_and_terminates_it_on_timeout(
+    monkeypatch,
+):
+    process = _TimedOutProcess()
+    observed = {}
+
+    def popen(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        return process
+
+    def terminate_tree(value):
+        observed["terminated"] = value
+        value.returncode = -15
+
+    monkeypatch.setattr(ytdlp_module, "_is_windows", lambda: False)
+    monkeypatch.setattr(ytdlp_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(ytdlp_module, "_terminate_process_tree", terminate_tree)
+
+    returncode, stdout, stderr = ytdlp_module._default_runner(["yt-dlp"])
+
+    assert returncode == 124
+    assert stdout == b"complete stdout"
+    assert b"process timeout" in stderr
+    assert observed["terminated"] is process
+    assert observed["kwargs"]["start_new_session"] is True
+    assert "creationflags" not in observed["kwargs"]
+
+
+def test_windows_launch_uses_a_new_hidden_process_group(monkeypatch):
+    observed = {}
+
+    class CompletedProcess:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            observed["timeout"] = timeout
+            return b"ok", b""
+
+    def popen(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        return CompletedProcess()
+
+    monkeypatch.setattr(ytdlp_module, "_is_windows", lambda: True)
+    monkeypatch.setattr(ytdlp_module.subprocess, "Popen", popen)
+
+    returncode, stdout, stderr = ytdlp_module._default_runner(["yt-dlp"])
+
+    assert (returncode, stdout, stderr) == (0, b"ok", b"")
+    assert observed["kwargs"]["creationflags"] & (
+        ytdlp_module._WINDOWS_CREATE_NEW_PROCESS_GROUP
+    )
+    assert observed["kwargs"]["creationflags"] & (
+        ytdlp_module._WINDOWS_CREATE_NO_WINDOW
+    )
+    assert "start_new_session" not in observed["kwargs"]
+
+
+def test_posix_timeout_escalates_from_term_to_kill_for_the_whole_group(
+    monkeypatch,
+):
+    process = _TimedOutProcess(pid=6789)
+    signals = []
+
+    monkeypatch.setattr(ytdlp_module, "PROCESS_TERMINATION_GRACE_SECONDS", 0)
+    monkeypatch.setattr(
+        ytdlp_module.os,
+        "killpg",
+        lambda process_group, selected_signal: signals.append(
+            (process_group, selected_signal)
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ytdlp_module,
+        "_posix_process_group_exists",
+        lambda _process_group: True,
+    )
+
+    ytdlp_module._terminate_posix_process_tree(process)
+
+    assert signals == [
+        (6789, ytdlp_module._POSIX_SIGTERM),
+        (6789, ytdlp_module._POSIX_SIGKILL),
+    ]
+    assert process.wait_calls == [0]
+
+
+def test_windows_timeout_uses_taskkill_tree_and_force_flags(monkeypatch):
+    process = _TimedOutProcess(pid=2468)
+    observed = {}
+
+    class TaskkillResult:
+        returncode = 0
+        stderr = b""
+
+    def run(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        process.returncode = -9
+        return TaskkillResult()
+
+    monkeypatch.setattr(ytdlp_module.subprocess, "run", run)
+
+    ytdlp_module._terminate_windows_process_tree(process)
+
+    assert observed["argv"][1:] == ["/PID", "2468", "/T", "/F"]
+    taskkill_path = observed["argv"][0].replace("/", "\\").lower()
+    assert taskkill_path.endswith("system32\\taskkill.exe")
+    assert observed["kwargs"]["creationflags"] == (
+        ytdlp_module._WINDOWS_CREATE_NO_WINDOW
+    )
+    assert process.wait_calls == [ytdlp_module.PROCESS_TERMINATION_GRACE_SECONDS]
+
+
+def test_default_timeout_cleans_attempt_fragments_and_preserves_final(
+    tmp_path,
+    monkeypatch,
+):
+    claims = [_claim("c1", sources=(URL,))]
+    out_path = tmp_path / "out.mp4"
+    out_path.write_bytes(b"previous validated file")
+    process = _TimedOutProcess()
+    observed = {}
+
+    def popen(argv, **_kwargs):
+        attempt = Path(argv[argv.index("-o") + 1])
+        observed["attempt_dir"] = attempt.parent
+        attempt.with_suffix(".mp4.part").write_bytes(b"partial")
+        (attempt.parent / "download.f137.mp4").write_bytes(b"video fragment")
+        return process
+
+    def terminate_tree(value):
+        observed["terminated"] = value
+        value.returncode = -15
+
+    monkeypatch.setattr(ytdlp_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(ytdlp_module, "_terminate_process_tree", terminate_tree)
+
+    with pytest.raises(RuntimeError, match="process timeout"):
+        fetch_primary(URL, out_path, claims, prober=_is_video)
+
+    assert observed["terminated"] is process
+    assert out_path.read_bytes() == b"previous validated file"
+    assert not observed["attempt_dir"].exists()
 
 
 def test_fetch_primary_raises_with_stderr_detail_on_non_zero_return(tmp_path):

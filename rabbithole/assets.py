@@ -33,18 +33,23 @@ draws them locally from the style pack, and the action is `draw`.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import math
+import os
+import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 
 from rabbithole import cards
 from rabbithole.jsonio import read_json
 from rabbithole.provenance import AssetRecord
 from rabbithole.slots import Slot
-from rabbithole.sources import archives, capture, ytdlp
+from rabbithole.sources import archives, capture, frame_video, image_video, ytdlp
 from rabbithole.sources.plates import PLATE_KINDS, PlateSpec, build_plate
 from rabbithole.validate import Finding
 
@@ -101,10 +106,29 @@ _ACTION_ORDER = ("generate", "draw", "shoot", "search", "fetch", "manual", _STAL
 # to make an animatic. Keep that workflow explicit, while the CLI's production
 # path uses ``final`` and fails closed on those placeholders.
 QUALITY_MODES = ("final", "animatic")
-FINAL_MIN_EVIDENCE_RATIO = 0.50
+FINAL_MIN_SOURCE_BACKED_RATIO = 0.50
+FINAL_MIN_SOURCE_PIXEL_RATIO = 0.35
+# Backwards-compatible public name: the established 50% floor now measures
+# source-backed editorial coverage. A separate source-pixel floor below keeps
+# attributed paraphrase cards from satisfying the documentary gate alone.
+FINAL_MIN_EVIDENCE_RATIO = FINAL_MIN_SOURCE_BACKED_RATIO
 EVIDENCE_TIERS = frozenset({"primary", "archival"})
+NON_SOURCE_PIXEL_EVIDENCE_PROVIDERS = frozenset(
+    {
+        # This provider deliberately burns "EDITORIAL PARAPHRASE" into the
+        # frame. It is source-backed context, but it contains no retained
+        # pixels from the cited page or media.
+        "rabbithole-evidence-card",
+    }
+)
 SOURCE_REPLACEMENT_TIERS = frozenset({"primary", "archival", "illustrative"})
 FLEXIBLE_VISUAL_KINDS = frozenset({"plate", "graphic"})
+
+# A successful acquisition is not successful until its output can be opened.
+# Keep this injectable because focused tests use tiny stand-in payloads, while
+# the production default performs a real ffprobe decode check.
+MediaProber = Callable[[Path], bool]
+RecordCallback = Callable[[AssetRecord], None]
 
 
 def allowed_tiers_for_kind(kind: str) -> frozenset[str]:
@@ -135,12 +159,20 @@ class PlanItem:
 
 @dataclass(frozen=True)
 class EvidenceMetrics:
-    """Measurable sourced-evidence coverage of the visual timeline."""
+    """Source-backed and source-pixel coverage of the visual timeline.
+
+    ``evidence_*`` retains the original public API and means source-backed:
+    primary/archival media plus explicitly disclosed, attributed citation
+    cards. ``source_pixel_*`` is the stricter subset containing retained source
+    pixels. Final quality applies an independent floor to each measurement.
+    """
 
     evidence_seconds: float
     total_seconds: float
     evidence_slots: int
     total_slots: int
+    source_pixel_seconds: float
+    source_pixel_slots: int
 
     @property
     def duration_ratio(self) -> float:
@@ -149,6 +181,38 @@ class EvidenceMetrics:
     @property
     def slot_ratio(self) -> float:
         return self.evidence_slots / self.total_slots if self.total_slots else 1.0
+
+    @property
+    def source_backed_seconds(self) -> float:
+        return self.evidence_seconds
+
+    @property
+    def source_backed_slots(self) -> int:
+        return self.evidence_slots
+
+    @property
+    def source_backed_duration_ratio(self) -> float:
+        return self.duration_ratio
+
+    @property
+    def source_backed_slot_ratio(self) -> float:
+        return self.slot_ratio
+
+    @property
+    def source_pixel_duration_ratio(self) -> float:
+        return (
+            self.source_pixel_seconds / self.total_seconds
+            if self.total_seconds
+            else 1.0
+        )
+
+    @property
+    def source_pixel_slot_ratio(self) -> float:
+        return (
+            self.source_pixel_slots / self.total_slots
+            if self.total_slots
+            else 1.0
+        )
 
 
 def normalize_quality(quality: str) -> str:
@@ -161,19 +225,104 @@ def normalize_quality(quality: str) -> str:
     return value
 
 
+def record_media_path(record: AssetRecord, project_root: Path) -> Path:
+    """Resolve a ledger path on the current machine.
+
+    Episode ledgers intentionally store project-relative POSIX paths so a
+    project copied from Windows to macOS (or the reverse) remains portable.
+    Absolute paths are still accepted for legacy/external media records.
+    """
+    raw = Path(record.local_path).expanduser()
+    if raw.is_absolute():
+        return raw
+    return Path(project_root) / Path(*raw.parts)
+
+
+def media_is_usable(path: Path, prober: MediaProber | None = None) -> bool:
+    """Return whether *path* exists, is non-empty, and decodes as visual media."""
+    candidate = Path(path)
+    try:
+        if not candidate.is_file() or candidate.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+
+    active_prober = prober if prober is not None else ytdlp.media_decodes
+    try:
+        return bool(active_prober(candidate))
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def usable_provenance_records(
+    records: list[AssetRecord],
+    project_root: Path,
+    *,
+    prober: MediaProber | None = None,
+    severity: str = "warning",
+) -> tuple[list[AssetRecord], list[Finding]]:
+    """Separate ledger records backed by decodable local media from broken ones.
+
+    A ledger entry alone must never suppress acquisition after a project is
+    moved to another machine or after an interrupted writer leaves a partial
+    file. Invalid entries remain in the append-only ledger; they simply do not
+    satisfy planning until their deterministic local path has been restored.
+    """
+    usable: list[AssetRecord] = []
+    findings: list[Finding] = []
+    checked_paths: dict[Path, bool] = {}
+
+    for record in records:
+        path = record_media_path(record, project_root)
+        try:
+            cache_key = path.resolve()
+        except OSError:
+            cache_key = path.absolute()
+        valid = checked_paths.get(cache_key)
+        if valid is None:
+            valid = media_is_usable(path, prober)
+            checked_paths[cache_key] = valid
+        if valid:
+            usable.append(record)
+            continue
+        findings.append(
+            Finding(
+                gate="assets",
+                severity=severity,
+                message=(
+                    f"Ledger asset {record.asset_id!r} does not have decodable "
+                    f"local media at {str(path)!r}; it will not satisfy "
+                    "acquisition on this machine."
+                ),
+            )
+        )
+    return usable, findings
+
+
 def evidence_metrics(
     slots: list[Slot], records: list[AssetRecord]
 ) -> EvidenceMetrics:
-    """Duration- and slot-weighted coverage by primary or archival evidence.
+    """Duration- and slot-weighted source-backed/source-pixel coverage.
 
-    A generated texture or explanatory card can support pacing, but it is not a
-    source. Each slot counts at most once even if a malformed ledger has two
-    claimants; :func:`check_provenance` separately rejects that ambiguity.
+    Primary and archival records are source-backed. A disclosed local citation
+    card is useful source-backed context, but it is not a screenshot and cannot
+    enter the source-pixel subset. A generated texture or ordinary explanatory
+    card enters neither metric. Each slot counts at most once even if a
+    malformed ledger has two claimants; :func:`check_provenance` separately
+    rejects that ambiguity.
     """
     evidence_slot_ids = {
         slot_id
         for record in records
         if record.tier in EVIDENCE_TIERS
+        for slot_id in record.used_in_slots
+    }
+    source_pixel_slot_ids = {
+        slot_id
+        for record in records
+        if record.tier in EVIDENCE_TIERS
+        and record.provider.strip().casefold()
+        not in NON_SOURCE_PIXEL_EVIDENCE_PROVIDERS
         for slot_id in record.used_in_slots
     }
     total_seconds = sum(max(0.0, slot.hold_seconds) for slot in slots)
@@ -182,11 +331,20 @@ def evidence_metrics(
         for slot in slots
         if slot.slot_id in evidence_slot_ids
     )
+    source_pixel_seconds = sum(
+        max(0.0, slot.hold_seconds)
+        for slot in slots
+        if slot.slot_id in source_pixel_slot_ids
+    )
     return EvidenceMetrics(
         evidence_seconds=evidence_seconds,
         total_seconds=total_seconds,
         evidence_slots=sum(1 for slot in slots if slot.slot_id in evidence_slot_ids),
         total_slots=len(slots),
+        source_pixel_seconds=source_pixel_seconds,
+        source_pixel_slots=sum(
+            1 for slot in slots if slot.slot_id in source_pixel_slot_ids
+        ),
     )
 
 
@@ -196,6 +354,7 @@ def check_source_quality(
     *,
     quality: str = "final",
     min_evidence_ratio: float = FINAL_MIN_EVIDENCE_RATIO,
+    min_source_pixel_ratio: float = FINAL_MIN_SOURCE_PIXEL_RATIO,
 ) -> list[Finding]:
     """Fail-closed documentary-source gates for a completed visual plan.
 
@@ -212,6 +371,11 @@ def check_source_quality(
     if not 0.0 <= min_evidence_ratio <= 1.0:
         raise ValueError(
             f"min_evidence_ratio must be between 0 and 1, got {min_evidence_ratio}"
+        )
+    if not 0.0 <= min_source_pixel_ratio <= 1.0:
+        raise ValueError(
+            "min_source_pixel_ratio must be between 0 and 1, got "
+            f"{min_source_pixel_ratio}"
         )
 
     findings: list[Finding] = []
@@ -260,7 +424,8 @@ def check_source_quality(
                     )
                 )
         elif slot.kind == "graphic" and not has_sourced_replacement:
-            spec, _card_findings = cards.spec_for_slot(slot)
+            spec, card_findings = cards.spec_for_slot(slot)
+            findings.extend(card_findings)
             reason = cards.production_note_reason(slot.detail, spec)
             if reason:
                 findings.append(
@@ -285,11 +450,31 @@ def check_source_quality(
                 message=(
                     "Sourced-evidence ratio is "
                     f"{metrics.duration_ratio:.1%} by screen time "
-                    f"({metrics.evidence_seconds:.2f}/{metrics.total_seconds:.2f}s; "
+                    f"(source-backed; {metrics.evidence_seconds:.2f}/"
+                    f"{metrics.total_seconds:.2f}s; "
                     f"{metrics.evidence_slots}/{metrics.total_slots} slots, "
                     f"{metrics.slot_ratio:.1%}), below the final-quality minimum "
                     f"of {min_evidence_ratio:.0%}. Primary and archival ledger tiers "
-                    "count as evidence; generated cards and plates do not."
+                    "count as source-backed; generated atmospherics do not."
+                ),
+            )
+        )
+    if metrics.source_pixel_duration_ratio < min_source_pixel_ratio:
+        findings.append(
+            Finding(
+                gate="source-quality",
+                severity="error",
+                message=(
+                    "Source-pixel evidence ratio is "
+                    f"{metrics.source_pixel_duration_ratio:.1%} by screen time "
+                    f"({metrics.source_pixel_seconds:.2f}/"
+                    f"{metrics.total_seconds:.2f}s; "
+                    f"{metrics.source_pixel_slots}/{metrics.total_slots} slots, "
+                    f"{metrics.source_pixel_slot_ratio:.1%}), below the "
+                    f"final-quality minimum of {min_source_pixel_ratio:.0%}. "
+                    "Retained primary/archival pixels count; locally authored "
+                    "citation cards are source-backed only and cannot satisfy "
+                    "this floor."
                 ),
             )
         )
@@ -317,6 +502,29 @@ class Artifact:
     slot_id: str = ""
     acquisition_mode: str = ""
     max_use_seconds: float | None = None
+    # JSON-friendly browser targeting passed to CaptureSpec. This is authored
+    # per slot because one URL can support several different paragraphs, dates,
+    # or detail crops.
+    capture_spec: dict[str, object] | None = None
+    capture_strategy: str = ""
+    capture_note: str = ""
+    # Screenshot-only slots may derive a silent frame from an already retained
+    # source-video slot instead of opening the video page in a browser.
+    source_video_slot: str = ""
+    source_frame_timestamp: float | None = None
+    source_frame_crop: list[int] | tuple[int, int, int, int] | None = None
+    source_image_crop: list[int] | tuple[int, int, int, int] | None = None
+    # SPDX-style identifier for a directly downloaded source image. This is
+    # intentionally separate from free-form rights_note: acquisition must
+    # never infer a licence from prose or from the source host.
+    source_license: str = ""
+    source_attribution: str = ""
+    source_date_label: str = ""
+    # Optional opt-in key for browser-source reuse. URL equality alone is not
+    # enough: two slots may need different page locations, crops, or video
+    # frames from the same URL. Only identical non-empty fingerprints share a
+    # capture request.
+    capture_spec_fingerprint: str = ""
 
 
 _ARTIFACT_FIELDS = frozenset(f.name for f in dataclasses.fields(Artifact))
@@ -361,6 +569,68 @@ def load_artifacts(path: Path) -> list[Artifact]:
         fields["artifact_id"] = str(artifact_id)
         fields["url"] = str(url)
         artifacts.append(Artifact(**fields))
+
+    overlays: dict[str, tuple[Path, dict]] = {}
+    for overlay_path in sorted(path.parent.glob("capture-targets*.json")):
+        overlay = read_json(overlay_path)
+        if not isinstance(overlay, dict):
+            raise RuntimeError(
+                f"{overlay_path}: expected an object keyed by slot id"
+            )
+        for slot_id, entry in overlay.items():
+            if not isinstance(slot_id, str) or not slot_id:
+                raise RuntimeError(
+                    f"{overlay_path}: capture-target slot ids must be non-empty strings"
+                )
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"{overlay_path}: capture target {slot_id!r} must be an object"
+                )
+            if slot_id in overlays:
+                previous = overlays[slot_id][0]
+                raise RuntimeError(
+                    f"{overlay_path}: capture target {slot_id!r} is also defined "
+                    f"in {previous}; each slot needs one authored target"
+                )
+            overlays[slot_id] = (overlay_path, entry)
+
+    if not overlays:
+        return artifacts
+
+    by_slot = {
+        artifact.slot_id: index
+        for index, artifact in enumerate(artifacts)
+        if artifact.slot_id
+    }
+    for slot_id, (overlay_path, entry) in overlays.items():
+        index = by_slot.get(slot_id)
+        if index is None:
+            raise RuntimeError(
+                f"{overlay_path}: capture target {slot_id!r} has no bound "
+                "artifact in artifacts.json"
+            )
+        artifact = artifacts[index]
+        expected_source = re.sub(r"-s\d{3}$", "", artifact.artifact_id)
+        source = str(entry.get("source", "")).strip()
+        if source and source != expected_source:
+            raise RuntimeError(
+                f"{overlay_path}: capture target {slot_id!r} names source "
+                f"{source!r}, but the bound artifact belongs to "
+                f"{expected_source!r}"
+            )
+        spec = entry.get("spec")
+        if spec is not None and not isinstance(spec, dict):
+            raise RuntimeError(
+                f"{overlay_path}: capture target {slot_id!r} spec must be an object"
+            )
+        strategy = str(entry.get("strategy", "")).strip()
+        note = str(entry.get("note", "")).strip()
+        artifacts[index] = dataclasses.replace(
+            artifact,
+            capture_spec=dict(spec) if spec is not None else artifact.capture_spec,
+            capture_strategy=strategy or artifact.capture_strategy,
+            capture_note=note or artifact.capture_note,
+        )
     return artifacts
 
 
@@ -393,6 +663,58 @@ _ACQUISITION_ACTIONS = {
     "screenshot-only": "shoot",
     "video-only": "fetch",
 }
+SOURCE_IMAGE_STRATEGIES = frozenset({"licensed-direct-image-crop-deferred"})
+# A syntactically plausible token is not enough here: accepting ``CCO-1.0``
+# or ``copyrighted`` would turn a typo or prose label into a false licence
+# assertion for retained source pixels.
+SOURCE_IMAGE_SPDX_LICENSES = frozenset(
+    {
+        "CC-PDDC",
+        "CC0-1.0",
+        "CC-BY-1.0",
+        "CC-BY-2.0",
+        "CC-BY-2.5",
+        "CC-BY-3.0",
+        "CC-BY-4.0",
+    }
+)
+_SOURCE_LICENSE_REF_RE = re.compile(
+    r"^LicenseRef-[A-Za-z0-9][A-Za-z0-9.-]*$"
+)
+LOCAL_EVIDENCE_CARD_STRATEGIES = frozenset(
+    {
+        "manual-editorial-card-no-page-capture",
+        "catalogue-metadata-card-no-page-or-media-access",
+        "local-current-context-citation-card-after-fetch-failure",
+    }
+)
+EVIDENCE_CARD_DISCLOSURE = "EDITORIAL PARAPHRASE · SOURCE-ATTRIBUTED"
+CAPTURE_STRATEGIES = frozenset(
+    {"", *SOURCE_IMAGE_STRATEGIES, *LOCAL_EVIDENCE_CARD_STRATEGIES}
+)
+
+
+def _citation_card_primary_text(slot_detail: str, capture_note: str = "") -> str:
+    """Return reviewer-facing copy instead of raw marker-routing metadata.
+
+    Screenshot slot details commonly begin with internal authoring syntax such
+    as ``source=wt-guardian detail=...``.  That is useful to the acquisition
+    planner but looks like a debug overlay when rendered as evidence.  Manual
+    fallback notes are deliberately authored with a concise, attributable
+    first sentence; prefer that sentence, then fall back to a cleaned detail.
+    """
+    note = str(capture_note or "").strip()
+    if note:
+        sentence = re.split(r"(?<=[.!?])\s+", note, maxsplit=1)[0].strip()
+        if sentence:
+            return sentence
+
+    text = str(slot_detail or "").split(";", 1)[0].strip()
+    detail_match = re.search(r"(?:^|\s)detail=(.+)$", text)
+    if detail_match:
+        text = detail_match.group(1).strip()
+    text = re.sub(r"^source=\S+\s*", "", text).strip()
+    return text or "Source context"
 
 
 def _artifact_policy_block(
@@ -408,6 +730,15 @@ def _artifact_policy_block(
             f"expected one of {expected}"
         )
 
+    strategy = str(artifact.capture_strategy or "").strip().lower()
+    if action == "shoot" and strategy not in CAPTURE_STRATEGIES:
+        expected = ", ".join(repr(value) for value in sorted(CAPTURE_STRATEGIES))
+        return (
+            f"artifact {artifact.artifact_id!r} bound to slot {slot.slot_id!r} "
+            f"has unsupported capture_strategy {artifact.capture_strategy!r}; "
+            f"expected one of {expected}"
+        )
+
     required_action = _ACQUISITION_ACTIONS.get(mode)
     if required_action is not None and action != required_action:
         return (
@@ -415,6 +746,123 @@ def _artifact_policy_block(
             f"{slot.slot_id!r} ({slot.kind!r}) requires acquisition action "
             f"{action!r}; rebind it to a compatible source slot"
         )
+
+    if action == "shoot" and artifact.capture_spec is not None:
+        try:
+            capture.CaptureSpec.from_value(artifact.capture_spec)
+        except (TypeError, ValueError) as exc:
+            return (
+                f"artifact {artifact.artifact_id!r} bound to slot "
+                f"{slot.slot_id!r} has invalid capture_spec: {exc}"
+            )
+
+    if artifact.source_video_slot:
+        if action != "shoot":
+            return (
+                f"artifact {artifact.artifact_id!r} declares source_video_slot "
+                f"{artifact.source_video_slot!r}, but only screenshot acquisition "
+                "can derive a retained source frame"
+            )
+        if artifact.capture_spec is not None:
+            return (
+                f"artifact {artifact.artifact_id!r} cannot combine capture_spec "
+                "with source_video_slot; choose browser evidence or a source frame"
+            )
+        timestamp = artifact.source_frame_timestamp
+        if (
+            timestamp is None
+            or isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not math.isfinite(float(timestamp))
+            or float(timestamp) < 0
+        ):
+            return (
+                f"artifact {artifact.artifact_id!r} has invalid "
+                f"source_frame_timestamp {timestamp!r}; it must be a finite "
+                "non-negative number"
+            )
+        crop = artifact.source_frame_crop
+        if crop is not None:
+            valid_crop = (
+                isinstance(crop, (list, tuple))
+                and len(crop) == 4
+                and all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    for value in crop
+                )
+                and crop[0] >= 0
+                and crop[1] >= 0
+                and crop[2] > 0
+                and crop[3] > 0
+            )
+            if not valid_crop:
+                return (
+                    f"artifact {artifact.artifact_id!r} has invalid "
+                    f"source_frame_crop {crop!r}; expected "
+                    "[x, y, width, height] in source pixels"
+                )
+
+    if strategy in SOURCE_IMAGE_STRATEGIES:
+        if artifact.capture_spec is not None or artifact.source_video_slot:
+            return (
+                f"artifact {artifact.artifact_id!r} source-image strategy cannot "
+                "combine with capture_spec or source_video_slot"
+            )
+        if not isinstance(artifact.source_license, str):
+            return (
+                f"artifact {artifact.artifact_id!r} has invalid source_license "
+                f"{artifact.source_license!r}; expected one SPDX-style licence "
+                "identifier as a string"
+            )
+        source_license = artifact.source_license.strip()
+        if not source_license:
+            return (
+                f"artifact {artifact.artifact_id!r} uses a direct source image "
+                "but has no source_license; record an explicit machine-readable "
+                "licence identifier such as 'CC0-1.0'"
+            )
+        if source_license in SOURCE_IMAGE_SPDX_LICENSES:
+            pass
+        elif _SOURCE_LICENSE_REF_RE.fullmatch(source_license):
+            if not str(artifact.rights_note or "").strip():
+                return (
+                    f"artifact {artifact.artifact_id!r} uses custom "
+                    f"source_license {source_license!r} but has no rights_note; "
+                    "a LicenseRef-* must document the permission or legal basis"
+                )
+            if not str(artifact.source_attribution or "").strip():
+                return (
+                    f"artifact {artifact.artifact_id!r} uses custom "
+                    f"source_license {source_license!r} but has no "
+                    "source_attribution"
+                )
+        else:
+            allowed = ", ".join(sorted(SOURCE_IMAGE_SPDX_LICENSES))
+            return (
+                f"artifact {artifact.artifact_id!r} has invalid source_license "
+                f"{artifact.source_license!r}; expected one approved SPDX "
+                f"identifier ({allowed}) or a documented LicenseRef-*"
+            )
+        crop = artifact.source_image_crop
+        if crop is not None:
+            valid_crop = (
+                isinstance(crop, (list, tuple))
+                and len(crop) == 4
+                and all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    for value in crop
+                )
+                and crop[0] >= 0
+                and crop[1] >= 0
+                and crop[2] > 0
+                and crop[3] > 0
+            )
+            if not valid_crop:
+                return (
+                    f"artifact {artifact.artifact_id!r} has invalid "
+                    f"source_image_crop {crop!r}; expected "
+                    "[x, y, width, height] in source pixels"
+                )
 
     limit = artifact.max_use_seconds
     if limit is None:
@@ -466,9 +914,57 @@ def _artifact_provenance_note(artifact: Artifact) -> str:
         ("date", artifact.date),
         ("source_role", artifact.source_role),
         ("rights_note", artifact.rights_note),
+        (
+            "capture_spec",
+            json.dumps(
+                capture.CaptureSpec.from_value(artifact.capture_spec).to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if artifact.capture_spec is not None
+            else "",
+        ),
+        ("capture_strategy", artifact.capture_strategy),
+        ("capture_note", artifact.capture_note),
+        ("source_video_slot", artifact.source_video_slot),
+        (
+            "source_frame_timestamp",
+            f"{float(artifact.source_frame_timestamp):.6f}"
+            if artifact.source_frame_timestamp is not None
+            else "",
+        ),
+        (
+            "source_frame_crop",
+            json.dumps(list(artifact.source_frame_crop), separators=(",", ":"))
+            if artifact.source_frame_crop is not None
+            else "",
+        ),
+        (
+            "source_image_crop",
+            json.dumps(list(artifact.source_image_crop), separators=(",", ":"))
+            if artifact.source_image_crop is not None
+            else "",
+        ),
+        ("source_license", artifact.source_license),
     )
     parts = [f"{label}={value!r}" for label, value in labelled if value]
     return f"catalogue metadata: {'; '.join(parts)}" if parts else ""
+
+
+def _capture_reuse_key(
+    artifact: Artifact, quality: str
+) -> tuple[str, str, str] | None:
+    """Opt-in identity for a truly identical browser capture request.
+
+    The same URL can legitimately need different scroll positions, DOM
+    targets, crops, or video frames. Reuse is therefore disabled unless the
+    research catalogue explicitly assigns the same non-empty capture-spec
+    fingerprint to the requests.
+    """
+    fingerprint = str(artifact.capture_spec_fingerprint or "").strip()
+    if not fingerprint:
+        return None
+    return (artifact.url.strip(), fingerprint, quality)
 
 
 def plan_assets(
@@ -661,6 +1157,32 @@ def format_plan(items: list[PlanItem]) -> str:
     return "\n".join(lines)
 
 
+def select_plan_items(
+    items: list[PlanItem],
+    *,
+    slot_ids: tuple[str, ...] | list[str] = (),
+    batch_size: int | None = None,
+) -> list[PlanItem]:
+    """Select exact slots and/or the next bounded batch of actionable work.
+
+    Batches deliberately ignore no-op entries such as ``satisfied``. Running
+    ``assets --batch-size 20`` repeatedly therefore advances through the next
+    twenty missing assets after each atomic ledger checkpoint, without an
+    offset that becomes stale as records are added.
+    """
+    if batch_size is not None and batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+    selected_ids = set(slot_ids)
+    selected = [
+        item for item in items if not selected_ids or item.slot_id in selected_ids
+    ]
+    if batch_size is None:
+        return selected
+    actionable = [item for item in selected if item.action not in _NO_OP_ACTIONS]
+    return actionable[:batch_size]
+
+
 def _plate_kind_for(slot: Slot) -> tuple[str, bool]:
     """The ffmpeg plate kind for a `plate` slot's `detail`.
 
@@ -700,6 +1222,9 @@ def execute_plan(
     typography: dict | None = None,
     palette: dict | None = None,
     quality: str = "animatic",
+    media_prober: MediaProber | None = None,
+    on_record: RecordCallback | None = None,
+    source_media_by_slot: dict[str, Path] | None = None,
 ) -> tuple[list[AssetRecord], list[Finding]]:
     """Source everything the plan calls for, returning new records and any failures.
 
@@ -715,6 +1240,12 @@ def execute_plan(
     forgot to pass them gets a clear message instead of a card in default
     fonts.
 
+    Every produced path is required to exist and pass a visual-media decode
+    probe before its record is accepted. ``on_record`` runs immediately after
+    that probe for each slot. The CLI uses it to checkpoint the provenance
+    ledger atomically, so an interruption resumes at the next missing slot
+    instead of discarding an otherwise successful batch.
+
     One slot failing (no archival hits, an unresolved hit, a refused
     download, a claims-ledger refusal) never aborts the run: it is recorded
     as a `Finding` with `gate="assets"` and `severity="error"`, and the loop
@@ -726,11 +1257,118 @@ def execute_plan(
     out_dir = Path(out_dir)
     quality = normalize_quality(quality)
     artifacts = artifacts or {}
+    resolved_source_media = {
+        slot_id: Path(path).resolve()
+        for slot_id, path in (source_media_by_slot or {}).items()
+    }
+    source_image_cache: dict[str, Path] = {}
     slots_by_id = {slot.slot_id: slot for slot in slots}
     resolved_now = now if now is not None else datetime.now(timezone.utc)
 
     records: list[AssetRecord] = []
     findings: list[Finding] = []
+
+    def accept_record(record: AssetRecord) -> bool:
+        path = Path(record.local_path)
+        if not media_is_usable(path, media_prober):
+            slot_list = ", ".join(record.used_in_slots) or "no slot"
+            findings.append(
+                Finding(
+                    gate="assets",
+                    severity="error",
+                    message=(
+                        f"Produced asset {record.asset_id!r} for {slot_list} did "
+                        f"not leave decodable media at {str(path)!r}; provenance "
+                        "was not recorded."
+                    ),
+                )
+            )
+            return False
+        records.append(record)
+        for slot_id in record.used_in_slots:
+            resolved_source_media[slot_id] = Path(record.local_path).resolve()
+        if on_record is not None:
+            on_record(record)
+        return True
+
+    def retained_source_image(url: str) -> Path:
+        cached = source_image_cache.get(url)
+        if cached is not None and cached.is_file() and cached.stat().st_size > 0:
+            return cached
+        cache_dir = out_dir / ".sourcecache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
+        destination = cache_dir / f"{digest}.image"
+        if not destination.is_file() or destination.stat().st_size <= 0:
+            body = capture.fetch_source_bytes(url, capture_transport)
+            temporary = cache_dir / f".{digest}.part"
+            temporary.write_bytes(body)
+            os.replace(temporary, destination)
+        source_image_cache[url] = destination
+        return destination
+
+    # Capturing a page is much more expensive than deriving a slot-length file
+    # from an already captured still. Reuse is strictly opt-in through an
+    # explicit capture-spec fingerprint; URL equality by itself is unsafe.
+    # Each slot still receives a distinct output and asset_id.
+    shoot_durations: dict[tuple[str, str, str], float] = {}
+    for planned in items:
+        if planned.action != "shoot":
+            continue
+        binding = artifacts.get(planned.slot_id)
+        if not binding:
+            continue
+        artifact = _artifact_from_binding(planned.slot_id, binding)
+        planned_slot = slots_by_id.get(planned.slot_id)
+        if planned_slot is None:
+            continue
+        if _artifact_policy_block(artifact, planned_slot, planned.action) is not None:
+            continue
+        key = _capture_reuse_key(artifact, quality)
+        if key is None:
+            continue
+        shoot_durations[key] = max(
+            shoot_durations.get(key, 0.0), planned_slot.hold_seconds
+        )
+    capture_cache: dict[tuple[str, str, str], tuple[Path, object, str]] = {}
+
+    # Several evidence slots can point at different DOM targets on one archived
+    # page.  They must not share pixels by URL -- every authored CaptureSpec is
+    # still resolved and captured independently -- but opening that exact page
+    # once is both faster and gentler on rate-limited archives.  Build batches
+    # only for targeted browser captures without an explicit identical-spec
+    # fingerprint; the existing fingerprint cache below keeps its established
+    # semantics.
+    targeted_slots_by_url: dict[str, list[str]] = {}
+    for planned in items:
+        if planned.action != "shoot":
+            continue
+        binding = artifacts.get(planned.slot_id)
+        planned_slot = slots_by_id.get(planned.slot_id)
+        if not binding or planned_slot is None:
+            continue
+        artifact = _artifact_from_binding(planned.slot_id, binding)
+        if _artifact_policy_block(artifact, planned_slot, planned.action) is not None:
+            continue
+        strategy = str(artifact.capture_strategy or "").strip().lower()
+        if (
+            strategy
+            or artifact.source_video_slot
+            or artifact.capture_spec_fingerprint
+        ):
+            continue
+        capture_spec = capture.CaptureSpec.from_value(artifact.capture_spec)
+        if not capture_spec.needs_browser_control:
+            continue
+        targeted_slots_by_url.setdefault(artifact.url, []).append(planned.slot_id)
+    targeted_slots_by_url = {
+        url: slot_ids
+        for url, slot_ids in targeted_slots_by_url.items()
+        if len(slot_ids) > 1
+    }
+    shared_capture_started: set[str] = set()
+    shared_capture_results: dict[str, capture.CaptureResult] = {}
+    shared_capture_errors: dict[str, str] = {}
 
     for item in items:
         if item.action in _NO_OP_ACTIONS:
@@ -766,7 +1404,7 @@ def execute_plan(
                     f"({', '.join(PLATE_KINDS)}); defaulted to 'grain'"
                 )
 
-            records.append(
+            accept_record(
                 AssetRecord(
                     asset_id=f"plate-{slot.slot_id}",
                     tier="atmospheric",
@@ -784,6 +1422,10 @@ def execute_plan(
         if item.action == "draw":
             spec, card_findings = cards.spec_for_slot(slot)
             findings.extend(card_findings)
+            if any(
+                finding.severity == "error" for finding in card_findings
+            ):
+                continue
             production_note = cards.production_note_reason(slot.detail, spec)
             if quality == "final" and production_note:
                 findings.append(
@@ -829,7 +1471,7 @@ def execute_plan(
                 )
                 continue
 
-            records.append(
+            accept_record(
                 AssetRecord(
                     asset_id=f"card-{slot.slot_id}",
                     tier="atmospheric",
@@ -871,21 +1513,307 @@ def execute_plan(
                 continue
             url = artifact.url
             out_path = out_dir / f"{slot.slot_id}-capture.mp4"
-            try:
-                result = capture.capture_to_video(
-                    url, out_path, slot.hold_seconds, out_dir / ".capturework",
-                    runner=capture_runner, transport=capture_transport,
-                    quality=quality,
+            strategy = str(artifact.capture_strategy or "").strip().lower()
+            if strategy in LOCAL_EVIDENCE_CARD_STRATEGIES:
+                if typography is None or palette is None:
+                    findings.append(
+                        Finding(
+                            gate="assets",
+                            severity="error",
+                            message=(
+                                f"Evidence-card fallback for slot "
+                                f"{slot.slot_id!r} needs the style typography "
+                                "and palette."
+                            ),
+                        )
+                    )
+                    continue
+                primary_text = _citation_card_primary_text(
+                    slot.detail, artifact.capture_note
                 )
-            except RuntimeError as exc:
-                findings.append(
-                    Finding(
-                        gate="assets",
-                        severity="error",
-                        message=f"Capture failed for slot {slot.slot_id!r}: {exc}",
+                context = (
+                    artifact.date
+                    or (
+                        (
+                            "CURRENT CONTEXT · ACCESSED "
+                            f"{resolved_now.strftime('%d %b %Y').upper()}"
+                        )
+                        if "current" in strategy or "manual" in strategy
+                        else artifact.source_role.replace("-", " ").upper()
+                    )
+                )
+                spec = cards.CardSpec(
+                    kind="document",
+                    heading=artifact.title or urlparse(url).netloc or "SOURCE",
+                    duration=slot.hold_seconds,
+                    items=tuple(
+                        value
+                        for value in (
+                            primary_text,
+                            context,
+                            f"SOURCE · {urlparse(url).netloc}",
+                        )
+                        if value
+                    ),
+                    disclosure=EVIDENCE_CARD_DISCLOSURE,
+                )
+                try:
+                    cards.build_card(
+                        spec,
+                        out_path,
+                        typography,
+                        palette,
+                        grade,
+                        out_dir / ".cardwork",
+                    )
+                except RuntimeError as exc:
+                    findings.append(
+                        Finding(
+                            gate="assets",
+                            severity="error",
+                            message=(
+                                f"Evidence-card fallback failed for slot "
+                                f"{slot.slot_id!r}: {exc}"
+                            ),
+                        )
+                    )
+                    continue
+                accept_record(
+                    AssetRecord(
+                        asset_id=f"capture-{slot.slot_id}",
+                        tier="primary",
+                        provider="rabbithole-evidence-card",
+                        original_url=url,
+                        license="commentary-use",
+                        retrieved_at=_iso_utc(resolved_now),
+                        local_path=str(out_path),
+                        used_in_slots=(slot.slot_id,),
+                        notes=_join_notes(
+                            "local attributed citation-card fallback; manual review required",
+                            _artifact_provenance_note(artifact),
+                        ),
                     )
                 )
                 continue
+            if strategy in SOURCE_IMAGE_STRATEGIES:
+                try:
+                    source_path = retained_source_image(url)
+                    image_video.derive_source_image_video(
+                        source_path,
+                        out_path,
+                        duration=slot.hold_seconds,
+                        crop=artifact.source_image_crop,
+                        attribution=artifact.source_attribution or artifact.title,
+                        date_label=artifact.source_date_label or artifact.date,
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    findings.append(
+                        Finding(
+                            gate="assets",
+                            severity="error",
+                            message=(
+                                f"Source-image derivation failed for slot "
+                                f"{slot.slot_id!r}: {exc}"
+                            ),
+                        )
+                    )
+                    continue
+                accept_record(
+                    AssetRecord(
+                        asset_id=f"capture-{slot.slot_id}",
+                        tier="primary",
+                        provider="rabbithole-source-image",
+                        original_url=url,
+                        license=artifact.source_license.strip(),
+                        retrieved_at=_iso_utc(resolved_now),
+                        local_path=str(out_path),
+                        used_in_slots=(slot.slot_id,),
+                        notes=_join_notes(
+                            "retained licensed source-image crop",
+                            _artifact_provenance_note(artifact),
+                        ),
+                    )
+                )
+                continue
+            if artifact.source_video_slot:
+                source_path = resolved_source_media.get(artifact.source_video_slot)
+                if source_path is None:
+                    findings.append(
+                        Finding(
+                            gate="assets",
+                            severity="error",
+                            message=(
+                                f"Source-frame derivation for slot {slot.slot_id!r} "
+                                f"requires retained source-video slot "
+                                f"{artifact.source_video_slot!r}, but no validated "
+                                "media record for it is available."
+                            ),
+                        )
+                    )
+                    continue
+                try:
+                    frame_video.derive_source_frame_video(
+                        source_path,
+                        out_path,
+                        timestamp=float(artifact.source_frame_timestamp),
+                        duration=slot.hold_seconds,
+                        crop=artifact.source_frame_crop,
+                        attribution=artifact.source_attribution or artifact.title,
+                        date_label=artifact.source_date_label or artifact.date,
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    findings.append(
+                        Finding(
+                            gate="assets",
+                            severity="error",
+                            message=(
+                                f"Source-frame derivation failed for slot "
+                                f"{slot.slot_id!r}: {exc}"
+                            ),
+                        )
+                    )
+                    continue
+                accept_record(
+                    AssetRecord(
+                        asset_id=f"capture-{slot.slot_id}",
+                        tier="primary",
+                        provider="rabbithole-source-frame",
+                        original_url=url,
+                        license="commentary-use",
+                        retrieved_at=_iso_utc(resolved_now),
+                        local_path=str(out_path),
+                        used_in_slots=(slot.slot_id,),
+                        notes=_join_notes(
+                            (
+                                "silent retained source frame at "
+                                f"{float(artifact.source_frame_timestamp):.3f}s"
+                            ),
+                            _artifact_provenance_note(artifact),
+                        ),
+                    )
+                )
+                continue
+            reuse_note = ""
+            shared_slot_ids = targeted_slots_by_url.get(url)
+            if shared_slot_ids is not None:
+                if url not in shared_capture_started:
+                    shared_capture_started.add(url)
+                    probe_transport = capture.memoized_transport(capture_transport)
+                    with capture.shared_page_capture() as targeted_capture:
+                        for shared_slot_id in shared_slot_ids:
+                            shared_slot = slots_by_id[shared_slot_id]
+                            shared_artifact = _artifact_from_binding(
+                                shared_slot_id, artifacts[shared_slot_id]
+                            )
+                            shared_out_path = (
+                                out_dir / f"{shared_slot_id}-capture.mp4"
+                            )
+                            try:
+                                shared_capture_results[shared_slot_id] = (
+                                    capture.capture_to_video(
+                                        shared_artifact.url,
+                                        shared_out_path,
+                                        shared_slot.hold_seconds,
+                                        out_dir / ".capturework",
+                                        runner=capture_runner,
+                                        transport=probe_transport,
+                                        quality=quality,
+                                        spec=shared_artifact.capture_spec,
+                                        targeted_capture=targeted_capture,
+                                    )
+                                )
+                            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                                shared_capture_errors[shared_slot_id] = str(exc)
+                shared_error = shared_capture_errors.get(slot.slot_id)
+                if shared_error is not None:
+                    findings.append(
+                        Finding(
+                            gate="assets",
+                            severity="error",
+                            message=(
+                                f"Capture failed for slot {slot.slot_id!r}: "
+                                f"{shared_error}"
+                            ),
+                        )
+                    )
+                    continue
+                result = shared_capture_results.get(slot.slot_id)
+                if result is None:
+                    findings.append(
+                        Finding(
+                            gate="assets",
+                            severity="error",
+                            message=(
+                                f"Capture failed for slot {slot.slot_id!r}: "
+                                "shared page batch returned no result"
+                            ),
+                        )
+                    )
+                    continue
+            else:
+                capture_key = _capture_reuse_key(artifact, quality)
+                cached = (
+                    capture_cache.get(capture_key)
+                    if capture_key is not None
+                    else None
+                )
+                if cached is not None and cached[0].is_file():
+                    cached_path, result, source_slot_id = cached
+                    try:
+                        if cached_path.resolve() != out_path.resolve():
+                            out_path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(cached_path, out_path)
+                        reuse_note = (
+                            f"source capture reused in-batch from slot "
+                            f"{source_slot_id!r}"
+                        )
+                    except OSError as exc:
+                        findings.append(
+                            Finding(
+                                gate="assets",
+                                severity="error",
+                                message=(
+                                    f"Capture reuse failed for slot "
+                                    f"{slot.slot_id!r}: {exc}"
+                                ),
+                            )
+                        )
+                        continue
+                else:
+                    try:
+                        requested_duration = (
+                            shoot_durations.get(capture_key, slot.hold_seconds)
+                            if capture_key is not None
+                            else slot.hold_seconds
+                        )
+                        result = capture.capture_to_video(
+                            url,
+                            out_path,
+                            requested_duration,
+                            out_dir / ".capturework",
+                            runner=capture_runner,
+                            transport=capture_transport,
+                            quality=quality,
+                            spec=artifact.capture_spec,
+                        )
+                    except RuntimeError as exc:
+                        findings.append(
+                            Finding(
+                                gate="assets",
+                                severity="error",
+                                message=(
+                                    f"Capture failed for slot "
+                                    f"{slot.slot_id!r}: {exc}"
+                                ),
+                            )
+                        )
+                        continue
+                    if capture_key is not None:
+                        capture_cache[capture_key] = (
+                            out_path,
+                            result,
+                            slot.slot_id,
+                        )
 
             for warning in result.warnings:
                 findings.append(
@@ -898,8 +1826,18 @@ def execute_plan(
                     f"; capture QA grey_stddev={result.inspection.grey_stddev:.2f}, "
                     f"distinct_grey_levels={result.inspection.distinct_grey_levels}"
                 )
+            framing_note = ""
+            if result.framing is not None:
+                framing_note = (
+                    "browser_framing="
+                    + json.dumps(
+                        result.framing.to_dict(),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
 
-            records.append(
+            accept_record(
                 AssetRecord(
                     asset_id=f"capture-{slot.slot_id}",
                     tier="primary",
@@ -911,6 +1849,8 @@ def execute_plan(
                     used_in_slots=(slot.slot_id,),
                     notes=_join_notes(
                         f"{result.kind} capture{inspection_note}",
+                        framing_note,
+                        reuse_note,
                         _artifact_provenance_note(artifact),
                     ),
                 )
@@ -981,7 +1921,7 @@ def execute_plan(
                 resolved, f"archival-{slot.slot_id}", out_path, now=resolved_now
             )
             fields["used_in_slots"] = (slot.slot_id,)
-            records.append(AssetRecord(**fields))
+            accept_record(AssetRecord(**fields))
             continue
 
         if item.action == "fetch":
@@ -1036,7 +1976,7 @@ def execute_plan(
                 str(fields.get("notes", "")),
                 _artifact_provenance_note(artifact),
             )
-            records.append(AssetRecord(**fields))
+            accept_record(AssetRecord(**fields))
             continue
 
     return records, findings

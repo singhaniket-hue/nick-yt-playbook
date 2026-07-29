@@ -64,8 +64,10 @@ SOURCE_RUNNER_SCRIPT = (
     Path(__file__).resolve().parents[1] / "scripts" / "rabbithole_resolve_runner.py"
 )
 
-JOB_STATES = frozenset({"queued", "running", "succeeded", "failed"})
-TERMINAL_JOB_STATES = frozenset({"succeeded", "failed"})
+JOB_STATES = frozenset(
+    {"queued", "running", "rendering", "superseded", "succeeded", "failed"}
+)
+TERMINAL_JOB_STATES = frozenset({"superseded", "succeeded", "failed"})
 SUPPORTED_ACTIONS = frozenset({"build", "render", "handoff"})
 _AUTO_TIMELINE_RE = re.compile(r"^AUTO_BUILD_([A-Za-z0-9][A-Za-z0-9_-]{7,63})$")
 _SAFE_SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
@@ -371,6 +373,12 @@ def _enqueue_job_locked(
     if job_path.exists():
         existing = _read_job(job_path)
         _validate_job_fingerprint(existing, project)
+        if existing["action"] == "build" and existing["state"] == "queued":
+            _supersede_older_queued_builds(
+                project,
+                keep_job_id=job_id,
+                keep_created_at=str(existing.get("created_at") or ""),
+            )
         _write_runner_pointer(project, queue_path, job_id)
         result = dict(existing)
         result["queue_file"] = os.fspath(job_path)
@@ -416,6 +424,12 @@ def _enqueue_job_locked(
         stream.flush()
         os.fsync(stream.fileno())
 
+    if action_value == "build":
+        _supersede_older_queued_builds(
+            project,
+            keep_job_id=job_id,
+            keep_created_at=now,
+        )
     pointer = _write_runner_pointer(project, queue_path, job_id)
     _write_status(
         project,
@@ -505,8 +519,10 @@ def _is_legacy_queue_job(path: Path) -> bool:
 
 
 _ALLOWED_TRANSITIONS = {
-    "queued": frozenset({"running"}),
-    "running": frozenset({"succeeded", "failed"}),
+    "queued": frozenset({"running", "superseded"}),
+    "running": frozenset({"rendering", "succeeded", "failed"}),
+    "rendering": frozenset({"succeeded", "failed"}),
+    "superseded": frozenset(),
     "succeeded": frozenset(),
     "failed": frozenset(),
 }
@@ -533,12 +549,49 @@ def _transition_job(
         updated["finished_at"] = None
         updated["error"] = None
         updated["result"] = None
+    elif state == "rendering":
+        updated["finished_at"] = None
+        updated["result"] = _json_clone(result, label="job result")
+        updated["error"] = None
     else:
         updated["finished_at"] = now
         updated["result"] = _json_clone(result, label="job result")
         updated["error"] = _json_clone(error, label="job error") if error else None
     _atomic_write_json(path, updated)
     return updated
+
+
+def _supersede_older_queued_builds(
+    project_root: Path,
+    *,
+    keep_job_id: str,
+    keep_created_at: str,
+) -> None:
+    """Retire only older unclaimed build jobs after a replacement is durable."""
+
+    for path in _queue_files(project_root):
+        if path.stem == keep_job_id or _is_legacy_queue_job(path):
+            continue
+        candidate = _read_job(path)
+        _validate_job_fingerprint(candidate, project_root)
+        if candidate["action"] != "build" or candidate["state"] != "queued":
+            continue
+        candidate_created_at = candidate.get("created_at")
+        if (
+            not isinstance(candidate_created_at, str)
+            or not keep_created_at
+            or candidate_created_at >= keep_created_at
+        ):
+            continue
+        _transition_job(
+            path,
+            candidate,
+            "superseded",
+            result={
+                "reason": "newer_build_enqueued",
+                "superseded_by": keep_job_id,
+            },
+        )
 
 
 def _queue_files(
@@ -1942,6 +1995,42 @@ def _render_settings(
     return settings
 
 
+_RENDER_COMPLETE_STATUSES = frozenset({"complete", "completed"})
+_RENDER_FAILED_STATUSES = frozenset({"failed", "cancelled", "canceled"})
+_RENDER_ACTIVE_STATUSES = frozenset(
+    {"ready", "rendering", "running", "queued", "pending", "waiting", "in_progress"}
+)
+
+
+def _normalized_render_status(value: Any) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+
+
+def _render_job_status(
+    project: Any,
+    render_job_id: str,
+) -> tuple[str, Mapping[str, Any] | None]:
+    method = getattr(project, "GetRenderJobStatus", None)
+    if not callable(method):
+        return "", None
+    try:
+        detail = method(render_job_id)
+    except Exception as exc:
+        raise ResolveExecutionError(
+            f"GetRenderJobStatus({render_job_id!r}) failed: {exc}"
+        ) from exc
+    if detail in (None, False):
+        return "", None
+    if not isinstance(detail, Mapping):
+        raise ResolveExecutionError(
+            f"GetRenderJobStatus({render_job_id!r}) returned {detail!r}"
+        )
+    raw_status = detail.get("JobStatus", detail.get("job_status"))
+    return _normalized_render_status(raw_status), detail
+
+
 def execute_render(
     resolve: Any,
     plan: Mapping[str, Any] | os.PathLike[str] | str,
@@ -2041,6 +2130,14 @@ def execute_render(
             )
         deadline = time.monotonic() + timeout
         while True:
+            job_status, _ = _render_job_status(project, str(render_job_id))
+            if job_status in _RENDER_COMPLETE_STATUSES:
+                status = "complete"
+                break
+            if job_status in _RENDER_FAILED_STATUSES:
+                raise ResolveExecutionError(
+                    f"Resolve render ended with status {job_status!r}"
+                )
             checker = getattr(project, "IsRenderingInProgress", None)
             if not callable(checker):
                 raise ResolveExecutionError(
@@ -2052,19 +2149,12 @@ def execute_render(
                     f"cannot wait for render: render state is {observed!r}"
                 )
             if not observed:
-                status = "completed_unverified"
-                status_method = getattr(project, "GetRenderJobStatus", None)
-                if callable(status_method):
-                    detail = status_method(render_job_id)
-                    if isinstance(detail, Mapping):
-                        job_status = str(detail.get("JobStatus", "")).lower()
-                        if job_status == "complete":
-                            status = "complete"
-                        elif job_status in {"failed", "cancelled", "canceled"}:
-                            raise ResolveExecutionError(
-                                f"Resolve render ended with status {job_status!r}"
-                            )
-                break
+                observed_label = job_status or "unavailable"
+                raise ResolveExecutionError(
+                    "Resolve stopped rendering without positively reporting "
+                    f"Complete for job {render_job_id!r}; observed status "
+                    f"{observed_label!r}"
+                )
             if time.monotonic() >= deadline:
                 raise ResolveBusyError(
                     f"render {render_job_id!r} remains active after {timeout:g}s"
@@ -2086,6 +2176,117 @@ def _job_error(exc: BaseException) -> dict[str, Any]:
         "type": type(exc).__name__,
         "message": str(exc),
     }
+
+
+def _rendering_job_result(job: Mapping[str, Any]) -> dict[str, Any]:
+    result = job.get("result")
+    if not isinstance(result, Mapping):
+        raise QueueError(
+            f"rendering job {job.get('job_id')!r} has no durable render result"
+        )
+    render_job_id = result.get("render_job_id")
+    if not isinstance(render_job_id, str) or not render_job_id:
+        raise QueueError(
+            f"rendering job {job.get('job_id')!r} has no Resolve render job ID"
+        )
+    return dict(result)
+
+
+def _persist_rendering_observation(
+    path: Path,
+    job: Mapping[str, Any],
+    result: Mapping[str, Any],
+    render_status: str,
+) -> dict[str, Any]:
+    updated = dict(job)
+    observed_result = dict(result)
+    observed_result["render_status"] = render_status
+    updated["result"] = _json_clone(observed_result, label="job result")
+    updated["updated_at"] = utc_now()
+    updated["finished_at"] = None
+    updated["error"] = None
+    _atomic_write_json(path, updated)
+    return updated
+
+
+def _reconcile_rendering_job(
+    path: Path,
+    job: Mapping[str, Any],
+    project: Any,
+) -> tuple[dict[str, Any], str]:
+    """Reconcile one durable render without inferring success from idleness."""
+
+    result = _rendering_job_result(job)
+    expected_project = result.get("project_name")
+    actual_project = project_name(project)
+    if (
+        isinstance(expected_project, str)
+        and expected_project
+        and expected_project != actual_project
+    ):
+        raise ResolveBusyError(
+            f"render job {job.get('job_id')!r} belongs to project "
+            f"{expected_project!r}, but {actual_project!r} is currently open"
+        )
+
+    render_job_id = str(result["render_job_id"])
+    observed_status, _ = _render_job_status(project, render_job_id)
+    if observed_status in _RENDER_COMPLETE_STATUSES:
+        result["render_status"] = "complete"
+        return (
+            _transition_job(path, job, "succeeded", result=result),
+            "succeeded",
+        )
+    if observed_status in _RENDER_FAILED_STATUSES:
+        result["render_status"] = observed_status
+        failure = _job_error(
+            ResolveExecutionError(
+                f"Resolve render {render_job_id!r} ended with status "
+                f"{observed_status!r}"
+            )
+        )
+        return (
+            _transition_job(
+                path,
+                job,
+                "failed",
+                result=result,
+                error=failure,
+            ),
+            "failed",
+        )
+
+    checker = getattr(project, "IsRenderingInProgress", None)
+    if not callable(checker):
+        raise ResolveExecutionError(
+            "cannot reconcile render: IsRenderingInProgress() is unavailable"
+        )
+    try:
+        active = checker()
+    except Exception as exc:
+        raise ResolveExecutionError(
+            f"IsRenderingInProgress() failed during reconciliation: {exc}"
+        ) from exc
+    if not isinstance(active, bool):
+        raise ResolveExecutionError(
+            f"cannot reconcile render: render state is {active!r}"
+        )
+
+    if active:
+        status = (
+            observed_status
+            if observed_status in _RENDER_ACTIVE_STATUSES
+            else "rendering"
+        )
+    else:
+        # Resolve being idle proves only that no render is currently running.
+        # Preserve the nonterminal state until this exact job reports Complete,
+        # Failed, or Cancelled.
+        status = observed_status or "completion_unverified"
+    return (
+        _persist_rendering_observation(path, job, result, status),
+        "rendering",
+    )
 
 
 def _execute_job(
@@ -2219,6 +2420,143 @@ def run_pending_jobs(
         write_roots=declared_write_roots,
         allow_external_write_roots=allow_external_roots,
     ) as lock:
+        rendering_candidates: list[tuple[Path, dict[str, Any]]] = []
+        for path in files:
+            candidate = _read_job(path)
+            _validate_job_fingerprint(candidate, root)
+            if candidate["state"] == "rendering":
+                rendering_candidates.append((path, candidate))
+
+        if rendering_candidates:
+            try:
+                if connection is None:
+                    connection = connect_resolve(
+                        resolve=resolve,
+                        app=app,
+                        allow_studio_external=allow_studio_external,
+                        studio_external_adapter=studio_external_adapter,
+                    )
+                manager = get_project_manager(connection.resolve)
+                current = get_current_project(manager)
+                if current is None:
+                    raise ResolveExecutionError(
+                        "no current Resolve project; cannot reconcile render"
+                    )
+            except (
+                ResolveUnavailableError,
+                ResolveBusyError,
+                ResolveApiError,
+                ResolveExecutionError,
+            ) as exc:
+                active_job = str(rendering_candidates[0][1]["job_id"])
+                _write_status(
+                    root,
+                    state="rendering",
+                    active_job=active_job,
+                    last_job=active_job,
+                    detail="awaiting_render_reconciliation",
+                    error=_job_error(exc),
+                )
+                return [dict(candidate) for _, candidate in rendering_candidates]
+
+            unresolved: list[dict[str, Any]] = []
+            unresolved_errors: dict[str, dict[str, Any]] = {}
+            reconciliation_failed = False
+            for path, candidate in rendering_candidates:
+                try:
+                    reconciled, outcome = _reconcile_rendering_job(
+                        path, candidate, current
+                    )
+                except (
+                    ResolveBusyError,
+                    ResolveApiError,
+                    ResolveExecutionError,
+                    QueueError,
+                ) as exc:
+                    unresolved.append(dict(candidate))
+                    unresolved_errors[str(candidate["job_id"])] = _job_error(exc)
+                    continue
+                results.append(dict(reconciled))
+                if outcome == "rendering":
+                    unresolved.append(reconciled)
+                elif outcome == "failed":
+                    reconciliation_failed = True
+                    _write_status(
+                        root,
+                        state="failed",
+                        active_job=None,
+                        last_job=str(candidate["job_id"]),
+                        detail="render_failed",
+                        project_name_value=(
+                            reconciled.get("result", {}).get("project_name")
+                            if isinstance(reconciled.get("result"), Mapping)
+                            else None
+                        ),
+                        timeline_name=(
+                            reconciled.get("result", {}).get("timeline_name")
+                            if isinstance(reconciled.get("result"), Mapping)
+                            else None
+                        ),
+                        error=(
+                            reconciled.get("error")
+                            if isinstance(reconciled.get("error"), Mapping)
+                            else None
+                        ),
+                    )
+                else:
+                    _write_status(
+                        root,
+                        state="succeeded",
+                        active_job=None,
+                        last_job=str(candidate["job_id"]),
+                        detail="render_succeeded",
+                        project_name_value=(
+                            reconciled.get("result", {}).get("project_name")
+                            if isinstance(reconciled.get("result"), Mapping)
+                            else None
+                        ),
+                        timeline_name=(
+                            reconciled.get("result", {}).get("timeline_name")
+                            if isinstance(reconciled.get("result"), Mapping)
+                            else None
+                        ),
+                    )
+            if unresolved:
+                active = unresolved[0]
+                active_result = active.get("result")
+                active_error = unresolved_errors.get(str(active["job_id"]))
+                _write_status(
+                    root,
+                    state="rendering",
+                    active_job=str(active["job_id"]),
+                    last_job=str(active["job_id"]),
+                    detail=(
+                        "render_reconciliation_blocked"
+                        if active_error is not None
+                        else (
+                            "render_in_progress"
+                            if isinstance(active_result, Mapping)
+                            and active_result.get("render_status")
+                            in _RENDER_ACTIVE_STATUSES
+                            else "render_completion_unverified"
+                        )
+                    ),
+                    project_name_value=(
+                        active_result.get("project_name")
+                        if isinstance(active_result, Mapping)
+                        else None
+                    ),
+                    timeline_name=(
+                        active_result.get("timeline_name")
+                        if isinstance(active_result, Mapping)
+                        else None
+                    ),
+                    error=active_error,
+                )
+                return results or [dict(item) for item in unresolved]
+            if reconciliation_failed:
+                return results
+
         # A previous process cannot still own this lock.  Preserve interrupted
         # jobs as failed diagnostics; do not silently rerun them.
         for path in files:
@@ -2298,6 +2636,33 @@ def run_pending_jobs(
                 result = _execute_job(
                     connection, root, running, loaded_path, plan, lock
                 )
+                if (
+                    job["action"] == "render"
+                    and isinstance(result, Mapping)
+                    and result.get("render_status") == "started"
+                ):
+                    rendering = _transition_job(
+                        path, running, "rendering", result=result
+                    )
+                    results.append(dict(rendering))
+                    _write_status(
+                        root,
+                        state="rendering",
+                        active_job=job["job_id"],
+                        last_job=job["job_id"],
+                        detail="render_in_progress",
+                        project_name_value=(
+                            result.get("project_name")
+                            if isinstance(result, Mapping)
+                            else None
+                        ),
+                        timeline_name=(
+                            result.get("timeline_name")
+                            if isinstance(result, Mapping)
+                            else None
+                        ),
+                    )
+                    break
                 completed = _transition_job(
                     path, running, "succeeded", result=result
                 )
@@ -2319,10 +2684,6 @@ def run_pending_jobs(
                         else None
                     ),
                 )
-                # StartRendering is asynchronous.  Never claim another job while
-                # that new render may be active.
-                if job["action"] == "render":
-                    break
             except Exception as exc:
                 failure = _job_error(exc)
                 failed = _transition_job(

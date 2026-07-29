@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
+import warnings
 import zipfile
 
 import pytest
 
+import rabbithole.resolve_handoff as resolve_handoff
 from rabbithole.resolve_handoff import (
     HandoffValidationError,
     ResolveHandoffError,
@@ -223,6 +226,37 @@ def test_handoff_refuses_wrong_current_project_timeline_before_archive(
     assert resolve.manager.archive_calls == []
 
 
+def test_handoff_refuses_timeline_with_wrong_immutable_identity_before_archive(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "episode"
+    project.mkdir()
+    current = FakeProject()
+    generated = current.timelines[-1]
+    generated.GetMarkers = lambda: {
+        0: {
+            "customData": json.dumps(
+                {
+                    "schema": "rabbithole.resolve-marker.v1",
+                    "build_id": "b-111111111111",
+                }
+            )
+        }
+    }
+    resolve = FakeResolve(current)
+
+    with pytest.raises(ResolveHandoffError, match="no RabbitHole marker"):
+        package_handoff(
+            project,
+            resolve=resolve,
+            plan=_plan(project),
+            destination=tmp_path / "handoffs",
+        )
+
+    assert resolve.manager.archive_calls == []
+    assert resolve.manager.export_calls == []
+
+
 def test_active_render_and_insufficient_space_fail_before_archive(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -311,3 +345,194 @@ def test_external_output_root_and_zip_slip_are_rejected(tmp_path: Path) -> None:
         archive.writestr("../escape.txt", "no")
     with pytest.raises(HandoffValidationError, match="unsafe path"):
         validate_handoff(malicious)
+
+
+def test_zip_writer_streams_files_and_stores_precompressed_media(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "package"
+    source.mkdir()
+    (source / "project.dra").mkdir()
+    (source / "project.dra" / "source.mp4").write_bytes(b"m" * 4096)
+    (source / "README.txt").write_text("compressible text " * 100)
+    target = tmp_path / "handoff.zip"
+
+    def refuse_read_bytes(self):
+        raise AssertionError(f"_zip_tree must stream instead of read_bytes: {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", refuse_read_bytes)
+    resolve_handoff._zip_tree(source, target, "RABBITHOLE_HANDOFF_TEST")
+
+    with zipfile.ZipFile(target) as archive:
+        media = archive.getinfo(
+            "RABBITHOLE_HANDOFF_TEST/project.dra/source.mp4"
+        )
+        readme = archive.getinfo("RABBITHOLE_HANDOFF_TEST/README.txt")
+        assert media.compress_type == zipfile.ZIP_STORED
+        assert readme.compress_type == zipfile.ZIP_DEFLATED
+        assert media.file_size == 4096
+
+
+@pytest.mark.parametrize(
+    ("members", "message"),
+    [
+        (
+            [("Root/manifest.json", "{}"), ("sibling.txt", "outside")],
+            "below one exact top-level",
+        ),
+        (
+            [("Root/manifest.json", "{}"), ("Other/file.txt", "outside")],
+            "one exact top-level",
+        ),
+        (
+            [("Root/duplicate.txt", "one"), ("Root/duplicate.txt", "two")],
+            "duplicate handoff ZIP member",
+        ),
+        (
+            [("Root/Clip.mov", "one"), ("Root/clip.mov", "two")],
+            "collide on a case-insensitive",
+        ),
+        (
+            [("Root/CON.txt", "reserved")],
+            "Windows-reserved",
+        ),
+        (
+            [("Root/Cafe\u0301.txt", "not NFC")],
+            "NFC-normalized",
+        ),
+    ],
+)
+def test_zip_layout_rejects_siblings_duplicates_and_nonportable_names(
+    tmp_path: Path,
+    members: list[tuple[str, str]],
+    message: str,
+) -> None:
+    package = tmp_path / "invalid.zip"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(package, "w") as archive:
+            for name, payload in members:
+                archive.writestr(name, payload)
+
+    with pytest.raises(HandoffValidationError, match=message):
+        validate_handoff(package)
+
+
+def test_package_rejects_non_nfc_source_names_before_publication(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "package"
+    source.mkdir()
+    (source / "Cafe\u0301.txt").write_text("decomposed")
+
+    with pytest.raises(HandoffValidationError, match="NFC-normalized"):
+        resolve_handoff._zip_tree(
+            source,
+            tmp_path / "handoff.zip",
+            "RABBITHOLE_HANDOFF_TEST",
+        )
+    assert not (tmp_path / "handoff.zip").exists()
+
+
+@pytest.mark.parametrize("fail_suffix", [".zip", ".zip.sha256"])
+def test_package_rolls_back_all_promoted_artifacts_when_publish_fails(
+    tmp_path: Path,
+    monkeypatch,
+    fail_suffix: str,
+) -> None:
+    project = tmp_path / "episode"
+    project.mkdir()
+    output = tmp_path / "handoffs"
+    expected_failure = output / f"transaction{fail_suffix}"
+    real_replace = os.replace
+
+    def injected_replace(source, destination):
+        if Path(destination) == expected_failure:
+            raise OSError("injected publication failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(resolve_handoff.os, "replace", injected_replace)
+    with pytest.raises(OSError, match="injected publication failure"):
+        package_handoff(
+            project,
+            resolve=FakeResolve(FakeProject()),
+            plan=_plan(project),
+            destination=output,
+            bundle_name="transaction",
+        )
+
+    assert not (output / "transaction").exists()
+    assert not (output / "transaction.zip").exists()
+    assert not (output / "transaction.zip.sha256").exists()
+    assert not list(output.glob(".rh-*"))
+
+
+@pytest.mark.parametrize("source_kind", ["directory", "zip"])
+def test_restore_validation_failure_leaves_no_partial_destination(
+    tmp_path: Path,
+    monkeypatch,
+    source_kind: str,
+) -> None:
+    project = tmp_path / "episode"
+    project.mkdir()
+    handoff = package_handoff(
+        project,
+        resolve=FakeResolve(FakeProject()),
+        plan=_plan(project),
+        destination=tmp_path / "handoffs",
+    )
+    source = (
+        handoff["package_directory"]
+        if source_kind == "directory"
+        else handoff["zip_path"]
+    )
+    target = tmp_path / f"restored-{source_kind}"
+    original_validate = resolve_handoff._validate_directory
+
+    def reject_staging(root, *, hooks, restored_project=None):
+        if any(part.startswith(".rh-restore-") for part in Path(root).parts):
+            raise HandoffValidationError("injected staged validation failure")
+        return original_validate(
+            root,
+            hooks=hooks,
+            restored_project=restored_project,
+        )
+
+    monkeypatch.setattr(resolve_handoff, "_validate_directory", reject_staging)
+    with pytest.raises(
+        HandoffValidationError,
+        match="injected staged validation failure",
+    ):
+        restore_handoff(source, target)
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(".rh-restore-*"))
+
+
+def test_restore_promotion_failure_rolls_back_staging(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "episode"
+    project.mkdir()
+    handoff = package_handoff(
+        project,
+        resolve=FakeResolve(FakeProject()),
+        plan=_plan(project),
+        destination=tmp_path / "handoffs",
+    )
+    target = tmp_path / "restored"
+    real_replace = os.replace
+
+    def injected_replace(source, destination):
+        if Path(destination) == target:
+            raise OSError("injected restore promotion failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(resolve_handoff.os, "replace", injected_replace)
+    with pytest.raises(OSError, match="injected restore promotion failure"):
+        restore_handoff(handoff["zip_path"], target)
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(".rh-restore-*"))

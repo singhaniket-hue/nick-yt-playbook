@@ -27,10 +27,12 @@ archives, and local application state are intentionally excluded from Git.
 - FFmpeg and ffprobe on `PATH` for conforming, generated plates, audio stems,
   verification, and the explicit legacy backend. Subtitle and graphic-card
   generation requires FFmpeg's `ass` filter (libass).
+- `yt-dlp` is installed inside the uv-managed project environment; no separate
+  machine-global installation is required.
 - Chrome, Edge, or Chromium for browser-capture operations
 - Poppler's `pdftoppm` for PDF evidence capture
-- an ElevenLabs API key and voice ID only when using narration or sound
-  generation
+- an ElevenLabs API key when using narration or sound generation; narration
+  additionally requires a voice ID
 
 Resolve Free uses an in-app runner. Resolve Studio may use the external scripting
 bridge. The timeline compiler, queue, safety checks, and handoff format are the
@@ -88,6 +90,20 @@ uv run rabbithole assets projects/my-episode/narration/timing.json
 uv run rabbithole edl projects/my-episode/narration/timing.json
 ```
 
+Long acquisition runs are resumable and may be bounded or selected exactly:
+
+```text
+uv run rabbithole assets projects/my-episode/narration/timing.json --batch-size 20 --quality final
+uv run rabbithole assets projects/my-episode/narration/timing.json --slot s041 --slot s042 --quality final
+uv run python -m rabbithole.contactsheet projects/my-episode/narration/timing.json
+```
+
+Each accepted slot is checkpointed before the next one starts. Repeating a
+batch advances to the next missing work. Replace approved media only through
+an explicit, dry-run-first
+`assets --refresh --slot <id>` transaction; old media is retained under
+project-local quarantine and the audit record remains in provenance.
+
 For a source-bound `capture` or `screenshot` shot, bind the full catalogue
 entry in `research/artifacts.json` with `slot_id`. Existing entries need no new
 fields. When rights require a particular method, set `acquisition_mode` to
@@ -95,6 +111,22 @@ fields. When rights require a particular method, set `acquisition_mode` to
 An optional positive `max_use_seconds` blocks a slot whose full hold exceeds
 the permitted use. The source `title`, `date`, `source_role`, and `rights_note`
 are copied into the retrieved asset's provenance notes.
+
+Catalogue entries can also author target-aware browser captures, intentionally
+identical same-page reuse, or an exact frame derived from retained source
+video. Browser captures reject consent/challenge/error pages and unreadable
+frames instead of recording them. Primary video downloads are conformed to a
+Resolve-portable H.264 MP4 profile and probed before acceptance. See
+[Asset acquisition and visual QA](docs/asset-acquisition-workflow.md) for the
+JSON fields, refresh guarantees, capture rules, contact-sheet review, and
+editable provenance captions.
+
+For an explanatory test-signal diagram, opt in with a graphic detail beginning
+`signal comparison -` and one of `edge baseline`, `processed change`,
+`timing and audio`, or `automated flag`. These cards visibly identify
+themselves as local illustrations of general testing logic and explicitly state
+that they are not Webdriver Torso's published algorithm; they are never source
+evidence.
 
 For voice cloning, `script/05-devanagari.md` is deliberately mixed-script:
 write Hindi words in Devanagari, but keep English words, brands, acronyms, and
@@ -129,6 +161,14 @@ uv run rabbithole resolve preflight projects/my-episode
 uv run rabbithole resolve prepare projects/my-episode
 uv run rabbithole resolve build projects/my-episode
 ```
+
+`prepare` renders immutable, content-addressed A3 music and A4 SFX stems. They
+preserve the approved constant-power bed joins, style-pack levels, cue timing,
+authored silence drops, and the final shared peak-ceiling attenuation when the
+timeline is imported through FCPXML. The raw generated sound library remains
+alongside them for editor replacements. Source-audio bites currently require
+the FFmpeg renderer because their narration/music duck automation is not yet
+represented by the Resolve stem handoff.
 
 For Resolve Free, `build` prints a one-line Python loader. Open the intended
 project, paste the loader into `Workspace > Console`, and press Enter. You can
@@ -180,8 +220,9 @@ uv run rabbithole resolve restore-bundle my-episode.bundle.zip --out projects/my
 
 Run `doctor`, `preflight`, and `prepare` again on the receiving machine. The
 bundle excludes credentials, stale locks/queues, generated Resolve builds, and
-prior renders. After Resolve assembly, use the source-inclusive DRA/DRP handoff
-instead:
+prior renders. It includes only the currently selected immutable A3/A4 stems
+as checksum-verified media inputs, not historical stem revisions. After
+Resolve assembly, use the source-inclusive DRA/DRP handoff instead:
 
 ```text
 uv run rabbithole resolve verify-handoff <handoff.zip>

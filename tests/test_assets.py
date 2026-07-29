@@ -1,8 +1,10 @@
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
+import rabbithole.assets as assets_module
 from rabbithole.assets import (
     ACTION_REASONS,
     KIND_TO_ACTION,
@@ -17,9 +19,16 @@ from rabbithole.assets import (
     format_plan,
     load_artifacts,
     plan_assets,
+    select_plan_items,
+    usable_provenance_records,
 )
 from rabbithole.provenance import AssetRecord, check_provenance
 from rabbithole.slots import Slot
+from rabbithole.sources.capture import (
+    CaptureFraming,
+    CaptureRectangle,
+    CaptureResult,
+)
 
 GRADE = {
     "lut": "style/luts/crowley-noir.cube",
@@ -90,11 +99,94 @@ def _wikimedia_body(pages):
     return json.dumps({"query": {"pages": pages}}).encode("utf-8")
 
 
+def test_citation_card_copy_prefers_authored_sentence_and_strips_marker_metadata():
+    assert (
+        assets_module._citation_card_primary_text(
+            'source=wt-guardian query="mystery" detail=headline and publication date',
+            "The Guardian published the report on 1 May 2014. "
+            "The browser consent layer obscured the retained pixels.",
+        )
+        == "The Guardian published the report on 1 May 2014."
+    )
+    assert (
+        assets_module._citation_card_primary_text(
+            "source=wt-guardian detail=headline and publication date"
+        )
+        == "headline and publication date"
+    )
+
+
 # --- load_artifacts ----------------------------------------------------
 
 
 def test_load_artifacts_missing_file_returns_empty_list(tmp_path):
     assert load_artifacts(tmp_path / "artifacts.json") == []
+
+
+def test_load_artifacts_merges_capture_target_overlay_by_slot(tmp_path):
+    artifact_path = tmp_path / "artifacts.json"
+    artifact_path.write_text(
+        json.dumps(
+            [
+                {
+                    "artifact_id": "source-page-s001",
+                    "url": "https://example.com/article",
+                    "slot_id": "s001",
+                    "acquisition_mode": "screenshot-only",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "capture-targets-archived.json").write_text(
+        json.dumps(
+            {
+                "s001": {
+                    "source": "source-page",
+                    "spec": {"text": "Exact evidence phrase"},
+                    "strategy": "browser-text",
+                    "note": "Verified against the archived DOM.",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    [artifact] = load_artifacts(artifact_path)
+
+    assert artifact.capture_spec == {"text": "Exact evidence phrase"}
+    assert artifact.capture_strategy == "browser-text"
+    assert artifact.capture_note == "Verified against the archived DOM."
+
+
+def test_load_artifacts_rejects_capture_target_source_mismatch(tmp_path):
+    artifact_path = tmp_path / "artifacts.json"
+    artifact_path.write_text(
+        json.dumps(
+            [
+                {
+                    "artifact_id": "source-page-s001",
+                    "url": "https://example.com/article",
+                    "slot_id": "s001",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "capture-targets.json").write_text(
+        json.dumps(
+            {
+                "s001": {
+                    "source": "different-source",
+                    "spec": {"text": "Evidence"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="different-source"):
+        load_artifacts(artifact_path)
 
 
 def test_load_artifacts_parses_the_rich_schema_with_every_field_populated(tmp_path):
@@ -111,6 +203,7 @@ def test_load_artifacts_parses_the_rich_schema_with_every_field_populated(tmp_pa
                     "source_role": "primary",
                     "use": "Establish the actual case and hearing.",
                     "rights_note": "Official public record; retain attribution.",
+                    "source_license": "CC-BY-4.0",
                     "slot_id": "s001",
                     "acquisition_mode": "screenshot-only",
                     "max_use_seconds": 8.5,
@@ -132,6 +225,7 @@ def test_load_artifacts_parses_the_rich_schema_with_every_field_populated(tmp_pa
             source_role="primary",
             use="Establish the actual case and hearing.",
             rights_note="Official public record; retain attribution.",
+            source_license="CC-BY-4.0",
             slot_id="s001",
             acquisition_mode="screenshot-only",
             max_use_seconds=8.5,
@@ -553,6 +647,66 @@ def test_format_plan_with_no_items_does_not_raise():
     assert isinstance(format_plan([]), str)
 
 
+def test_batch_selects_only_the_next_actionable_items():
+    items = [
+        PlanItem("s001", "plate", "atmospheric", "satisfied", "done"),
+        PlanItem("s002", "graphic", "atmospheric", "draw", "draw"),
+        PlanItem("s003", "screenshot", "primary", "blocked", "missing binding"),
+        PlanItem("s004", "capture", "primary", "fetch", "fetch"),
+    ]
+
+    selected = select_plan_items(items, batch_size=2)
+
+    assert [item.slot_id for item in selected] == ["s002", "s004"]
+
+
+def test_exact_slot_filter_composes_with_batch_limit():
+    items = [
+        PlanItem("s001", "graphic", "atmospheric", "draw", "draw"),
+        PlanItem("s002", "graphic", "atmospheric", "draw", "draw"),
+        PlanItem("s003", "graphic", "atmospheric", "draw", "draw"),
+    ]
+
+    selected = select_plan_items(
+        items, slot_ids=("s002", "s003"), batch_size=1
+    )
+
+    assert [item.slot_id for item in selected] == ["s002"]
+
+
+def test_existing_record_without_a_decodable_local_file_does_not_satisfy(tmp_path):
+    record = _record(
+        "missing",
+        local_path="assets/missing.mp4",
+        used_in_slots=("s001",),
+    )
+
+    usable, findings = usable_provenance_records(
+        [record], tmp_path, prober=lambda _path: True
+    )
+
+    assert usable == []
+    assert len(findings) == 1
+    assert "will not satisfy acquisition" in findings[0].message
+
+
+def test_existing_record_must_decode_even_when_the_path_exists(tmp_path):
+    broken = tmp_path / "assets" / "broken.mp4"
+    broken.parent.mkdir()
+    broken.write_bytes(b"not media")
+    record = _record(
+        "broken",
+        local_path="assets/broken.mp4",
+        used_in_slots=("s001",),
+    )
+
+    usable, _findings = usable_provenance_records(
+        [record], tmp_path, prober=lambda _path: False
+    )
+
+    assert usable == []
+
+
 # --- execute_plan: generate (plate) ---------------------------------------
 
 
@@ -579,6 +733,51 @@ def test_generated_plate_records_used_in_slots_contains_exactly_that_slot(tmp_pa
     records, _ = execute_plan(items, [slot], tmp_path, grade=GRADE, claims=[])
 
     assert records[0].used_in_slots == ("s001",)
+
+
+def test_record_callback_runs_immediately_after_each_decodable_output(tmp_path):
+    slots = [
+        _slot("s001", "plate", detail="grain", start=0.0, end=0.2),
+        _slot("s002", "plate", detail="grain", start=0.2, end=0.4),
+    ]
+    seen = []
+
+    records, findings = execute_plan(
+        plan_assets(slots, [], []),
+        slots,
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        on_record=seen.append,
+    )
+
+    assert findings == []
+    assert seen == records
+    assert [record.used_in_slots for record in seen] == [("s001",), ("s002",)]
+
+
+def test_undecodable_output_is_not_recorded_or_checkpointed(tmp_path, monkeypatch):
+    slot = _slot("s001", "plate", detail="grain", start=0.0, end=0.2)
+    monkeypatch.setattr(
+        assets_module,
+        "build_plate",
+        lambda _spec, path, grade: path.write_bytes(b"broken"),
+    )
+    seen = []
+
+    records, findings = execute_plan(
+        plan_assets([slot], [], []),
+        [slot],
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        media_prober=lambda _path: False,
+        on_record=seen.append,
+    )
+
+    assert records == []
+    assert seen == []
+    assert any("provenance was not recorded" in finding.message for finding in findings)
 
 
 def test_valid_plate_kind_in_detail_is_honoured_with_empty_notes(tmp_path):
@@ -649,7 +848,13 @@ def test_execute_plan_sources_an_archival_slot_via_fake_transports(tmp_path):
     )
 
     records, findings = execute_plan(
-        items, [slot], tmp_path, grade=GRADE, claims=[], archive_transport=transport
+        items,
+        [slot],
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        archive_transport=transport,
+        media_prober=lambda _path: True,
     )
 
     assert findings == []
@@ -832,6 +1037,7 @@ def test_fetch_slot_whose_claims_ledger_cites_the_url_yields_a_record(tmp_path):
     ]
 
     def runner(argv):
+        Path(argv[argv.index("-o") + 1]).write_bytes(b"fake video bytes")
         return (0, b"", b"")
 
     records, findings = execute_plan(
@@ -842,6 +1048,7 @@ def test_fetch_slot_whose_claims_ledger_cites_the_url_yields_a_record(tmp_path):
         claims=claims,
         ytdlp_runner=runner,
         ytdlp_prober=lambda p: True,
+        media_prober=lambda _path: True,
         artifacts=artifact_bindings_by_slot(artifact_list),
     )
 
@@ -984,7 +1191,13 @@ def test_execute_plan_records_satisfy_check_provenance_across_mixed_kinds(tmp_pa
     )
 
     records, findings = execute_plan(
-        items, slots, tmp_path, grade=GRADE, claims=[], archive_transport=transport
+        items,
+        slots,
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        archive_transport=transport,
+        media_prober=lambda _path: True,
     )
 
     assert findings == []
@@ -1016,6 +1229,78 @@ def test_evidence_metrics_are_duration_weighted_not_just_a_record_count():
     assert metrics.duration_ratio == pytest.approx(0.10)
     assert metrics.slot_ratio == pytest.approx(0.50)
     assert metrics.evidence_seconds == pytest.approx(1.0)
+    assert metrics.source_pixel_duration_ratio == pytest.approx(0.10)
+    assert metrics.source_pixel_seconds == pytest.approx(1.0)
+
+
+def test_citation_card_is_source_backed_but_not_source_pixel_evidence():
+    slots = [
+        _slot("s001", "screenshot", start=0.0, end=6.0),
+        _slot("s002", "screenshot", start=6.0, end=10.0),
+    ]
+    records = [
+        _record(
+            "citation",
+            tier="primary",
+            provider="rabbithole-evidence-card",
+            used_in_slots=("s001",),
+        ),
+        _record(
+            "capture",
+            tier="primary",
+            provider="web.archive.org",
+            used_in_slots=("s002",),
+        ),
+    ]
+
+    metrics = evidence_metrics(slots, records)
+
+    assert metrics.source_backed_duration_ratio == pytest.approx(1.0)
+    assert metrics.source_backed_seconds == pytest.approx(10.0)
+    assert metrics.source_pixel_duration_ratio == pytest.approx(0.4)
+    assert metrics.source_pixel_seconds == pytest.approx(4.0)
+
+
+def test_citation_cards_cannot_satisfy_final_evidence_gate_by_themselves():
+    slots = [
+        _slot("s001", "screenshot", start=0.0, end=6.0),
+        _slot(
+            "s002",
+            "graphic",
+            detail="testing logic: input | output",
+            start=6.0,
+            end=10.0,
+        ),
+    ]
+    records = [
+        _record(
+            "citation",
+            tier="primary",
+            provider="rabbithole-evidence-card",
+            used_in_slots=("s001",),
+        ),
+        _record(
+            "graphic",
+            tier="atmospheric",
+            provider="rabbithole-cards",
+            original_url="",
+            license="",
+            used_in_slots=("s002",),
+        ),
+    ]
+
+    findings = check_source_quality(slots, records, quality="final")
+
+    assert not any(
+        "Sourced-evidence ratio is" in finding.message
+        for finding in findings
+    )
+    assert any(
+        finding.severity == "error"
+        and "Source-pixel evidence ratio is 0.0%" in finding.message
+        and "citation cards are source-backed only" in finding.message
+        for finding in findings
+    )
 
 
 def test_final_quality_reports_the_measured_evidence_ratio():
@@ -1353,3 +1638,492 @@ def test_a_failed_capture_is_reported_per_slot_and_does_not_abort(tmp_path):
     assert any("Capture failed for slot 's001'" in f.message for f in findings)
     # The plate after it still got generated: one failure does not end the run.
     assert any(r.asset_id == "plate-s002" for r in records)
+
+
+@pytest.mark.parametrize(
+    "fingerprint,expected_capture_calls",
+    [
+        ("", 2),
+        ("same-explicit-capture-spec", 1),
+    ],
+)
+def test_capture_reuse_requires_an_explicit_identical_spec_and_keeps_slot_outputs(
+    tmp_path, monkeypatch, fingerprint, expected_capture_calls
+):
+    slots = [
+        _slot("s001", "screenshot", start=0.0, end=1.0),
+        _slot("s002", "screenshot", start=1.0, end=3.0),
+    ]
+    url = "https://example.com/one-page"
+    artifacts = [
+        _artifact(
+            "a001",
+            url,
+            slot_id="s001",
+            capture_spec_fingerprint=fingerprint,
+        ),
+        _artifact(
+            "a002",
+            url,
+            slot_id="s002",
+            capture_spec_fingerprint=fingerprint,
+        ),
+    ]
+    calls = []
+
+    def fake_capture(_url, out_path, duration, _work_dir, **_kwargs):
+        calls.append((out_path, duration))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"decodable stand-in")
+        return CaptureResult(path=out_path, kind="page")
+
+    monkeypatch.setattr(assets_module.capture, "capture_to_video", fake_capture)
+    records, findings = execute_plan(
+        plan_assets(slots, [], artifacts),
+        slots,
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        artifacts=artifact_bindings_by_slot(artifacts),
+        media_prober=lambda _path: True,
+    )
+
+    assert [finding for finding in findings if finding.severity == "error"] == []
+    assert len(calls) == expected_capture_calls
+    assert [record.asset_id for record in records] == [
+        "capture-s001",
+        "capture-s002",
+    ]
+    assert records[0].local_path != records[1].local_path
+    assert all(Path(record.local_path).exists() for record in records)
+
+
+def test_targeted_same_url_slots_share_one_page_batch_and_keep_distinct_records(
+    tmp_path, monkeypatch
+):
+    slots = [
+        _slot("s001", "screenshot", start=0.0, end=1.0),
+        _slot("s002", "screenshot", start=1.0, end=3.0),
+    ]
+    url = "https://web.archive.org/web/2026/https://example.com/article"
+    specs = [
+        {"full_page": True, "text": "first evidence"},
+        {"full_page": True, "text": "second evidence"},
+    ]
+    artifacts = [
+        _artifact(
+            f"a00{index}",
+            url,
+            slot_id=slot.slot_id,
+            capture_spec=spec,
+        )
+        for index, (slot, spec) in enumerate(zip(slots, specs), start=1)
+    ]
+    page_contexts = []
+    capture_calls = []
+    source_probes = []
+    recorded = []
+    callback = object()
+
+    @contextmanager
+    def fake_shared_page_capture():
+        page_contexts.append("opened")
+        yield callback
+
+    def fake_capture(
+        requested_url, out_path, duration, _work_dir, **kwargs
+    ):
+        capture_calls.append(
+            (
+                requested_url,
+                out_path,
+                duration,
+                kwargs["spec"],
+                kwargs["targeted_capture"],
+            )
+        )
+        # capture_to_video performs this optional probe once per call; the
+        # memoized wrapper supplied by execute_plan must collapse it to one.
+        assert kwargs["transport"](requested_url) == (200, b"<html>source</html>")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(f"video for {out_path.stem}".encode())
+        return CaptureResult(path=out_path, kind="page")
+
+    def transport(requested_url):
+        source_probes.append(requested_url)
+        return 200, b"<html>source</html>"
+
+    monkeypatch.setattr(
+        assets_module.capture,
+        "shared_page_capture",
+        fake_shared_page_capture,
+    )
+    monkeypatch.setattr(
+        assets_module.capture, "capture_to_video", fake_capture
+    )
+
+    records, findings = execute_plan(
+        plan_assets(slots, [], artifacts),
+        slots,
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        artifacts=artifact_bindings_by_slot(artifacts),
+        capture_transport=transport,
+        media_prober=lambda _path: True,
+        on_record=recorded.append,
+    )
+
+    assert [finding for finding in findings if finding.severity == "error"] == []
+    assert page_contexts == ["opened"]
+    assert source_probes == [url]
+    assert [call[3] for call in capture_calls] == specs
+    assert all(call[4] is callback for call in capture_calls)
+    assert [call[2] for call in capture_calls] == [1.0, 2.0]
+    assert [record.asset_id for record in records] == [
+        "capture-s001",
+        "capture-s002",
+    ]
+    assert records == recorded
+    assert records[0].local_path != records[1].local_path
+
+
+def test_invalid_artifact_capture_spec_blocks_before_io():
+    slot = _slot("s001", "screenshot", start=0.0, end=1.0)
+    artifact = _artifact(
+        "a001",
+        "https://example.com/article",
+        slot_id="s001",
+        acquisition_mode="screenshot-only",
+        capture_spec={"scroll_target": {"y": -1}},
+    )
+
+    [item] = plan_assets([slot], [], [artifact])
+
+    assert item.action == "blocked"
+    assert "invalid capture_spec" in item.reason
+    assert "non-negative" in item.reason
+
+
+def test_execute_plan_forwards_authored_capture_spec_and_records_it(
+    tmp_path, monkeypatch
+):
+    slot = _slot("s001", "screenshot", start=0.0, end=1.0)
+    spec = {"text": "Google behind Webdriver Torso mystery"}
+    artifact = _artifact(
+        "a001",
+        "https://example.com/article",
+        slot_id="s001",
+        acquisition_mode="screenshot-only",
+        capture_spec=spec,
+    )
+    calls = []
+
+    def fake_capture(_url, out_path, _duration, _work_dir, **kwargs):
+        calls.append(kwargs)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"decodable stand-in")
+        return CaptureResult(
+            path=out_path,
+            kind="page",
+            framing=CaptureFraming(
+                mode="target",
+                target=CaptureRectangle(100, 200, 300, 50),
+                clip=CaptureRectangle(0, 0, 1920, 1080),
+                content=CaptureRectangle(0, 0, 1920, 4000),
+            ),
+        )
+
+    monkeypatch.setattr(assets_module.capture, "capture_to_video", fake_capture)
+    records, findings = execute_plan(
+        plan_assets([slot], [], [artifact]),
+        [slot],
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        artifacts=artifact_bindings_by_slot([artifact]),
+        media_prober=lambda _path: True,
+    )
+
+    assert [finding for finding in findings if finding.severity == "error"] == []
+    assert calls[0]["spec"] == spec
+    assert '"text":"Google behind Webdriver Torso mystery"' in records[0].notes
+    assert (
+        'browser_framing={"authored_crop":null,"clip":'
+        '{"height":1080,"width":1920,"x":0,"y":0},'
+        '"content":{"height":4000,"width":1920,"x":0,"y":0},'
+        '"mode":"target","target":{"height":50,"width":300,"x":100,"y":200}}'
+        in records[0].notes
+    )
+
+
+def test_source_frame_artifact_requires_a_valid_timestamp():
+    slot = _slot("s002", "screenshot", start=0.0, end=1.0)
+    artifact = _artifact(
+        "a002",
+        "https://www.youtube.com/watch?v=example",
+        slot_id="s002",
+        acquisition_mode="screenshot-only",
+        source_video_slot="s001",
+    )
+
+    [item] = plan_assets([slot], [], [artifact])
+
+    assert item.action == "blocked"
+    assert "source_frame_timestamp" in item.reason
+
+
+def test_execute_plan_derives_source_frame_without_browser_or_network(
+    tmp_path, monkeypatch
+):
+    slot = _slot("s002", "screenshot", start=0.0, end=1.25)
+    artifact = _artifact(
+        "a002",
+        "https://www.youtube.com/watch?v=example",
+        slot_id="s002",
+        acquisition_mode="screenshot-only",
+        source_video_slot="s001",
+        source_frame_timestamp=2.5,
+        source_attribution="Webdriver Torso / YouTube",
+        source_date_label="23 Sep 2013",
+    )
+    source = tmp_path / "s001-capture.mp4"
+    source.write_bytes(b"validated source")
+    calls = []
+
+    def fake_derive(source_path, out_path, **kwargs):
+        calls.append((source_path, out_path, kwargs))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"derived source frame")
+        return out_path
+
+    monkeypatch.setattr(
+        assets_module.frame_video, "derive_source_frame_video", fake_derive
+    )
+    monkeypatch.setattr(
+        assets_module.capture,
+        "capture_to_video",
+        lambda *_args, **_kwargs: pytest.fail("browser capture must not run"),
+    )
+
+    records, findings = execute_plan(
+        plan_assets([slot], [], [artifact]),
+        [slot],
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        artifacts=artifact_bindings_by_slot([artifact]),
+        media_prober=lambda _path: True,
+        source_media_by_slot={"s001": source},
+    )
+
+    assert [finding for finding in findings if finding.severity == "error"] == []
+    assert calls[0][0] == source.resolve()
+    assert calls[0][2]["timestamp"] == 2.5
+    assert calls[0][2]["duration"] == 1.25
+    assert calls[0][2]["attribution"] == "Webdriver Torso / YouTube"
+    assert records[0].provider == "rabbithole-source-frame"
+    assert "source_video_slot='s001'" in records[0].notes
+
+
+def test_execute_plan_builds_local_evidence_card_without_browser(
+    tmp_path, monkeypatch
+):
+    slot = _slot(
+        "s034",
+        "screenshot",
+        detail="current channel identity and access-date context; verify totals manually",
+        start=0.0,
+        end=1.5,
+    )
+    artifact = _artifact(
+        "wt-channel-s034",
+        "https://www.youtube.com/@realwebdrivertorso",
+        title="Webdriver Torso official YouTube channel",
+        date="23 Sep 2013",
+        slot_id="s034",
+        acquisition_mode="screenshot-only",
+        capture_strategy="manual-editorial-card-no-page-capture",
+        capture_note="Dynamic page requires human verification.",
+    )
+    built = []
+
+    def fake_build(spec, out_path, *_args, **_kwargs):
+        built.append(spec)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"evidence card")
+        return out_path
+
+    monkeypatch.setattr(assets_module.cards, "build_card", fake_build)
+    monkeypatch.setattr(
+        assets_module.capture,
+        "capture_to_video",
+        lambda *_args, **_kwargs: pytest.fail("browser capture must not run"),
+    )
+
+    records, findings = execute_plan(
+        plan_assets([slot], [], [artifact]),
+        [slot],
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        artifacts=artifact_bindings_by_slot([artifact]),
+        typography={},
+        palette={},
+        media_prober=lambda _path: True,
+    )
+
+    assert [finding for finding in findings if finding.severity == "error"] == []
+    assert built[0].kind == "document"
+    assert built[0].heading == "Webdriver Torso official YouTube channel"
+    assert built[0].disclosure == assets_module.EVIDENCE_CARD_DISCLOSURE
+    assert built[0].items == (
+        "Dynamic page requires human verification.",
+        "23 Sep 2013",
+        "SOURCE · www.youtube.com",
+    )
+    assert records[0].provider == "rabbithole-evidence-card"
+    assert "manual review required" in records[0].notes
+
+
+def test_execute_plan_fetches_direct_source_image_once_for_distinct_slot_crops(
+    tmp_path, monkeypatch
+):
+    slots = [
+        _slot("s062", "screenshot", start=0.0, end=1.0),
+        _slot("s063", "screenshot", start=1.0, end=2.0),
+    ]
+    url = "https://upload.wikimedia.org/example.jpg"
+    artifacts = [
+        _artifact(
+            f"wt-commons-shortwave-sx115-{slot.slot_id}",
+            url,
+            slot_id=slot.slot_id,
+            acquisition_mode="screenshot-only",
+            capture_strategy="licensed-direct-image-crop-deferred",
+            source_license="CC0-1.0",
+        )
+        for slot in slots
+    ]
+    fetches = []
+    derives = []
+
+    def fake_fetch(_url, _transport):
+        fetches.append(_url)
+        return b"retained image bytes"
+
+    def fake_derive(source_path, out_path, **kwargs):
+        derives.append((source_path, out_path, kwargs))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"derived image video")
+        return out_path
+
+    monkeypatch.setattr(assets_module.capture, "fetch_source_bytes", fake_fetch)
+    monkeypatch.setattr(
+        assets_module.image_video, "derive_source_image_video", fake_derive
+    )
+
+    records, findings = execute_plan(
+        plan_assets(slots, [], artifacts),
+        slots,
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        artifacts=artifact_bindings_by_slot(artifacts),
+        media_prober=lambda _path: True,
+    )
+
+    assert [finding for finding in findings if finding.severity == "error"] == []
+    assert fetches == [url]
+    assert len(derives) == 2
+    assert len({call[1] for call in derives}) == 2
+    assert [record.provider for record in records] == [
+        "rabbithole-source-image",
+        "rabbithole-source-image",
+    ]
+    assert [record.license for record in records] == ["CC0-1.0", "CC0-1.0"]
+    assert all("source_license='CC0-1.0'" in record.notes for record in records)
+
+
+@pytest.mark.parametrize(
+    "source_license,reason",
+    [
+        ("", "has no source_license"),
+        (
+            "https://creativecommons.org/publicdomain/zero/1.0/",
+            "invalid source_license",
+        ),
+        ("CC0 1.0 Universal", "invalid source_license"),
+        ("CCO-1.0", "invalid source_license"),
+        ("NOPE", "invalid source_license"),
+        ("copyrighted", "invalid source_license"),
+        (123, "invalid source_license"),
+    ],
+)
+def test_direct_source_image_requires_explicit_machine_readable_license(
+    source_license, reason
+):
+    slot = _slot("s062", "screenshot")
+    artifact = _artifact(
+        "wt-commons-shortwave-sx115-s062",
+        "https://upload.wikimedia.org/example.jpg",
+        slot_id=slot.slot_id,
+        acquisition_mode="screenshot-only",
+        capture_strategy="licensed-direct-image-crop-deferred",
+        source_license=source_license,
+    )
+
+    [item] = plan_assets([slot], [], [artifact])
+
+    assert item.action == "blocked"
+    assert reason in item.reason
+
+
+def test_direct_source_image_accepts_documented_custom_license_ref():
+    slot = _slot("s062", "screenshot")
+    artifact = _artifact(
+        "permissioned-image-s062",
+        "https://example.test/permissioned.jpg",
+        slot_id=slot.slot_id,
+        acquisition_mode="screenshot-only",
+        capture_strategy="licensed-direct-image-crop-deferred",
+        source_license="LicenseRef-Permission-Granted",
+        rights_note="The photographer granted written permission for this episode.",
+        source_attribution="Example Photographer",
+    )
+
+    [item] = plan_assets([slot], [], [artifact])
+
+    assert item.action == "shoot"
+
+
+@pytest.mark.parametrize(
+    "missing_field,reason",
+    [
+        ("rights_note", "has no rights_note"),
+        ("source_attribution", "has no source_attribution"),
+    ],
+)
+def test_direct_source_image_custom_license_ref_requires_documentation(
+    missing_field, reason
+):
+    slot = _slot("s062", "screenshot")
+    values = {
+        "rights_note": "The photographer granted written permission.",
+        "source_attribution": "Example Photographer",
+    }
+    values[missing_field] = ""
+    artifact = _artifact(
+        "permissioned-image-s062",
+        "https://example.test/permissioned.jpg",
+        slot_id=slot.slot_id,
+        acquisition_mode="screenshot-only",
+        capture_strategy="licensed-direct-image-crop-deferred",
+        source_license="LicenseRef-Permission-Granted",
+        **values,
+    )
+
+    [item] = plan_assets([slot], [], [artifact])
+
+    assert item.action == "blocked"
+    assert reason in item.reason

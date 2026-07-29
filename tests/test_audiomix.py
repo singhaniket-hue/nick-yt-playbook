@@ -24,6 +24,7 @@ from rabbithole.audiomix import (
     build_sfx_layer,
     duck,
     load_sfx_categories,
+    measure_mix_master_gain_db,
     mix_audio,
     sfx_events,
     silence_windows,
@@ -146,6 +147,20 @@ def _vo_with_silence(path, duration, windows, freq=440, sample_rate=44100):
         check=True,
     )
     return path
+
+
+def test_measure_mix_master_gain_never_boosts_and_caps_peak(tmp_path):
+    quiet = _tone(tmp_path / "quiet.wav", 0.5, peak_db=-6.0)
+    hot = _tone(tmp_path / "hot.wav", 0.5, peak_db=-0.5)
+
+    assert measure_mix_master_gain_db(
+        [quiet], tmp_path / "quiet-measure.wav"
+    ) == 0.0
+    assert measure_mix_master_gain_db(
+        [hot], tmp_path / "hot-measure.wav"
+    ) == pytest.approx(-0.5, abs=0.11)
+    assert not (tmp_path / "quiet-measure.wav").exists()
+    assert not (tmp_path / "hot-measure.wav").exists()
 
 
 def _silence(path, seconds, sample_rate=44100):

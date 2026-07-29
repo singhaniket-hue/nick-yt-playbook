@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
@@ -81,7 +82,9 @@ def build_fcpxml(
                     "hasAudio": "1",
                     "audioSources": "1",
                     "audioChannels": str(media_item.get("channels") or 2),
-                    "audioRate": _audio_rate(sample_rate),
+                    "audioRate": _audio_rate(
+                        int(media_item.get("sample_rate") or sample_rate)
+                    ),
                 }
             )
         else:
@@ -246,6 +249,7 @@ def _collect_media(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
     durations: dict[tuple[str, str], int] = {}
     types: dict[tuple[str, str], str] = {}
     channels: dict[tuple[str, str], Any] = {}
+    sample_rates: dict[tuple[str, str], Any] = {}
     names: dict[tuple[str, str], str] = {}
     for clip in plan.get("clips", []):
         asset_id = clip.get("asset_id")
@@ -268,6 +272,7 @@ def _collect_media(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
         durations[key] = max(durations.get(key, 0), source_end)
         types[key] = "audio"
         channels[key] = clip.get("channels")
+        sample_rates[key] = clip.get("source_sample_rate")
         names[key] = str(asset_id)
     result = [
         {
@@ -277,6 +282,7 @@ def _collect_media(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
             "duration_frames": max(1, durations[key]),
             "media_type": types[key],
             "channels": channels.get(key),
+            "sample_rate": sample_rates.get(key),
         }
         for key in durations
     ]
@@ -601,6 +607,13 @@ def _append_audio_track(
                 "lane": str(lane),
             },
         )
+        gain_db = _audio_gain_db(clip)
+        if abs(gain_db) > 1e-9:
+            ET.SubElement(
+                item,
+                "adjust-volume",
+                {"amount": f"{_number(gain_db)}dB"},
+            )
         note = ET.SubElement(item, "note")
         note.text = f"id={clip['id']} track={track_id}"
 
@@ -652,6 +665,7 @@ def _append_title(
     fps: int,
 ) -> None:
     track_id = str(overlay.get("track") or "V3")
+    kind = str(overlay.get("kind") or "")
     match = re.fullmatch(r"V([2-4])", track_id)
     if match is None:
         raise FCPXMLError(f"title {overlay['id']!r} has invalid track {track_id!r}")
@@ -671,25 +685,38 @@ def _append_title(
             "role": "titles",
         },
     )
+    source_caption = kind == "source_caption"
+    if source_caption:
+        # Basic Title is born centred. FCPXML transform coordinates are
+        # percentages of frame size, so this places the editable title within
+        # lower-left title-safe while leaving the generator and text editable.
+        ET.SubElement(
+            title,
+            "adjust-transform",
+            {
+                "position": "-38 -42",
+                "scale": "1 1",
+                "rotation": "0",
+            },
+        )
     style_id = _xml_id(f"ts-{overlay['id']}")
     text = ET.SubElement(title, "text")
     styled = ET.SubElement(text, "text-style", {"ref": style_id})
     styled.text = str(overlay["text"])
     style_def = ET.SubElement(title, "text-style-def", {"id": style_id})
-    ET.SubElement(
-        style_def,
-        "text-style",
-        {
-            "font": "Courier New",
-            "fontSize": "54",
-            "fontColor": "1 1 1 1",
-            "alignment": "center",
-        },
-    )
+    style_attributes = {
+        "font": "Courier New",
+        "fontSize": "32" if source_caption else "54",
+        "fontColor": "1 1 1 1",
+        "alignment": "left" if source_caption else "center",
+    }
+    if source_caption:
+        style_attributes["backgroundColor"] = "0 0 0 0.65"
+    ET.SubElement(style_def, "text-style", style_attributes)
     note = ET.SubElement(title, "note")
-    note.text = (
-        f"id={overlay['id']} kind={overlay.get('kind', '')} track={track_id}"
-    )
+    note.text = f"id={overlay['id']} kind={kind} track={track_id}"
+    if source_caption:
+        note.text += " editable=1 layout=bottom-left"
 
 
 def _validate_plan(plan: Mapping[str, Any]) -> None:
@@ -744,6 +771,21 @@ def _audio_rate(sample_rate: int) -> str:
         raise FCPXMLError(
             f"sample rate {sample_rate} is not representable in FCPXML 1.10"
         ) from exc
+
+
+def _audio_gain_db(clip: Mapping[str, Any]) -> float:
+    value = clip.get("gain_db", 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise FCPXMLError(
+            f"audio clip {clip.get('id')!r} gain_db must be a finite number"
+        )
+    gain_db = float(value)
+    if not math.isfinite(gain_db) or not -80.0 <= gain_db <= 24.0:
+        raise FCPXMLError(
+            f"audio clip {clip.get('id')!r} gain_db must be between "
+            "-80 and +24 dB"
+        )
+    return gain_db
 
 
 def _time(frames: int, fps: int) -> str:

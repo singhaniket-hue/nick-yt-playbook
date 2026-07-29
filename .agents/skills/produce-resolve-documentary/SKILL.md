@@ -16,9 +16,11 @@ privacy, cost, and render-safety gates even when asked to run end to end.
    `pipeline/crowley-hinglish.yaml` before acting.
 3. Read only the relevant research, scripting, ethics, thumbnail, or publishing
    sections of `docs/dark-documentary-playbook.md`.
-4. Inspect the existing episode, Resolve status, and Git status before resuming.
+4. Before binding, acquiring, replacing, or approving visual assets, read
+   `docs/asset-acquisition-workflow.md`.
+5. Inspect the existing episode, Resolve status, and Git status before resuming.
    Do not repeat paid narration, downloads, or completed queue jobs.
-5. Select `animatic` or `final`, and Resolve `free` or `studio`. Treat an
+6. Select `animatic` or `final`, and Resolve `free` or `studio`. Treat an
    unspecified first technical pilot as `animatic`; never silently downgrade a
    requested final episode.
 
@@ -42,9 +44,11 @@ Homebrew only as an installation option; do not install system packages
 without authorization.
 
 Keep `.env` local and ignored. Never print, transfer, or commit credentials.
-Require `ELEVENLABS_API_KEY` and `RABBITHOLE_VOICE_ID` only for paid narration
-or sound generation. Use `RABBITHOLE_PROJECTS_DIR` or `new --projects-dir` when
-episode media belongs on a separate volume.
+Require `ELEVENLABS_API_KEY` for paid narration or sound generation. Require
+`RABBITHOLE_VOICE_ID` only for narration; sound generation must not depend on a
+voice ID. The current narration dry run still loads narration configuration.
+Use `RABBITHOLE_PROJECTS_DIR` or `new --projects-dir` when episode media belongs
+on a separate volume.
 
 Use project-relative POSIX media paths in JSON. Copy authorized external media
 into `projects/<slug>/assets/` or another episode subdirectory without changing
@@ -115,12 +119,66 @@ obtain approval before the paid narration call. After approval, repeat
 
 ## Source assets and build the edit
 
-Start with dry runs and preserve provenance:
+Follow `docs/asset-acquisition-workflow.md`. Start with a dry run, then use
+bounded batches or exact slots so a long run can be resumed without repeating
+completed downloads:
 
 ```text
 uv run rabbithole assets projects/<slug>/narration/timing.json --dry-run --quality <animatic|final>
+uv run rabbithole assets projects/<slug>/narration/timing.json --batch-size 20 --quality <animatic|final>
+uv run rabbithole assets projects/<slug>/narration/timing.json --slot s041 --slot s042 --quality <animatic|final>
 uv run rabbithole edl projects/<slug>/narration/timing.json --dry-run --quality <animatic|final>
 ```
+
+Each accepted slot is checkpointed atomically. Rerun the same batch to advance
+through remaining actionable slots, or the same exact-slot command to fill only
+its gaps.
+
+Replace a current asset only through an explicit, dry-run-first refresh:
+
+```text
+uv run rabbithole assets projects/<slug>/narration/timing.json --refresh --slot s041 --dry-run --quality <animatic|final>
+uv run rabbithole assets projects/<slug>/narration/timing.json --refresh --slot s041 --quality <animatic|final>
+```
+
+Select every slot claimed by an affected multi-slot asset. Never combine
+`--refresh` with `--tier` or `--batch-size`, delete old media, or remove ledger
+records manually. Refresh retains old media in project-local quarantine,
+records retirement in provenance, rolls back incomplete retirement, and resumes
+only the gaps when the exact incomplete slot set is rerun.
+
+For browser evidence, author a `capture_spec` target or crop rather than hoping
+the first viewport contains the claim. Same-URL targets may share one page load
+but must keep distinct pixels and records; reuse pixels only when the identical
+request has the same explicit `capture_spec_fingerprint`. Treat detected consent
+walls, challenges, interstitials, and blank frames as acquisition failures.
+Never dismiss consent automatically or bypass blank QA. Use an unobstructed
+archive, an exact frame from already retained source video, or an explicitly
+disclosed citation-card fallback.
+
+Use the uv-managed yt-dlp path. Primary downloads must retain their exact claims
+URL gate and pass the portable H.264 MP4/ffprobe checks before provenance accepts
+them.
+
+Signal-comparison cards are explanatory graphics, not evidence. Use only the
+documented `edge baseline`, `processed change`, `timing and audio`, or
+`automated flag` forms. They must visibly retain:
+
+```text
+LOCAL ILLUSTRATION · GENERAL TESTING LOGIC
+NOT WEBDRIVER TORSO'S PUBLISHED ALGORITHM
+```
+
+After each meaningful acquisition pass, generate the read-only visual QA:
+
+```text
+uv run python -m rabbithole.contactsheet projects/<slug>/narration/timing.json
+```
+
+Review both graphics and evidence sheets in timeline order. Exit code `1` means
+the sheets were written with red missing/unreadable cards; resolve every
+intended gap before approval. Check source/date labels, target context, derived
+frame timestamp/crop, citation-card disclosures, and both signal-card caveats.
 
 For a no-network technical pass, use `--tier atmospheric --quality animatic`.
 A final run requires source-bound evidence, rights/licence notes, complete
@@ -138,6 +196,19 @@ uv run rabbithole resolve prepare projects/<slug>
 uv run rabbithole resolve build projects/<slug> --mode <free|studio>
 ```
 
+`prepare` must create or reuse the content-addressed A3/A4 mix stems under
+`resolve/audio-stems/`. Those stems freeze the approved bed crossfades, music
+gain, category-specific SFX levels, cue placement, and silence-drop ramps that
+FCPXML cannot reproduce from raw tiles. Keep the raw sound library in the
+episode for editorial replacement, but do not substitute raw unity-gain clips
+for the approved stems. Preserve the manifest-recorded shared peak-ceiling gain
+on A1/A3/A4 as editable FCPXML volume adjustments. A changed narration, timing
+file, sound file, manifest, implementation, or style map must produce a new
+immutable stem directory; never overwrite one referenced by an existing queue
+job or render. Resolve stem preparation must fail closed when
+`research/source-audio.json` contains bites until their A1/A3 duck automation
+can be baked faithfully; use the FFmpeg renderer for that case.
+
 Never proceed while the user reports an active render. Never stop a render,
 clear a render queue, quit Resolve, switch databases/projects, delete a
 timeline, or mutate `EDITORIAL_*`. Build or reuse only the immutable
@@ -154,9 +225,12 @@ older, stop before claiming the job and use manual FCPXML import, the explicit
 FFmpeg backend, or Resolve Studio's external bridge. Never claim that unit
 tests prove a Free Console runtime.
 
-Review evidence, redactions, subtitles, source audio, rights, and grade on the
-generated timeline. Then queue the deterministic render and poll status until
-Resolve reports completion:
+Review evidence, redactions, subtitles, editable provenance-derived source
+captions, source audio, rights, and grade on the generated timeline. Generated
+source captions must use the authored source/publication date, never the
+retrieval timestamp; attribution already burned into a source frame, source
+image, or citation card must not appear twice. Then queue the deterministic
+render and poll status until Resolve reports completion:
 
 ```text
 uv run rabbithole resolve render projects/<slug> --mode <free|studio> --out projects/<slug>/renders/final.mp4
@@ -179,6 +253,12 @@ uv run rabbithole resolve restore-bundle <episode-bundle.zip> --out <new-project
 After restoring on a Mac, run `doctor`, `preflight`, and `prepare` again so all
 Resolve plans and FCPXML contain that machine's paths. Do not transfer `.env`,
 stale locks, queue state, generated Resolve builds, or prior renders.
+Treat a bundle as portable only after verification follows the selected
+audio-stem pointer through its immutable manifest, exact A3/A4 checksums, and
+all project-local stem inputs. Repository style/implementation files travel in
+Git, not inside the episode ZIP. Bundle only `current.json` and its selected
+fingerprint directory; exclude historical stem sets and incomplete `.build-*`
+directories.
 
 After Resolve assembly, create the editor handoff:
 

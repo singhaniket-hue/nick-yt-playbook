@@ -9,7 +9,13 @@ from typing import Any, Mapping
 
 from .encoding import require_filter
 from .resolve_install import install_style_assets
-from .resolve_manifest import ResolveManifestError, compile_resolve_plan, write_resolve_bundle
+from .resolve_audio import prepare_resolve_audio_stems
+from .resolve_manifest import (
+    ResolveManifestError,
+    _discover_sound_manifest,
+    compile_resolve_plan,
+    write_resolve_bundle,
+)
 from .resolve_runner import (
     console_loader_command,
     enqueue_job,
@@ -333,6 +339,10 @@ def prepare_project(
             raise ResolveServiceError(
                 f"prepared bundles must stay under {root / 'resolve'}: {destination}"
             )
+    audio_stems: dict[str, Any] | None = None
+    sound_manifest_path = _discover_sound_manifest(root)
+    if sound_manifest_path is not None:
+        audio_stems = prepare_resolve_audio_stems(root, sound_manifest_path)
     result = write_resolve_bundle(
         root,
         output_dir=destination,
@@ -353,6 +363,17 @@ def prepare_project(
             if flag.get("severity") == "error"
         ),
     }
+    if audio_stems is not None:
+        stem_findings = list(audio_stems["manifest"].get("findings", []))
+        response["audio_stems"] = {
+            "generated": bool(audio_stems["generated"]),
+            "fingerprint": str(audio_stems["fingerprint"]),
+            "manifest_path": os.fspath(audio_stems["manifest_path"]),
+            "findings": stem_findings,
+            "warning_count": sum(
+                1 for finding in stem_findings if finding.get("severity") == "warning"
+            ),
+        }
     return _json_safe(response)
 
 

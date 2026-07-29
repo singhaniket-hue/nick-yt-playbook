@@ -120,6 +120,7 @@ class FakeProject:
         self.render_mode = None
         self.render_jobs: list[str] = []
         self.started: list[str] = []
+        self.render_statuses: dict[str, dict[str, str]] = {}
 
     def GetName(self):
         return self.name
@@ -160,7 +161,11 @@ class FakeProject:
     def StartRendering(self, job_id):
         self.started.append(job_id)
         self.rendering = True
+        self.render_statuses.setdefault(job_id, {"JobStatus": "Rendering"})
         return True
+
+    def GetRenderJobStatus(self, job_id):
+        return self.render_statuses.get(job_id)
 
 
 class FakeProjectManager:
@@ -575,6 +580,155 @@ def test_queue_pointer_status_and_execution(tmp_path: Path, monkeypatch) -> None
         project_root=project_root,
         job_id=job["job_id"],
     ) == []
+
+
+def test_new_build_supersedes_only_older_queued_build_jobs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project_root = tmp_path / "episode"
+    first_plan_path, first_plan = compiler_shaped_plan(project_root)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "user-state"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "user-state"))
+
+    def plan_variant(token: str) -> tuple[Path, dict]:
+        plan = json.loads(json.dumps(first_plan))
+        build_id = f"b-{token}"
+        build_dir = project_root / "resolve" / "builds" / build_id
+        build_dir.mkdir(parents=True)
+        fcpxml = build_dir / "timeline.fcpxml"
+        fcpxml.write_text(
+            f'<fcpxml version="1.10"><!-- {token} --></fcpxml>',
+            encoding="utf-8",
+        )
+        plan["build_id"] = build_id
+        plan["timeline_name"] = f"AUTO_BUILD_{token.upper()}"
+        plan["output_paths"] = {
+            "plan": f"resolve/builds/{build_id}/resolve-plan.v1.json",
+            "plan_path_kind": "project-relative",
+            "fcpxml": f"resolve/builds/{build_id}/timeline.fcpxml",
+            "fcpxml_path_kind": "project-relative",
+            "fcpxml_sha256": hashlib.sha256(fcpxml.read_bytes()).hexdigest(),
+        }
+        plan_path = build_dir / "resolve-plan.v1.json"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        return plan_path, plan
+
+    first_build = enqueue_job(project_root, "build", first_plan_path)
+    queued_render = enqueue_job(project_root, "render", first_plan_path)
+    second_plan_path, _ = plan_variant("111111111111")
+    second_build = enqueue_job(project_root, "build", second_plan_path)
+
+    retired = json.loads(Path(first_build["queue_file"]).read_text())
+    assert retired["state"] == "superseded"
+    assert retired["result"] == {
+        "reason": "newer_build_enqueued",
+        "superseded_by": second_build["job_id"],
+    }
+    assert json.loads(Path(queued_render["queue_file"]).read_text())["state"] == "queued"
+
+    running = json.loads(Path(second_build["queue_file"]).read_text())
+    running["state"] = "running"
+    running["attempts"] = 1
+    Path(second_build["queue_file"]).write_text(json.dumps(running), encoding="utf-8")
+    third_plan_path, _ = plan_variant("222222222222")
+    third_build = enqueue_job(project_root, "build", third_plan_path)
+
+    assert json.loads(Path(second_build["queue_file"]).read_text())["state"] == "running"
+    assert json.loads(Path(queued_render["queue_file"]).read_text())["state"] == "queued"
+    assert json.loads(Path(third_build["queue_file"]).read_text())["state"] == "queued"
+
+
+def test_async_render_queue_requires_positive_completion_before_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    local_state = tmp_path / "user-state"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_state))
+    monkeypatch.setenv("XDG_STATE_HOME", str(local_state))
+    project = FakeProject()
+    resolve = FakeResolve(project)
+    execute_build(
+        resolve,
+        plan,
+        project_root=project_root,
+        plan_path=plan_path,
+    )
+    job = enqueue_job(project_root, "render", plan_path)
+
+    started = run_pending_jobs(
+        resolve=resolve,
+        project_root=project_root,
+        job_id=job["job_id"],
+    )
+
+    assert [item["state"] for item in started] == ["rendering"]
+    render_job_id = started[0]["result"]["render_job_id"]
+    status = read_status(project_root)
+    assert status["state"] == "rendering"
+    assert status["queue"]["rendering"] == 1
+    assert status["queue"]["succeeded"] == 0
+
+    project.rendering = False
+    project.render_statuses[render_job_id] = {"JobStatus": "Unknown"}
+    unverified = run_pending_jobs(
+        resolve=resolve,
+        project_root=project_root,
+        job_id=job["job_id"],
+    )
+
+    assert [item["state"] for item in unverified] == ["rendering"]
+    assert unverified[0]["result"]["render_status"] == "unknown"
+    assert read_status(project_root)["detail"] == "render_completion_unverified"
+
+    project.render_statuses[render_job_id] = {"JobStatus": "Complete"}
+    completed = run_pending_jobs(
+        resolve=resolve,
+        project_root=project_root,
+        job_id=job["job_id"],
+    )
+
+    assert [item["state"] for item in completed] == ["succeeded"]
+    assert completed[0]["result"]["render_status"] == "complete"
+    assert read_status(project_root)["queue"]["succeeded"] == 1
+    assert project.started == [render_job_id]
+
+
+def test_async_render_queue_records_terminal_resolve_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "user-state"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "user-state"))
+    project = FakeProject()
+    resolve = FakeResolve(project)
+    execute_build(
+        resolve,
+        plan,
+        project_root=project_root,
+        plan_path=plan_path,
+    )
+    job = enqueue_job(project_root, "render", plan_path)
+    started = run_pending_jobs(
+        resolve=resolve,
+        project_root=project_root,
+        job_id=job["job_id"],
+    )
+    render_job_id = started[0]["result"]["render_job_id"]
+    project.rendering = False
+    project.render_statuses[render_job_id] = {"JobStatus": "Cancelled"}
+
+    failed = run_pending_jobs(
+        resolve=resolve,
+        project_root=project_root,
+        job_id=job["job_id"],
+    )
+
+    assert [item["state"] for item in failed] == ["failed"]
+    assert failed[0]["result"]["render_status"] == "cancelled"
+    assert failed[0]["error"]["type"] == "ResolveExecutionError"
+    assert read_status(project_root)["state"] == "failed"
 
 
 def test_queue_refuses_fcpxml_changed_after_enqueue(

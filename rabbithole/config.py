@@ -38,7 +38,11 @@ class Config:
         return REPO_ROOT / "style"
 
 
-def load_config(env_path: Path | None = None) -> Config:
+def load_config(
+    env_path: Path | None = None,
+    *,
+    require_voice_id: bool = True,
+) -> Config:
     """Load configuration from a .env file, falling back to the process environment.
 
     A value in the .env file wins over the process environment only if it is
@@ -46,6 +50,10 @@ def load_config(env_path: Path | None = None) -> Config:
     unfilled `ELEVENLABS_API_KEY=` placeholder that bootstrap copies from
     .env.example) is treated as absent rather than as an override, so it cannot
     silently blank out a key already exported in the shell.
+
+    Narration callers use the default fail-closed voice-ID check. Services such
+    as sound generation that share the ElevenLabs API key but do not use a voice
+    may opt out explicitly.
     """
     path = env_path if env_path is not None else REPO_ROOT / ".env"
     values = dict(os.environ)
@@ -59,7 +67,7 @@ def load_config(env_path: Path | None = None) -> Config:
             "(copy .env.example) or export it in the shell."
         )
     voice_id = values.get("RABBITHOLE_VOICE_ID", DEFAULT_VOICE_ID).strip()
-    if not voice_id:
+    if require_voice_id and not voice_id:
         raise RuntimeError(
             "RABBITHOLE_VOICE_ID is not set. Add the voice ID to .env "
             "(copy .env.example) or export it in the shell."

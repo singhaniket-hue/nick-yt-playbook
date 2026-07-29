@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import stat
@@ -7,6 +8,7 @@ import zipfile
 
 import pytest
 
+import rabbithole.episode_bundle as episode_bundle_module
 from rabbithole.episode_bundle import (
     EpisodeBundleValidationError,
     UnsafeEpisodeDestinationError,
@@ -14,6 +16,88 @@ from rabbithole.episode_bundle import (
     restore_episode_bundle,
     validate_episode_bundle,
 )
+from rabbithole.resolve_audio import (
+    _fingerprint,
+    _input_contract,
+    prepare_resolve_audio_stems,
+)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_audio_stems(root: Path) -> str:
+    timing = root / "narration" / "timing.json"
+    timing.write_text("{}", encoding="utf-8")
+    sound_manifest = root / "assets" / "soundlib" / "manifest.json"
+    sound_manifest.parent.mkdir(parents=True)
+    sound_manifest.write_text('{"entries":{}}', encoding="utf-8")
+    style_path = Path(__file__).resolve().parents[1] / "style" / "sfx.json"
+    contract = _input_contract(
+        root,
+        timing,
+        root / "narration" / "vo.wav",
+        sound_manifest,
+        style_path,
+        [],
+    )
+    fingerprint = _fingerprint(contract)
+    stems = root / "resolve" / "audio-stems" / fingerprint
+    stems.mkdir(parents=True)
+    music = stems / "music-stem.wav"
+    sfx = stems / "sfx-stem.wav"
+    music.write_bytes(b"immutable music")
+    sfx.write_bytes(b"immutable sfx")
+    manifest = {
+        "schema_version": "resolve-audio-stems.v1",
+        "generator_version": "resolve-audio-stems.v1",
+        "fingerprint": fingerprint,
+        "duration_seconds": 1.0,
+        "contract": contract,
+        "entries": {
+            "music": {
+                "path": music.name,
+                "sha256": _sha256(music),
+                "duration_seconds": 1.0,
+                "channels": 1,
+                "sample_rate": 44_100,
+                "codec": "pcm_s16le",
+                "track": "A3",
+                "kind": "music",
+            },
+            "sfx": {
+                "path": sfx.name,
+                "sha256": _sha256(sfx),
+                "duration_seconds": 1.0,
+                "channels": 1,
+                "sample_rate": 44_100,
+                "codec": "pcm_s16le",
+                "track": "A4",
+                "kind": "sfx",
+            },
+        },
+    }
+    stem_manifest = stems / "manifest.json"
+    stem_manifest.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (root / "resolve" / "audio-stems" / "current.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "resolve-audio-stems.v1",
+                "fingerprint": fingerprint,
+                "manifest_path": f"{fingerprint}/manifest.json",
+                "manifest_sha256": _sha256(stem_manifest),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return fingerprint
 
 
 def _episode(root: Path) -> Path:
@@ -69,6 +153,21 @@ def test_package_is_deterministic_portable_and_excludes_machine_state(
     (episode / "resolve" / ".resolve-runner.lock").write_text(
         "locked", encoding="utf-8"
     )
+    (episode / "resolve" / "current.json").write_text(
+        '{"plan_path":"resolve/builds/b-123/resolve-plan.v1.json"}',
+        encoding="utf-8",
+    )
+    fingerprint = _write_audio_stems(episode)
+    historical = (
+        episode
+        / "resolve"
+        / "audio-stems"
+        / ("f" * 64)
+    )
+    historical.mkdir()
+    (historical / "manifest.json").write_bytes(b"historical manifest")
+    (historical / "music-stem.wav").write_bytes(b"historical music")
+    (historical / "sfx-stem.wav").write_bytes(b"historical sfx")
 
     first = tmp_path / "first.zip"
     second = tmp_path / "second.zip"
@@ -94,7 +193,78 @@ def test_package_is_deterministic_portable_and_excludes_machine_state(
         assert "resolve/builds/" not in joined
         assert "resolve/queue/" not in joined
         assert ".resolve-runner.lock" not in joined
+        assert "project/resolve/current.json" not in names
+        assert "project/resolve/audio-stems/current.json" in names
+        assert (
+            f"project/resolve/audio-stems/{fingerprint}/music-stem.wav" in names
+        )
+        assert not any(f"audio-stems/{'f' * 64}/" in name for name in names)
         assert all(info.date_time == (1980, 1, 1, 0, 0, 0) for info in archive.infolist())
+
+
+def test_restored_audio_stem_selection_is_reusable_without_bundled_repo_style(
+    tmp_path: Path,
+) -> None:
+    episode = _episode(tmp_path / "episode")
+    fingerprint = _write_audio_stems(episode)
+    bundle = tmp_path / "episode.zip"
+    package_episode(episode, bundle)
+    destination = tmp_path / "mac-mini" / "episode"
+
+    restore_episode_bundle(bundle, destination)
+    result = prepare_resolve_audio_stems(
+        destination,
+        destination / "assets" / "soundlib" / "manifest.json",
+    )
+
+    assert result["generated"] is False
+    assert result["fingerprint"] == fingerprint
+    assert not (destination / "style" / "sfx.json").exists()
+
+
+def test_package_rejects_audio_stems_with_stale_project_input(
+    tmp_path: Path,
+) -> None:
+    episode = _episode(tmp_path / "episode")
+    _write_audio_stems(episode)
+    (episode / "narration" / "timing.json").write_text(
+        '{"duration_seconds":2}', encoding="utf-8"
+    )
+
+    with pytest.raises(EpisodeBundleValidationError, match="stale or changed"):
+        package_episode(episode, tmp_path / "stale.zip")
+
+
+def test_bundle_validation_rejects_self_consistent_zip_with_broken_stem_pointer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    episode = _episode(tmp_path / "episode")
+    _write_audio_stems(episode)
+    pointer_path = episode / "resolve" / "audio-stems" / "current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["manifest_path"] = "missing/manifest.json"
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+    bundle = tmp_path / "broken-pointer.zip"
+
+    real_validate = episode_bundle_module.validate_episode_bundle
+    monkeypatch.setattr(
+        episode_bundle_module,
+        "_audit_local_audio_stems",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        episode_bundle_module,
+        "validate_episode_bundle",
+        lambda _path: {"valid": True},
+    )
+    episode_bundle_module.package_episode(episode, bundle)
+
+    with pytest.raises(
+        EpisodeBundleValidationError,
+        match="manifest_path must select the immutable fingerprint directory",
+    ):
+        real_validate(bundle)
 
 
 def test_restore_preserves_project_tree_and_refuses_overwrite(tmp_path: Path) -> None:

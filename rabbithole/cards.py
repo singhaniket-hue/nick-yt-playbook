@@ -71,6 +71,7 @@ module does not make.
 from __future__ import annotations
 
 import re
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -110,16 +111,42 @@ TITLE_SAFE_FRACTION = 0.74
 CARD_PLATE_KIND = "grain"
 
 _HEADING_SIZE_FRACTION = 0.062
+_DISCLOSURE_SIZE_FRACTION = 0.026
 # Body text is read, not glanced at -- a card holds for 3-12 seconds and the
 # viewer has to finish it. Rendered at 0.040 the items were legible but weak
 # against the heading; 0.052 reads at a glance without crowding six of them.
 _BODY_SIZE_FRACTION = 0.052
 _STAT_SIZE_FRACTION = 0.150
 _RULE_THICKNESS_FRACTION = 0.0045
+# libass centres a multi-line ``\an5`` event as one block. Use an explicit
+# conservative line box when placing the rule below that block; a fixed offset
+# crosses the final line as soon as a source title wraps.
+_HEADING_LINE_HEIGHT_MULTIPLIER = 1.25
+_HEADING_RULE_PADDING_FRACTION = 0.018
 
 _BOLD_WEIGHT_THRESHOLD = 600
 _ASS_TOP_LEFT = 7
+_ASS_MIDDLE_LEFT = 4
 _ASS_MIDDLE_CENTER = 5
+_ASS_MIDDLE_RIGHT = 6
+
+# An authored comparison heading beginning with this phrase opts into the
+# reusable test-signal visual system below. Keeping it in the heading rather
+# than adding a new CardSpec kind means existing scripts and manifests remain
+# compatible, while an ordinary comparison still takes the established
+# text-column path byte-for-byte.
+_SIGNAL_COMPARISON_PREFIX_RE = re.compile(
+    r"^\s*signal comparison\s*-\s*(?P<variant>.+?)\s*$",
+    re.IGNORECASE,
+)
+_SIGNAL_DISCLOSURE = "LOCAL ILLUSTRATION · GENERAL TESTING LOGIC"
+_SIGNAL_CAVEAT = "NOT WEBDRIVER TORSO'S PUBLISHED ALGORITHM"
+SIGNAL_COMPARISON_ITEM_COUNTS = {
+    "edge baseline": 2,
+    "processed change": 2,
+    "timing and audio": 2,
+    "automated flag": 4,
+}
 
 # Longest run of items any template lays out. Beyond this the layout stops
 # being legible at 1080p, so extra items are dropped and reported rather than
@@ -152,12 +179,17 @@ class CardSpec:
     `checklist`, the two sides of a `comparison`, points on a `timeline`,
     panels of a `montage`. An empty `items` is valid -- every template
     degrades to a heading-only card rather than failing.
+
+    `disclosure` is optional frame-native editorial context. Document cards
+    use it for labels such as ``EDITORIAL PARAPHRASE · SOURCE-ATTRIBUTED`` so
+    a locally composed evidence summary cannot be mistaken for source pixels.
     """
 
     kind: str
     heading: str
     duration: float
     items: tuple[str, ...] = ()
+    disclosure: str = ""
 
     def __post_init__(self) -> None:
         if self.kind not in CARD_KINDS:
@@ -322,6 +354,15 @@ def parse_detail(detail: str, duration: float) -> tuple[CardSpec, list[Finding]]
     if items and heading.strip().lower() in {*_ARCHETYPE_NOISE, *CARD_KINDS}:
         heading = ""
 
+    # A callout needs a verbal anchor. Details such as
+    # `three labels confirmed date | playful reference | broader intent
+    # uncertain` intentionally carry their content in items, but classification
+    # strips the generic "callout/label" heading. Promoting the first authored
+    # item gives the remaining points context instead of leaving a small body
+    # line floating under an otherwise blank card.
+    if kind == "callout" and items and not heading.strip():
+        heading = items.pop(0)
+
     if len(items) > MAX_ITEMS:
         findings.append(
             Finding(
@@ -356,7 +397,14 @@ def parse_detail(detail: str, duration: float) -> tuple[CardSpec, list[Finding]]
             )
         )
 
-    return CardSpec(kind=kind, heading=heading, duration=duration, items=tuple(items)), findings
+    spec = CardSpec(
+        kind=kind,
+        heading=heading,
+        duration=duration,
+        items=tuple(items),
+    )
+    findings.extend(_signal_comparison_findings(spec, detail=detail))
+    return spec, findings
 
 
 def production_note_reason(detail: str, spec: CardSpec | None = None) -> str:
@@ -425,6 +473,32 @@ def _rect(x: float, y: float, w: float, h: float) -> str:
     )
 
 
+def _wrapped_ass_text(text: str, max_width: float, font_size: float) -> str:
+    """Escape *text* and add deterministic hard wraps for a pixel-width budget.
+
+    libass's automatic wrapping uses the whole frame because these events are
+    positioned rather than margin-boxed. A comparison item could therefore
+    flow straight through its divider. The conservative average-glyph estimate
+    keeps short text byte-for-byte stable and wraps long text before it reaches
+    the edge; a rectangular ``\\clip`` remains the final containment guard in
+    column layouts.
+    """
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return ""
+    average_glyph_width = max(1.0, font_size * 0.62)
+    max_chars = max(1, int(max_width / average_glyph_width))
+    lines = textwrap.wrap(
+        normalized,
+        width=max_chars,
+        break_long_words=True,
+        break_on_hyphens=False,
+        replace_whitespace=True,
+        drop_whitespace=True,
+    ) or [normalized]
+    return r"\N".join(_escape_ass_text(line) for line in lines)
+
+
 @dataclass
 class _Layout:
     """Frame geometry, all of it inside the title-safe box."""
@@ -465,9 +539,11 @@ def _styles(typography: dict, palette: dict, width: int, height: int) -> list[st
     bold = -1 if weight >= _BOLD_WEIGHT_THRESHOLD else 0
 
     heading_size = max(1, round(height * _HEADING_SIZE_FRACTION))
+    disclosure_size = max(1, round(height * _DISCLOSURE_SIZE_FRACTION))
     body_size = max(1, round(height * _BODY_SIZE_FRACTION))
     stat_size = max(1, round(height * _STAT_SIZE_FRACTION))
     light = ass_colour(palette.get("text_light", "#E0E0E0"))
+    accent = ass_colour(palette.get("accent_red", "#E02020"))
 
     fmt = (
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
@@ -482,6 +558,9 @@ def _styles(typography: dict, palette: dict, width: int, height: int) -> list[st
         f"0,1,2.0,1.0,{_ASS_MIDDLE_CENTER},0,0,0,1",
         f"Style: CardBody,{body_font},{body_size},{light},{light},"
         f"&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1.5,1.0,{_ASS_TOP_LEFT},0,0,0,1",
+        f"Style: CardDisclosure,{body_font},{disclosure_size},{accent},{accent},"
+        f"&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,1.5,1.0,"
+        f"{_ASS_TOP_LEFT},0,0,0,1",
         f"Style: CardStat,{title_font},{stat_size},{light},{light},"
         f"&H00000000,&H00000000,{bold},0,0,0,100,100,0,0,1,2.0,1.0,{_ASS_MIDDLE_CENTER},0,0,0,1",
         f"Style: CardShape,{body_font},{body_size},{light},{light},"
@@ -505,8 +584,28 @@ def _heading_events(spec: CardSpec, layout: _Layout, palette: dict, typography: 
     rule_w = layout.safe_w * 0.16
 
     events = []
+    rule_y = y + layout.height * 0.055
     if spec.heading.strip():
-        heading = _escape_ass_text(_transform(spec.heading, typography))
+        heading_size = max(1, round(layout.height * _HEADING_SIZE_FRACTION))
+        heading = _wrapped_ass_text(
+            _transform(spec.heading, typography),
+            layout.safe_w * 0.90,
+            heading_size,
+        )
+        line_count = heading.count(r"\N") + 1
+        heading_bottom = (
+            y
+            + (
+                line_count
+                * heading_size
+                * _HEADING_LINE_HEIGHT_MULTIPLIER
+            )
+            / 2
+        )
+        rule_y = heading_bottom + max(
+            layout.height * _HEADING_RULE_PADDING_FRACTION,
+            thickness * 2,
+        )
         events.append(_dialogue(
             "CardHead", spec.duration,
             f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({layout.centre_x:.0f},{y:.0f})"
@@ -518,7 +617,7 @@ def _heading_events(spec: CardSpec, layout: _Layout, palette: dict, typography: 
     events.append(_dialogue(
         "CardShape", spec.duration,
         f"{{\\an{_ASS_TOP_LEFT}\\pos({layout.centre_x - rule_w / 2:.0f},"
-        f"{y + layout.height * 0.055:.0f})\\c{_wrap_override(rule)}}}"
+        f"{rule_y:.0f})\\c{_wrap_override(rule)}}}"
         f"{_rect(0, 0, rule_w, thickness)}"))
     return events
 
@@ -526,7 +625,11 @@ def _heading_events(spec: CardSpec, layout: _Layout, palette: dict, typography: 
 def _callout_events(spec, layout, palette, typography):
     events = _heading_events(spec, layout, palette, typography, layout.centre_y)
     if spec.items:
-        body = _escape_ass_text(" / ".join(spec.items))
+        body = _wrapped_ass_text(
+            " / ".join(spec.items),
+            layout.safe_w * 0.78,
+            max(1, round(layout.height * _BODY_SIZE_FRACTION)),
+        )
         events.append(_dialogue(
             "CardBody", spec.duration,
             f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({layout.centre_x:.0f},"
@@ -571,7 +674,304 @@ def _checklist_events(spec, layout, palette, typography):
     return events
 
 
+def _signal_comparison_variant(heading: str) -> str | None:
+    """Return the requested signal motif, or ``None`` for a normal comparison."""
+    match = _SIGNAL_COMPARISON_PREFIX_RE.match(heading or "")
+    if not match:
+        return None
+    return re.sub(r"\s+", " ", match.group("variant").strip()).casefold()
+
+
+def _signal_comparison_findings(
+    spec: CardSpec, *, detail: str = ""
+) -> list[Finding]:
+    """Validate the closed signal-motif vocabulary and authored item shape."""
+    variant = _signal_comparison_variant(spec.heading)
+    if variant is None:
+        return []
+    expected = SIGNAL_COMPARISON_ITEM_COUNTS.get(variant)
+    label = detail or spec.heading
+    if expected is None:
+        supported = ", ".join(SIGNAL_COMPARISON_ITEM_COUNTS)
+        return [
+            Finding(
+                gate="cards",
+                severity="error",
+                message=(
+                    f"Signal-comparison card {label!r} names unsupported variant "
+                    f"{variant!r}; expected one of {supported}."
+                ),
+            )
+        ]
+    if len(spec.items) != expected:
+        noun = "item" if expected == 1 else "items"
+        return [
+            Finding(
+                gate="cards",
+                severity="error",
+                message=(
+                    f"Signal-comparison variant {variant!r} requires exactly "
+                    f"{expected} authored {noun}, but {label!r} supplies "
+                    f"{len(spec.items)}. Use pipe-separated labels after the "
+                    "colon."
+                ),
+            )
+        ]
+    return []
+
+
+def _signal_comparison_events(spec, layout, palette, typography, variant):
+    """A reusable reference/processed signal diagram with an editorial caveat.
+
+    These panels explain ordinary quality-control concepts; they do not claim
+    to reproduce Google's private test implementation. The two disclosures are
+    therefore part of the rendered frame, not metadata an export could lose.
+    """
+    light = palette.get("text_light", "#E0E0E0")
+    mid = palette.get("text_mid", "#404040")
+    accent = palette.get("accent_red", "#E02020")
+    blue = "#2058D8"
+    shifted_red = "#D66A45"
+    shifted_blue = "#5C43D7"
+    panel_fill = "#D8D8D8"
+
+    viewer_spec = CardSpec(
+        kind="comparison",
+        heading="REFERENCE / PROCESSED",
+        duration=spec.duration,
+    )
+    events = _heading_events(
+        viewer_spec,
+        layout,
+        palette,
+        typography,
+        layout.top + layout.safe_h * 0.085,
+    )
+
+    gap = layout.safe_w * 0.055
+    panel_w = layout.safe_w * 0.40
+    panel_h = layout.safe_h * 0.34
+    total_w = panel_w * 2 + gap
+    left_x = layout.centre_x - total_w / 2
+    right_x = left_x + panel_w + gap
+    panel_y = layout.top + layout.safe_h * 0.31
+    label_y = panel_y - layout.safe_h * 0.055
+    thickness = max(2.0, layout.height * _RULE_THICKNESS_FRACTION * 0.7)
+
+    def shape(
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        colour: str,
+        *,
+        blur: int = 0,
+        alpha: str = "",
+    ) -> None:
+        effects = f"\\blur{blur}" if blur else ""
+        if alpha:
+            effects += f"\\alpha&H{alpha}&"
+        events.append(_dialogue(
+            "CardShape",
+            spec.duration,
+            f"{{\\an{_ASS_TOP_LEFT}\\pos({x:.0f},{y:.0f})"
+            f"\\c{_wrap_override(colour)}{effects}}}{_rect(0, 0, w, h)}",
+        ))
+
+    # The light panels make the colour/edge comparison readable against the
+    # moving grain plate. A dark lower strip gives timing and audio marks a
+    # consistent plotting surface without leaving the common card identity.
+    for panel_x in (left_x, right_x):
+        shape(panel_x, panel_y, panel_w, panel_h, panel_fill)
+        shape(
+            panel_x,
+            panel_y + panel_h - thickness,
+            panel_w,
+            thickness,
+            mid,
+        )
+
+    for label, x in (
+        ("REFERENCE", left_x + panel_w / 2),
+        ("PROCESSED", right_x + panel_w / 2),
+    ):
+        events.append(_dialogue(
+            "CardDisclosure",
+            spec.duration,
+            f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({x:.0f},{label_y:.0f})"
+            f"\\c{_wrap_override(light)}}}{label}",
+        ))
+
+    inner_x = panel_w * 0.075
+    block_gap = panel_w * 0.045
+    block_w = (panel_w - inner_x * 2 - block_gap) / 2
+    block_y = panel_y + panel_h * 0.16
+    block_h = panel_h * (0.43 if variant == "timing and audio" else 0.68)
+    offset = max(2.0, layout.width * 0.00625)
+
+    # Reference edges are deliberately crisp.
+    shape(left_x + inner_x, block_y, block_w, block_h, accent)
+    shape(left_x + inner_x + block_w + block_gap, block_y, block_w, block_h, blue)
+
+    # Faint expected-position ghosts make the processed offset measurable,
+    # while the coloured blocks show blur and colour drift. At 1920px the
+    # offset is 12px, scaled proportionally on smaller renders.
+    shape(
+        right_x + inner_x,
+        block_y,
+        block_w,
+        block_h,
+        accent,
+        alpha="90",
+    )
+    shape(
+        right_x + inner_x + block_w + block_gap,
+        block_y,
+        block_w,
+        block_h,
+        blue,
+        alpha="90",
+    )
+    shape(
+        right_x + inner_x + offset,
+        block_y + offset,
+        block_w,
+        block_h,
+        shifted_red,
+        blur=6,
+    )
+    shape(
+        right_x + inner_x + block_w + block_gap + offset,
+        block_y + offset,
+        block_w,
+        block_h,
+        shifted_blue,
+        blur=6,
+    )
+
+    if variant == "edge baseline":
+        # A thin baseline under each pair keeps attention on crisp-versus-soft
+        # edge behaviour before later cards introduce specific measurements.
+        baseline_y = panel_y + panel_h * 0.88
+        shape(left_x + inner_x, baseline_y, panel_w - inner_x * 2, thickness, mid)
+        shape(
+            right_x + inner_x,
+            baseline_y,
+            panel_w - inner_x * 2,
+            thickness,
+            mid,
+            alpha="50",
+        )
+    elif variant == "processed change":
+        # Two small deltas call out the changed processed output without adding
+        # invented numbers to what is only a general explanatory diagram.
+        delta_y = panel_y + panel_h * 0.88
+        delta_w = (panel_w - inner_x * 2 - block_gap) / 2
+        shape(right_x + inner_x, delta_y, delta_w, thickness * 2, shifted_red)
+        shape(
+            right_x + inner_x + delta_w + block_gap,
+            delta_y,
+            delta_w,
+            thickness * 2,
+            shifted_blue,
+        )
+    elif variant == "timing and audio":
+        plot_y = panel_y + panel_h * 0.67
+        plot_w = panel_w - inner_x * 2
+        tick_h = panel_h * 0.075
+        for panel_x, active_index in ((left_x, 2), (right_x, 4)):
+            shape(panel_x + inner_x, plot_y, plot_w, thickness, mid)
+            for index in range(5):
+                tick_x = panel_x + inner_x + plot_w * index / 4
+                shape(
+                    tick_x - thickness / 2,
+                    plot_y - tick_h / 2,
+                    thickness,
+                    tick_h,
+                    accent if index == active_index else mid,
+                )
+
+        tone_y = panel_y + panel_h * 0.79
+        tone_gap = panel_w * 0.025
+        tone_w = (plot_w - tone_gap * 3) / 4
+        reference_heights = (0.030, 0.065, 0.045, 0.075)
+        processed_heights = (0.055, 0.035, 0.080, 0.050)
+        for panel_x, heights, colour in (
+            (left_x, reference_heights, blue),
+            (right_x, processed_heights, shifted_red),
+        ):
+            for index, height_fraction in enumerate(heights):
+                tone_h = panel_h * height_fraction
+                shape(
+                    panel_x + inner_x + index * (tone_w + tone_gap),
+                    tone_y - tone_h,
+                    tone_w,
+                    tone_h,
+                    colour,
+                )
+    elif variant == "automated flag":
+        chip_gap_x = layout.safe_w * 0.025
+        chip_gap_y = layout.safe_h * 0.020
+        chip_w = (total_w - chip_gap_x) / 2
+        chip_h = layout.safe_h * 0.070
+        chip_top = panel_y + panel_h + layout.safe_h * 0.045
+        for index, item in enumerate(spec.items[:4]):
+            column = index % 2
+            row = index // 2
+            chip_x = left_x + column * (chip_w + chip_gap_x)
+            chip_y = chip_top + row * (chip_h + chip_gap_y)
+            shape(chip_x, chip_y, chip_w, chip_h, mid)
+            shape(chip_x, chip_y, thickness * 2.2, chip_h, accent)
+            events.append(_dialogue(
+                "CardDisclosure",
+                spec.duration,
+                f"{{\\an{_ASS_MIDDLE_LEFT}\\pos({chip_x + chip_w * 0.06:.0f},"
+                f"{chip_y + chip_h / 2:.0f})\\c{_wrap_override(light)}}}"
+                f"{_escape_ass_text(item)}",
+            ))
+
+    # For the two-panel variants, retain the author's exact labels beneath
+    # their matching panels. The flag variant uses all four authored items in
+    # its status chips instead.
+    if variant != "automated flag":
+        item_y = panel_y + panel_h + layout.safe_h * 0.055
+        item_size = max(1, round(layout.height * _DISCLOSURE_SIZE_FRACTION))
+        for index, item in enumerate(spec.items[:2]):
+            panel_x = left_x if index == 0 else right_x
+            body = _wrapped_ass_text(item, panel_w * 0.92, item_size)
+            events.append(_dialogue(
+                "CardDisclosure",
+                spec.duration,
+                f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({panel_x + panel_w / 2:.0f},"
+                f"{item_y:.0f})\\c{_wrap_override(light)}}}{body}",
+            ))
+
+    disclosure_y = layout.top + layout.safe_h * 0.875
+    caveat_y = layout.top + layout.safe_h * 0.935
+    for text, y, colour in (
+        (_SIGNAL_DISCLOSURE, disclosure_y, light),
+        (_SIGNAL_CAVEAT, caveat_y, accent),
+    ):
+        events.append(_dialogue(
+            "CardDisclosure",
+            spec.duration,
+            f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({layout.centre_x:.0f},{y:.0f})"
+            f"\\c{_wrap_override(colour)}}}{_escape_ass_text(text)}",
+        ))
+    return events
+
+
 def _comparison_events(spec, layout, palette, typography):
+    variant = _signal_comparison_variant(spec.heading)
+    if variant is not None:
+        return _signal_comparison_events(
+            spec,
+            layout,
+            palette,
+            typography,
+            variant,
+        )
+
     events = _heading_events(spec, layout, palette, typography, layout.top + layout.safe_h * 0.14)
     if not spec.items:
         return events
@@ -594,10 +994,20 @@ def _comparison_events(spec, layout, palette, typography):
     column = layout.safe_w / count
     for index, item in enumerate(spec.items):
         x = layout.left + column * (index + 0.5)
+        padding = min(column * 0.10, layout.width * 0.025)
+        clip_left = layout.left + column * index + padding
+        clip_right = layout.left + column * (index + 1) - padding
+        body = _wrapped_ass_text(
+            item,
+            max(1.0, clip_right - clip_left),
+            max(1, round(layout.height * _BODY_SIZE_FRACTION)),
+        )
         events.append(_dialogue(
             "CardBody", spec.duration,
             f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({x:.0f},{layout.centre_y + layout.height * 0.05:.0f})"
-            f"\\c{_wrap_override(light)}}}{_escape_ass_text(item)}"))
+            f"\\clip({clip_left:.0f},{layout.top:.0f},{clip_right:.0f},"
+            f"{layout.top + layout.safe_h:.0f})"
+            f"\\c{_wrap_override(light)}}}{body}"))
     return events
 
 
@@ -628,10 +1038,93 @@ def _timeline_events(spec, layout, palette, typography):
             "CardShape", spec.duration,
             f"{{\\an{_ASS_TOP_LEFT}\\pos({x - thickness / 2:.0f},{axis_y - tick_h / 2:.0f})"
             f"\\c{_wrap_override(accent)}}}{_rect(0, 0, thickness, tick_h)}"))
+
+        # Endpoint text grows inward from its tick. Centre anchoring made half
+        # of a long first/last label extend beyond title-safe. Each label also
+        # gets a local wrap/clip box so unusually long text cannot escape the
+        # safe area or collide with the opposite endpoint.
+        if count == 1:
+            alignment = _ASS_MIDDLE_CENTER
+            clip_left = axis_x
+            clip_right = axis_x + axis_w
+        else:
+            interval = axis_w / (count - 1)
+            label_w = interval * 0.86
+            if index == 0:
+                alignment = _ASS_MIDDLE_LEFT
+                clip_left = x
+                clip_right = min(x + label_w, layout.left + layout.safe_w)
+            elif index == count - 1:
+                alignment = _ASS_MIDDLE_RIGHT
+                clip_left = max(x - label_w, layout.left)
+                clip_right = x
+            else:
+                alignment = _ASS_MIDDLE_CENTER
+                clip_left = max(x - label_w / 2, layout.left)
+                clip_right = min(x + label_w / 2, layout.left + layout.safe_w)
+        body = _wrapped_ass_text(
+            item,
+            max(1.0, clip_right - clip_left),
+            max(1, round(layout.height * _BODY_SIZE_FRACTION)),
+        )
         events.append(_dialogue(
             "CardBody", spec.duration,
-            f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({x:.0f},{axis_y + layout.height * 0.06:.0f})"
-            f"\\c{_wrap_override(light)}}}{_escape_ass_text(item)}"))
+            f"{{\\an{alignment}\\pos({x:.0f},{axis_y + layout.height * 0.06:.0f})"
+            f"\\clip({clip_left:.0f},{layout.top:.0f},{clip_right:.0f},"
+            f"{layout.top + layout.safe_h:.0f})"
+            f"\\c{_wrap_override(light)}}}{body}"))
+    return events
+
+
+def _long_nonnumeric_stat_events(spec, figure, layout, palette, typography):
+    """Readable heading/body fallback for prose misclassified as a stat."""
+    heading = spec.heading.strip()
+    body = " / ".join(spec.items).strip()
+
+    # A heading-only prose stat still needs two levels. Derive a short,
+    # content-bearing heading from its opening words rather than inventing a
+    # generic label that tells the viewer nothing.
+    if not body or body == heading:
+        words = figure.split()
+        split_at = min(5, max(2, len(words) // 3))
+        if len(words) > split_at:
+            heading = " ".join(words[:split_at])
+            body = " ".join(words[split_at:])
+        else:
+            heading = figure
+            body = ""
+
+    fallback = CardSpec(
+        kind="stat",
+        heading=heading,
+        duration=spec.duration,
+        items=spec.items,
+    )
+    events = _heading_events(
+        fallback,
+        layout,
+        palette,
+        typography,
+        layout.top + layout.safe_h * 0.18,
+    )
+    if body:
+        light = palette.get("text_light", "#E0E0E0")
+        clip_left = layout.left + layout.safe_w * 0.08
+        clip_right = layout.left + layout.safe_w * 0.92
+        wrapped = _wrapped_ass_text(
+            body,
+            clip_right - clip_left,
+            max(1, round(layout.height * _BODY_SIZE_FRACTION)),
+        )
+        events.append(_dialogue(
+            "CardBody",
+            spec.duration,
+            f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({layout.centre_x:.0f},"
+            f"{layout.centre_y + layout.height * 0.07:.0f})"
+            f"\\clip({clip_left:.0f},{layout.top:.0f},{clip_right:.0f},"
+            f"{layout.top + layout.safe_h:.0f})"
+            f"\\c{_wrap_override(light)}}}{wrapped}",
+        ))
     return events
 
 
@@ -647,6 +1140,17 @@ def _stat_events(spec, layout, palette, typography):
     if caption and number and not spec.items:
         remainder = caption.replace(number, "", 1).strip(" ,-")
         caption = remainder or ""
+
+    # CardStat is intentionally huge and works for figures such as "400" or
+    # "2.279 million". It is not a prose style. Classification can still land
+    # here through words like "numbered"; only long, nonnumeric figures take
+    # this fallback, leaving established numeric/short layouts unchanged.
+    stat_size = max(1, round(layout.height * _STAT_SIZE_FRACTION))
+    stat_capacity = max(1, int((layout.safe_w * 0.84) / (stat_size * 0.62)))
+    if not _first_number(figure) and len(re.sub(r"\s+", " ", figure).strip()) > stat_capacity:
+        return _long_nonnumeric_stat_events(
+            spec, figure, layout, palette, typography
+        )
 
     events = [_dialogue(
         "CardStat", spec.duration,
@@ -693,6 +1197,20 @@ def _document_events(spec, layout, palette, typography):
             "CardShape", spec.duration,
             f"{{\\an{_ASS_TOP_LEFT}\\pos({x:.0f},{y:.0f})"
             f"\\c{_wrap_override(mid)}}}{_rect(0, 0, w, h)}"))
+
+    if spec.disclosure.strip():
+        disclosure_size = max(
+            1, round(layout.height * _DISCLOSURE_SIZE_FRACTION)
+        )
+        disclosure = _wrapped_ass_text(
+            _transform(spec.disclosure, typography),
+            frame_w * 0.90,
+            disclosure_size,
+        )
+        events.append(_dialogue(
+            "CardDisclosure", spec.duration,
+            f"{{\\an{_ASS_TOP_LEFT}\\pos({frame_x + frame_w * 0.05:.0f},"
+            f"{frame_y + frame_h * 0.06:.0f})}}{disclosure}"))
 
     # Only fill the frame when there is something to put in it. Echoing the
     # heading inside its own frame reads as a rendering mistake, not a design.
@@ -765,6 +1283,9 @@ def card_ass(
     spec: CardSpec, typography: dict, palette: dict, width: int = 1920, height: int = 1080
 ) -> str:
     """The ASS document for one card."""
+    signal_errors = _signal_comparison_findings(spec)
+    if signal_errors:
+        raise ValueError(signal_errors[0].message)
     layout = _Layout(width=width, height=height)
     events = _EVENT_BUILDERS[spec.kind](spec, layout, palette, typography)
 

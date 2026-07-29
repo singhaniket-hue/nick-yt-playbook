@@ -20,6 +20,9 @@ from rabbithole.assets import (
     format_plan,
     load_artifacts,
     plan_assets,
+    record_media_path,
+    select_plan_items,
+    usable_provenance_records,
 )
 from rabbithole.audiomix import bed_spans, build_mix, sfx_events, silence_windows
 from rabbithole.config import REPO_ROOT, load_config
@@ -39,8 +42,11 @@ from rabbithole.provenance import (
     TIERS,
     AssetRecord,
     add_record,
+    apply_asset_refresh,
     check_provenance,
     load_provenance,
+    plan_asset_refresh,
+    resumable_refresh_id,
     save_provenance,
 )
 from rabbithole.render import assemble_footage, deferred_audio_cues, finish
@@ -103,6 +109,17 @@ def _quality_mode(args: argparse.Namespace) -> str:
     their feet.
     """
     return getattr(args, "quality", "animatic")
+
+
+def _positive_int(value: str) -> int:
+    """Argparse type for bounded batch sizes."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
 
 
 def _devanagari_for(script_path: Path) -> Path:
@@ -554,6 +571,27 @@ def _live_archive_transport(url: str) -> tuple[int, bytes]:
 
 def cmd_assets(args: argparse.Namespace) -> int:
     """Plan, and unless --dry-run source, every visual asset a slot plan calls for."""
+    requested_slots = tuple(
+        dict.fromkeys(getattr(args, "slot", ()) or ())
+    )
+    refresh = bool(getattr(args, "refresh", False))
+    tier = getattr(args, "tier", None)
+    batch_size = getattr(args, "batch_size", None)
+    if refresh and not requested_slots:
+        print(
+            "Refusing --refresh without an explicit --slot. Repeat --slot for "
+            "every asset slot that may be retired; no media or provenance was "
+            "changed."
+        )
+        return 2
+    if refresh and (tier or batch_size is not None):
+        print(
+            "Refusing --refresh with --tier or --batch-size. Refresh already "
+            "uses the exact repeated --slot set as its complete transaction "
+            "scope; no media or provenance was changed."
+        )
+        return 2
+
     timing_path = Path(args.timing_json)
     document = read_json(timing_path)
     # projects/<slug>/narration/timing.json -> projects/<slug>
@@ -563,26 +601,129 @@ def cmd_assets(args: argparse.Namespace) -> int:
     slot_findings = check_slots(slots, document)
     print(format_report(slot_findings))
 
-    records = load_provenance(project_root / "provenance.json")
+    provenance_path = project_root / "provenance.json"
+    records = load_provenance(provenance_path)
     claims = load_claims(project_root / "claims.json")
     artifacts = load_artifacts(project_root / "research" / "artifacts.json")
 
-    items = plan_assets(slots, records, artifacts)
+    known_slot_ids = {slot.slot_id for slot in slots}
+    unknown_slots = sorted(set(requested_slots) - known_slot_ids)
+    if unknown_slots:
+        print()
+        print(
+            "Unknown --slot value(s): "
+            + ", ".join(unknown_slots)
+            + ". No acquisition was attempted."
+        )
+        return 2
+
+    refresh_plan = None
+    resume_id = None
+    planning_records = records
+    if refresh:
+        resume_id = resumable_refresh_id(records, requested_slots)
+        try:
+            candidate_plan = plan_asset_refresh(
+                records, requested_slots, project_root
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print()
+            print(f"Refresh preflight failed: {exc}")
+            return 2
+        if resume_id is None:
+            refresh_plan = candidate_plan
+            planning_records = list(candidate_plan.preview_records)
+
+    usable_records, existing_media_findings = usable_provenance_records(
+        planning_records, project_root
+    )
+    if existing_media_findings:
+        print()
+        print(format_report(existing_media_findings))
+
+    # Invalid same-tier entries are intentionally excluded so the deterministic
+    # local path can be restored. Preserve stale-tier decisions from the full
+    # append-only ledger, though: acquiring over one would leave two assets
+    # claiming the same positional slot.
+    all_record_items = plan_assets(slots, planning_records, artifacts)
+    stale_by_slot = {
+        item.slot_id: item for item in all_record_items if item.action == "stale"
+    }
+    items = [
+        stale_by_slot.get(item.slot_id, item)
+        for item in plan_assets(slots, usable_records, artifacts)
+    ]
     quality = _quality_mode(args)
-    if args.tier:
-        items = [item for item in items if item.tier == args.tier]
+    if tier:
+        items = [item for item in items if item.tier == tier]
+
+    items = select_plan_items(
+        items, slot_ids=requested_slots, batch_size=batch_size
+    )
+
+    if refresh:
+        allowed_refresh_actions = {
+            "generate",
+            "draw",
+            "shoot",
+            "search",
+            "fetch",
+        }
+        item_by_slot = {item.slot_id: item for item in items}
+        unsafe = []
+        for slot_id in requested_slots:
+            item = item_by_slot.get(slot_id)
+            if item is None:
+                unsafe.append(f"{slot_id}: no plan item")
+            elif item.action == "satisfied" and resume_id is not None:
+                continue
+            elif item.action not in allowed_refresh_actions:
+                unsafe.append(f"{slot_id}: {item.action} ({item.reason})")
+        if unsafe:
+            print()
+            print(
+                "Refresh preflight found selected slot(s) that cannot be "
+                "regenerated safely: "
+                + "; ".join(unsafe)
+                + ". No media or provenance was changed."
+            )
+            return 2
 
     print()
     print(format_plan(items))
+    if refresh:
+        if resume_id is not None:
+            print()
+            print(
+                f"REFRESH RESUME {resume_id}: keeping successful current "
+                "replacement(s) and regenerating only selected gaps."
+            )
+        elif refresh_plan is not None:
+            print()
+            verb = "would retire" if args.dry_run else "will retire"
+            print(
+                f"REFRESH {refresh_plan.refresh_id}: {verb} "
+                f"{len(refresh_plan.retired_records)} current record(s) into "
+                "project-local revisions/quarantine before replacement."
+            )
 
     if args.dry_run:
         dry_findings: list[Finding] = []
         if quality == "final":
+            quality_records = usable_records
+            if refresh_plan is not None:
+                # Refresh planning deliberately clears the selected claims so
+                # those slots become actionable.  That preview is correct for
+                # acquisition, but it is not the current project state and
+                # must not make a no-write preflight fail by construction.
+                quality_records, _ = usable_provenance_records(
+                    records, project_root
+                )
             dry_findings += check_provenance(
-                records, [slot.slot_id for slot in slots]
+                quality_records, [slot.slot_id for slot in slots]
             )
             dry_findings += check_source_quality(
-                slots, records, quality=quality
+                slots, quality_records, quality=quality
             )
         if dry_findings:
             print()
@@ -592,8 +733,59 @@ def cmd_assets(args: argparse.Namespace) -> int:
 
     out_dir = Path(args.out_dir) if args.out_dir else project_root / "assets"
     grade = load_grade(REPO_ROOT / "style")
+    typography = read_json(REPO_ROOT / "style" / "typography.json")
+    palette = read_json(REPO_ROOT / "style" / "palette.json")
 
-    new_records, exec_findings = execute_plan(
+    if refresh_plan is not None:
+        try:
+            records = apply_asset_refresh(provenance_path, refresh_plan)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print()
+            print(
+                f"Refresh retirement failed before replacement: {exc}. "
+                "Completed media moves were rolled back where possible."
+            )
+            return 2
+        usable_records, retirement_media_findings = usable_provenance_records(
+            records, project_root
+        )
+        if retirement_media_findings:
+            print()
+            print(format_report(retirement_media_findings))
+
+    all_records = list(records)
+
+    def checkpoint(record: AssetRecord) -> None:
+        """Persist each successful slot before acquisition advances."""
+        nonlocal all_records
+        portable = _portable_asset_record(record, project_root)
+        existing = next(
+            (
+                candidate
+                for candidate in all_records
+                if candidate.asset_id == portable.asset_id
+            ),
+            None,
+        )
+        if existing is not None:
+            existing_path = record_media_path(existing, project_root)
+            new_path = record_media_path(portable, project_root)
+            if (
+                existing.used_in_slots != portable.used_in_slots
+                or existing_path.resolve() != new_path.resolve()
+            ):
+                raise RuntimeError(
+                    f"Cannot checkpoint asset {portable.asset_id!r}: an "
+                    "incompatible record with that id already exists."
+                )
+            # An interrupted earlier run may have saved the ledger before its
+            # media disappeared. Recreating the deterministic path restores
+            # that record without mutating the append-only audit entry.
+            return
+        all_records = add_record(all_records, portable)
+        save_provenance(provenance_path, all_records)
+
+    _new_records, exec_findings = execute_plan(
         items,
         slots,
         out_dir,
@@ -601,33 +793,43 @@ def cmd_assets(args: argparse.Namespace) -> int:
         claims=claims,
         archive_transport=_live_archive_transport,
         artifacts=artifact_bindings_by_slot(artifacts),
-        typography=read_json(REPO_ROOT / "style" / "typography.json"),
-        palette=read_json(REPO_ROOT / "style" / "palette.json"),
+        typography=typography,
+        palette=palette,
         quality=quality,
+        on_record=checkpoint,
+        source_media_by_slot={
+            slot_id: record_media_path(record, project_root)
+            for record in usable_records
+            for slot_id in record.used_in_slots
+        },
     )
-    new_records = [
-        _portable_asset_record(record, project_root) for record in new_records
-    ]
     if exec_findings:
         print()
         print(format_report(exec_findings))
 
-    all_records = records
-    for record in new_records:
-        all_records = add_record(all_records, record)
-    save_provenance(project_root / "provenance.json", all_records)
-
     slot_ids = [slot.slot_id for slot in slots]
-    provenance_findings = check_provenance(all_records, slot_ids)
+    final_usable_records, final_media_findings = usable_provenance_records(
+        all_records, project_root, severity="error"
+    )
+    provenance_findings = check_provenance(final_usable_records, slot_ids)
     source_quality_findings = check_source_quality(
-        slots, all_records, quality=quality
+        slots, final_usable_records, quality=quality
     )
     print()
-    print(format_report([*provenance_findings, *source_quality_findings]))
+    print(
+        format_report(
+            [
+                *final_media_findings,
+                *provenance_findings,
+                *source_quality_findings,
+            ]
+        )
+    )
 
     all_findings = [
         *slot_findings,
         *exec_findings,
+        *final_media_findings,
         *provenance_findings,
         *source_quality_findings,
     ]
@@ -861,7 +1063,7 @@ def cmd_sound(args: argparse.Namespace) -> int:
     # step (`normalize_bed_group`, run over the cached raws), so it still has
     # to happen on a fully-cached run -- skipping it would leave the playable
     # beds at whatever level the last build left them.
-    cfg = load_config()
+    cfg = load_config(require_voice_id=False)
     print()
     counts = build_library(
         library, prompts, cfg.elevenlabs_api_key,
@@ -1337,6 +1539,35 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Limit the plan to one tier. '--tier atmospheric' is the safe first "
             "run: fully local plate generation, no network, no rights questions."
+        ),
+    )
+    assets.add_argument(
+        "--slot",
+        action="append",
+        metavar="SLOT_ID",
+        help=(
+            "Limit acquisition to one exact slot id; repeat for multiple slots "
+            "(for example --slot s041 --slot s042)."
+        ),
+    )
+    assets.add_argument(
+        "--refresh",
+        action="store_true",
+        help=(
+            "Recoverably replace currently claimed assets for the exact repeated "
+            "--slot set. Existing media moves into project-local "
+            "revisions/quarantine and remains as unclaimed audit provenance. "
+            "Requires at least one --slot; cannot be combined with --tier or "
+            "--batch-size."
+        ),
+    )
+    assets.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        help=(
+            "Acquire at most this many currently actionable slots. Re-running "
+            "the same command advances to the next missing batch because each "
+            "success is checkpointed atomically."
         ),
     )
     assets.add_argument(

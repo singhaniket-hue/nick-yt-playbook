@@ -659,6 +659,52 @@ def duck_for_source_audio(
     return out_path
 
 
+def _render_raw_layer_mix(input_paths: list[Path], out_path: Path) -> Path:
+    """Sum audio layers exactly as the final mix path does, before limiting."""
+
+    if not input_paths:
+        raise ValueError("an audio mix needs at least one input layer")
+    inputs: list[str] = []
+    for path in input_paths:
+        inputs += ["-i", str(Path(path))]
+    streams = "".join(f"[{index}:a]" for index in range(len(input_paths)))
+    _run(
+        [
+            "ffmpeg", "-y",
+            *inputs,
+            "-filter_complex",
+            f"{streams}amix=inputs={len(input_paths)}:duration=first:normalize=0[out]",
+            "-map", "[out]",
+            "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+            "-c:a", "pcm_s16le", str(out_path),
+        ]
+    )
+    return Path(out_path)
+
+
+def measure_mix_master_gain_db(
+    input_paths: list[Path],
+    work_path: Path,
+) -> float:
+    """Return the non-positive gain needed to respect the mix peak ceiling.
+
+    Resolve receives independent editable tracks, while ``mix_audio`` normally
+    measures their sum and applies one uniform attenuation after mixing.  This
+    helper uses the exact same raw-sum and peak-measurement path so a Resolve
+    handoff can express that uniform value as editable clip gain.
+    """
+
+    work_path = Path(work_path)
+    work_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _render_raw_layer_mix([Path(path) for path in input_paths], work_path)
+        peak = _measure_peak_db(work_path)
+        return min(0.0, MIX_CLIP_CEILING_DB - peak)
+    finally:
+        if work_path.exists():
+            work_path.unlink()
+
+
 def mix_audio(
     vo_path: Path,
     bed_path: Path,
@@ -681,27 +727,10 @@ def mix_audio(
     raw_path = out_path.with_suffix(".raw.wav")
 
     try:
-        inputs = [
-            "-i", str(vo_path),
-            "-i", str(bed_path),
-            "-i", str(sfx_path),
-        ]
-        input_count = 3
+        input_paths = [Path(vo_path), Path(bed_path), Path(sfx_path)]
         if source_audio_path is not None:
-            inputs += ["-i", str(source_audio_path)]
-            input_count += 1
-        streams = "".join(f"[{index}:a]" for index in range(input_count))
-        _run(
-            [
-                "ffmpeg", "-y",
-                *inputs,
-                "-filter_complex",
-                f"{streams}amix=inputs={input_count}:duration=first:normalize=0[out]",
-                "-map", "[out]",
-                "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
-                "-c:a", "pcm_s16le", str(raw_path),
-            ]
-        )
+            input_paths.append(Path(source_audio_path))
+        _render_raw_layer_mix(input_paths, raw_path)
         peak = _measure_peak_db(raw_path)
         gain = min(0.0, MIX_CLIP_CEILING_DB - peak)
         _run(
@@ -767,7 +796,11 @@ def build_mix(
         spans, duration, work_dir / "bed-layer.wav", work_dir / "bed-cache",
         library=library,
     )
-    findings = [*sfx_findings, *bed_findings, *_events_inside_silence_findings(events, windows)]
+    findings = [
+        *sfx_findings,
+        *bed_findings,
+        *events_inside_silence_findings(events, windows),
+    ]
 
     sfx_ducked = duck(sfx_raw, windows, work_dir / "sfx-ducked.wav")
     bed_ducked = duck(bed_raw, windows, work_dir / "bed-ducked.wav")
@@ -797,7 +830,10 @@ def build_mix(
     return out_path, findings
 
 
-def _events_inside_silence_findings(events: list[SfxEvent], windows: list[SilenceWindow]) -> list[Finding]:
+def events_inside_silence_findings(
+    events: list[SfxEvent],
+    windows: list[SilenceWindow],
+) -> list[Finding]:
     """Warn about an SFX cue scheduled inside a silence window.
 
     The drop has to be total -- `duck` mutes the SFX layer there along with

@@ -245,12 +245,19 @@ stages:
     human_approval_default: false
 
   - name: assets
-    cli: rabbithole assets <narration/timing.json>
+    cli: rabbithole assets <narration/timing.json> [--batch-size N | --slot SLOT_ID ...]
     description: >
       Plans and sources one asset per slot across three tiers (primary
       artifacts, archival texture, generated atmospherics), recording full
       provenance (provider, original_url, license, retrieved_at) for every
-      asset.
+      asset. Each success is checkpointed atomically, so bounded batches and
+      exact-slot runs resume missing work without repeating completed
+      acquisition. Explicit --refresh requires the complete repeated --slot
+      set, quarantines replaced media, and preserves retired audit provenance.
+      Target-aware browser capture fails closed on consent/challenge/blank
+      pages; retained source-video frames and portable H.264 yt-dlp downloads
+      provide deterministic alternatives. Read-only contact sheets are
+      generated with `python -m rabbithole.contactsheet` before asset approval.
     required_artifacts_in:
       - timing_spine
       - slot_plan
@@ -258,9 +265,13 @@ stages:
       - research_artifacts
     produces:
       - asset_manifest  # provenance.json
+      - contact_sheets  # review/contact-sheets/*.png + contact-sheets.json
     tools_available:
       - ytdlp
       - archive_sources
+      - target_browser_capture
+      - source_frame_derivation
+      - contact_sheet_qa
       - plate_generator
     checkpoint_required: true
     human_approval_default: true
@@ -268,6 +279,8 @@ stages:
       - Every slot has exactly one asset in the provenance ledger
       - Tier-1 (primary artifact) footage never fetched without a matching claims_ledger entry
       - Full licence string present on every archival-texture asset
+      - Graphics and evidence contact sheets have no unresolved red error cards
+      - Same-URL targets, source-frame timestamps/crops, and editorial caveats are visually correct
 
   - name: edl
     cli: rabbithole edl <narration/timing.json>
@@ -327,14 +340,15 @@ stages:
         implementation: rabbithole.resolve_runner
         produces: >
           editable V1-V4/A1-A5 track contract, subtitles, grouped provenance
-          markers, baseline grade intent/application, an optional final render,
-          and a source-inclusive portable archive. Fusion/VHS placement and the
-          complete Crowley texture treatment remain human-review items.
+          markers, editable provenance-derived source captions, baseline grade
+          intent/application, an optional final render, and a source-inclusive
+          portable archive. Fusion/VHS placement and the complete Crowley
+          texture treatment remain human-review items.
     tools_available: []
     checkpoint_required: true
     human_approval_default: true
     review_focus:
       - Generated duration matches the EDL to within one frame
       - No protected EDITORIAL_vN timeline was changed
-      - Evidence, redactions, rights flags, subtitles, and source bites are reviewed
+      - Evidence, redactions, rights flags, subtitles, editable source captions, and source bites are reviewed
       - Output and restored archive match the target canvas and track map

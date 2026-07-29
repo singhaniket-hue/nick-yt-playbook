@@ -33,6 +33,20 @@ the title or transition templates automatically; editors can apply them from
 the installed template browser. A build result reports `manual_required` if a
 versioned grade asset or clip node graph is unavailable.
 
+Provenance-derived source captions take the deterministic FCPXML path instead:
+they arrive on V3 as editable lower-left Basic Title items. The
+`RabbitholeSource` Fusion title remains an optional editor-applied treatment,
+not a prerequisite for receiving or editing source attribution.
+
+Generated sound follows the same deterministic handoff rule. Before compiling
+FCPXML, `resolve prepare` freezes the approved mix decisions into immutable,
+content-addressed A3 music and A4 SFX WAV stems inside the episode. Resolve
+imports them with the same shared master attenuation as A1 narration, preserving
+the approved peak ceiling while leaving each track editable. The raw project
+sound library remains available for an editor who wants to redesign individual
+cues. Projects with authored source-audio bites must use the FFmpeg renderer
+until their narration/music duck automation is supported by Resolve stems.
+
 Fonts are not vendored by default. The Fusion templates request IBM Plex Mono;
 install a properly licensed copy for deterministic typography because Resolve's
 substitution varies by machine. FCPXML baseline titles use Courier New and
