@@ -234,6 +234,13 @@ Simple phone shots elevate a video enormously: a hand typing in the dark, a hall
 > **ASSET ORGANIZATION**
 >
 > Name assets by chapter and script line as you collect them: `ch3_012_profile_screenshot.png`. Editing a 30-minute doc with 400 unlabeled files is how projects die. Keep a "shot list" column in your script noting which asset covers each paragraph — do this during research, not during the edit.
+>
+> In RabbitHole's `research/artifacts.json`, preserve `title`, `date`,
+> `source_role`, and `rights_note` on every source. Use
+> `acquisition_mode: "screenshot-only"` or `"video-only"` when the permitted
+> method is explicit, and add a positive `max_use_seconds` when excerpt length
+> is restricted. The asset planner fails closed on incompatible methods or
+> overlong source slots and carries the source context into provenance.
 
 ---
 

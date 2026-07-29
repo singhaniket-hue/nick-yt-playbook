@@ -9,6 +9,7 @@ from rabbithole.assets import (
     KIND_TO_TIER,
     Artifact,
     PlanItem,
+    artifact_bindings_by_slot,
     artifact_urls_by_slot,
     check_source_quality,
     evidence_metrics,
@@ -56,8 +57,13 @@ def _record(asset_id, **overrides):
     return AssetRecord(**defaults)
 
 
-def _artifact(artifact_id, url, slot_id=""):
-    return Artifact(artifact_id=artifact_id, url=url, slot_id=slot_id)
+def _artifact(artifact_id, url, slot_id="", **overrides):
+    return Artifact(
+        artifact_id=artifact_id,
+        url=url,
+        slot_id=slot_id,
+        **overrides,
+    )
 
 
 def _transport_for(url_to_response):
@@ -106,6 +112,8 @@ def test_load_artifacts_parses_the_rich_schema_with_every_field_populated(tmp_pa
                     "use": "Establish the actual case and hearing.",
                     "rights_note": "Official public record; retain attribution.",
                     "slot_id": "s001",
+                    "acquisition_mode": "screenshot-only",
+                    "max_use_seconds": 8.5,
                 }
             ]
         ),
@@ -125,6 +133,8 @@ def test_load_artifacts_parses_the_rich_schema_with_every_field_populated(tmp_pa
             use="Establish the actual case and hearing.",
             rights_note="Official public record; retain attribution.",
             slot_id="s001",
+            acquisition_mode="screenshot-only",
+            max_use_seconds=8.5,
         )
     ]
 
@@ -245,6 +255,22 @@ def test_artifact_urls_by_slot_is_empty_when_none_are_bound():
     assert artifact_urls_by_slot(artifacts) == {}
 
 
+def test_artifact_bindings_by_slot_preserves_complete_rights_metadata():
+    artifact = _artifact(
+        "a001",
+        "https://example.com/a",
+        slot_id="s001",
+        title="Source title",
+        date="2026-07-01",
+        source_role="primary",
+        rights_note="Screenshot only; credit on screen.",
+        acquisition_mode="screenshot-only",
+        max_use_seconds=4.0,
+    )
+
+    assert artifact_bindings_by_slot([artifact]) == {"s001": artifact}
+
+
 # --- plan_assets: satisfied precedence --------------------------------
 
 
@@ -344,6 +370,122 @@ def test_capture_slot_with_a_bound_artifact_is_fetch():
     items = plan_assets([slot], [], artifacts)
 
     assert items[0].action == "fetch"
+
+
+def test_screenshot_only_artifact_blocks_a_capture_slot_before_fetch():
+    slot = _slot("s001", "capture", start=0.0, end=4.0)
+    artifact = _artifact(
+        "a001",
+        "https://example.com/video",
+        slot_id="s001",
+        acquisition_mode="screenshot-only",
+    )
+
+    item = plan_assets([slot], [], [artifact])[0]
+
+    assert item.action == "blocked"
+    assert "screenshot-only" in item.reason
+    assert "fetch" in item.reason
+
+
+def test_screenshot_only_artifact_allows_a_screenshot_slot():
+    slot = _slot("s001", "screenshot", start=0.0, end=4.0)
+    artifact = _artifact(
+        "a001",
+        "https://example.com/page",
+        slot_id="s001",
+        acquisition_mode="screenshot-only",
+    )
+
+    assert plan_assets([slot], [], [artifact])[0].action == "shoot"
+
+
+def test_video_only_artifact_blocks_a_screenshot_slot():
+    slot = _slot("s001", "screenshot", start=0.0, end=4.0)
+    artifact = _artifact(
+        "a001",
+        "https://example.com/video",
+        slot_id="s001",
+        acquisition_mode="video-only",
+    )
+
+    item = plan_assets([slot], [], [artifact])[0]
+
+    assert item.action == "blocked"
+    assert "video-only" in item.reason
+    assert "shoot" in item.reason
+
+
+def test_unknown_acquisition_mode_fails_closed_at_planning_time():
+    slot = _slot("s001", "capture", start=0.0, end=4.0)
+    artifact = _artifact(
+        "a001",
+        "https://example.com/video",
+        slot_id="s001",
+        acquisition_mode="download-somehow",
+    )
+
+    item = plan_assets([slot], [], [artifact])[0]
+
+    assert item.action == "blocked"
+    assert "unsupported acquisition_mode" in item.reason
+
+
+@pytest.mark.parametrize("limit", [0, -1, float("inf"), "five", True])
+def test_invalid_max_use_seconds_fails_closed(limit):
+    slot = _slot("s001", "screenshot", start=0.0, end=4.0)
+    artifact = _artifact(
+        "a001",
+        "https://example.com/page",
+        slot_id="s001",
+        max_use_seconds=limit,
+    )
+
+    item = plan_assets([slot], [], [artifact])[0]
+
+    assert item.action == "blocked"
+    assert "positive finite number" in item.reason
+
+
+def test_max_use_seconds_blocks_a_source_slot_that_holds_too_long():
+    slot = _slot("s001", "screenshot", start=0.0, end=4.1)
+    artifact = _artifact(
+        "a001",
+        "https://example.com/page",
+        slot_id="s001",
+        max_use_seconds=4.0,
+    )
+
+    item = plan_assets([slot], [], [artifact])[0]
+
+    assert item.action == "blocked"
+    assert "at most 4s" in item.reason
+    assert "4.1s" in item.reason
+
+
+def test_max_use_seconds_allows_a_source_slot_at_the_exact_limit():
+    slot = _slot("s001", "screenshot", start=0.0, end=4.0)
+    artifact = _artifact(
+        "a001",
+        "https://example.com/page",
+        slot_id="s001",
+        max_use_seconds=4.0,
+    )
+
+    assert plan_assets([slot], [], [artifact])[0].action == "shoot"
+
+
+def test_source_policy_still_blocks_an_already_claimed_slot():
+    slot = _slot("s001", "capture", start=0.0, end=5.0)
+    artifact = _artifact(
+        "a001",
+        "https://example.com/video",
+        slot_id="s001",
+        max_use_seconds=4.0,
+    )
+    existing = _record("existing", tier="primary", used_in_slots=("s001",))
+
+    assert plan_assets([slot], [existing], [artifact])[0].action == "blocked"
 
 
 # --- plan_assets: unknown kind -------------------------------------------
@@ -601,6 +743,42 @@ def test_one_slot_failing_does_not_prevent_a_later_slot_from_being_sourced(tmp_p
 # --- execute_plan: fetch (capture) ----------------------------------------
 
 
+def test_execute_plan_rechecks_acquisition_policy_before_fetch(tmp_path):
+    slot = _slot("s001", "capture", start=0.0, end=5.0)
+    item = PlanItem(
+        slot_id="s001",
+        kind="capture",
+        tier="primary",
+        action="fetch",
+        reason="stale plan prepared before the rights policy changed",
+    )
+    artifact = _artifact(
+        "a001",
+        "https://www.youtube.com/watch?v=abc123",
+        slot_id="s001",
+        acquisition_mode="screenshot-only",
+    )
+
+    def runner(_argv):
+        raise AssertionError("yt-dlp must not run against a screenshot-only source")
+
+    records, findings = execute_plan(
+        [item],
+        [slot],
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        ytdlp_runner=runner,
+        artifacts=artifact_bindings_by_slot([artifact]),
+    )
+
+    assert records == []
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+    assert "Acquisition refused" in findings[0].message
+    assert "screenshot-only" in findings[0].message
+
+
 def test_fetch_slot_whose_claims_ledger_does_not_cite_the_url_yields_a_finding(tmp_path):
     slot = _slot("s001", "capture", start=0.0, end=5.0)
     artifact_list = [
@@ -632,7 +810,17 @@ def test_fetch_slot_whose_claims_ledger_does_not_cite_the_url_yields_a_finding(t
 def test_fetch_slot_whose_claims_ledger_cites_the_url_yields_a_record(tmp_path):
     slot = _slot("s001", "capture", start=0.0, end=5.0)
     url = "https://www.youtube.com/watch?v=abc123"
-    artifact_list = [_artifact("a001", url, slot_id="s001")]
+    artifact_list = [
+        _artifact(
+            "a001",
+            url,
+            slot_id="s001",
+            title="Original test upload",
+            date="2013-09-23",
+            source_role="primary-original",
+            rights_note="Use no more than a brief credited excerpt.",
+        )
+    ]
     items = plan_assets([slot], [], artifact_list)
     claims = [
         {
@@ -654,13 +842,18 @@ def test_fetch_slot_whose_claims_ledger_cites_the_url_yields_a_record(tmp_path):
         claims=claims,
         ytdlp_runner=runner,
         ytdlp_prober=lambda p: True,
-        artifacts=artifact_urls_by_slot(artifact_list),
+        artifacts=artifact_bindings_by_slot(artifact_list),
     )
 
     assert findings == []
     assert len(records) == 1
     assert records[0].tier == "primary"
     assert records[0].used_in_slots == ("s001",)
+    assert "artifact_id='a001'" in records[0].notes
+    assert "title='Original test upload'" in records[0].notes
+    assert "date='2013-09-23'" in records[0].notes
+    assert "source_role='primary-original'" in records[0].notes
+    assert "rights_note='Use no more than a brief credited excerpt.'" in records[0].notes
 
 
 # --- execute_plan: no-op actions ------------------------------------------
@@ -1060,7 +1253,17 @@ def test_a_bound_screenshot_slot_is_captured_and_recorded(tmp_path):
     from PIL import Image
 
     slot = _slot("s001", "screenshot", detail="archived homepage", start=0.0, end=1.0)
-    artifact_list = [_artifact("a001", "https://web.archive.org/web/2026/https://x", slot_id="s001")]
+    artifact_list = [
+        _artifact(
+            "a001",
+            "https://web.archive.org/web/2026/https://x",
+            slot_id="s001",
+            title="Archived homepage",
+            date="2026-07-01",
+            source_role="contemporaneous-reporting",
+            rights_note="Screenshot only; preserve visible attribution.",
+        )
+    ]
     items = plan_assets([slot], [], artifact_list)
     assert items[0].action == "shoot"
 
@@ -1081,7 +1284,7 @@ def test_a_bound_screenshot_slot_is_captured_and_recorded(tmp_path):
 
     records, findings = execute_plan(
         items, [slot], tmp_path, grade=GRADE, claims=[],
-        artifacts=artifact_urls_by_slot(artifact_list),
+        artifacts=artifact_bindings_by_slot(artifact_list),
         capture_runner=runner,
     )
 
@@ -1090,6 +1293,11 @@ def test_a_bound_screenshot_slot_is_captured_and_recorded(tmp_path):
     assert records[0].asset_id == "capture-s001"
     assert records[0].tier == "primary"
     assert Path(records[0].local_path).exists()
+    assert "artifact_id='a001'" in records[0].notes
+    assert "title='Archived homepage'" in records[0].notes
+    assert "date='2026-07-01'" in records[0].notes
+    assert "source_role='contemporaneous-reporting'" in records[0].notes
+    assert "rights_note='Screenshot only; preserve visible attribution.'" in records[0].notes
 
 
 def test_capturing_a_live_page_surfaces_the_archive_warning(tmp_path):

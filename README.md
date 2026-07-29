@@ -88,6 +88,14 @@ uv run rabbithole assets projects/my-episode/narration/timing.json
 uv run rabbithole edl projects/my-episode/narration/timing.json
 ```
 
+For a source-bound `capture` or `screenshot` shot, bind the full catalogue
+entry in `research/artifacts.json` with `slot_id`. Existing entries need no new
+fields. When rights require a particular method, set `acquisition_mode` to
+`screenshot-only` or `video-only`; blank/`auto` preserves the inferred method.
+An optional positive `max_use_seconds` blocks a slot whose full hold exceeds
+the permitted use. The source `title`, `date`, `source_role`, and `rights_note`
+are copied into the retrieved asset's provenance notes.
+
 For voice cloning, `script/05-devanagari.md` is deliberately mixed-script:
 write Hindi words in Devanagari, but keep English words, brands, acronyms, and
 technical terms in Latin. Never transliterate an English word into Devanagari.

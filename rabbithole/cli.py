@@ -14,7 +14,7 @@ from pathlib import Path
 
 from rabbithole.assets import (
     QUALITY_MODES,
-    artifact_urls_by_slot,
+    artifact_bindings_by_slot,
     check_source_quality,
     execute_plan,
     format_plan,
@@ -600,7 +600,7 @@ def cmd_assets(args: argparse.Namespace) -> int:
         grade=grade,
         claims=claims,
         archive_transport=_live_archive_transport,
-        artifacts=artifact_urls_by_slot(artifacts),
+        artifacts=artifact_bindings_by_slot(artifacts),
         typography=read_json(REPO_ROOT / "style" / "typography.json"),
         palette=read_json(REPO_ROOT / "style" / "palette.json"),
         quality=quality,

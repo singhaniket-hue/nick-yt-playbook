@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -314,6 +315,8 @@ class Artifact:
     use: str = ""
     rights_note: str = ""
     slot_id: str = ""
+    acquisition_mode: str = ""
+    max_use_seconds: float | None = None
 
 
 _ARTIFACT_FIELDS = frozenset(f.name for f in dataclasses.fields(Artifact))
@@ -371,10 +374,101 @@ def artifact_urls_by_slot(artifacts: list[Artifact]) -> dict[str, str]:
     return {artifact.slot_id: artifact.url for artifact in artifacts if artifact.slot_id}
 
 
+def artifact_bindings_by_slot(artifacts: list[Artifact]) -> dict[str, Artifact]:
+    """Return complete bound catalogue records keyed by slot.
+
+    Execution needs the complete record, rather than only its URL, so source
+    identity and rights notes survive into the provenance ledger.  Keep
+    :func:`artifact_urls_by_slot` for callers that only need URLs.
+    """
+    return {
+        artifact.slot_id: artifact
+        for artifact in artifacts
+        if artifact.slot_id
+    }
+
+
+ACQUISITION_MODES = frozenset({"", "auto", "screenshot-only", "video-only"})
+_ACQUISITION_ACTIONS = {
+    "screenshot-only": "shoot",
+    "video-only": "fetch",
+}
+
+
+def _artifact_policy_block(
+    artifact: Artifact, slot: Slot, action: str
+) -> str | None:
+    """Return a fail-closed planning reason for an incompatible source policy."""
+    mode = str(artifact.acquisition_mode or "").strip().lower()
+    if mode not in ACQUISITION_MODES:
+        expected = ", ".join(repr(value) for value in sorted(ACQUISITION_MODES))
+        return (
+            f"artifact {artifact.artifact_id!r} bound to slot {slot.slot_id!r} "
+            f"has unsupported acquisition_mode {artifact.acquisition_mode!r}; "
+            f"expected one of {expected}"
+        )
+
+    required_action = _ACQUISITION_ACTIONS.get(mode)
+    if required_action is not None and action != required_action:
+        return (
+            f"artifact {artifact.artifact_id!r} is {mode!r}, but slot "
+            f"{slot.slot_id!r} ({slot.kind!r}) requires acquisition action "
+            f"{action!r}; rebind it to a compatible source slot"
+        )
+
+    limit = artifact.max_use_seconds
+    if limit is None:
+        return None
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, (int, float))
+        or not math.isfinite(float(limit))
+        or float(limit) <= 0
+    ):
+        return (
+            f"artifact {artifact.artifact_id!r} bound to slot {slot.slot_id!r} "
+            f"has invalid max_use_seconds {limit!r}; it must be a positive "
+            "finite number"
+        )
+    if slot.hold_seconds > float(limit) + 1e-6:
+        return (
+            f"artifact {artifact.artifact_id!r} permits at most "
+            f"{float(limit):g}s of use, but slot {slot.slot_id!r} holds it for "
+            f"{slot.hold_seconds:.1f}s"
+        )
+    return None
+
+
 def _iso_utc(ts: datetime) -> str:
     if ts.tzinfo is not None:
         ts = ts.astimezone(timezone.utc)
     return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _artifact_from_binding(
+    slot_id: str, binding: Artifact | str
+) -> Artifact:
+    """Normalize the legacy slot->URL execution input to a full artifact."""
+    if isinstance(binding, Artifact):
+        return binding
+    return Artifact(artifact_id="", url=str(binding), slot_id=slot_id)
+
+
+def _join_notes(*notes: str) -> str:
+    return " | ".join(note.strip() for note in notes if note and note.strip())
+
+
+def _artifact_provenance_note(artifact: Artifact) -> str:
+    """Serialize catalogue identity and rights context into ledger notes."""
+    labelled = (
+        ("artifact_id", artifact.artifact_id),
+        ("title", artifact.title),
+        ("date", artifact.date),
+        ("source_role", artifact.source_role),
+        ("rights_note", artifact.rights_note),
+    )
+    parts = [f"{label}={value!r}" for label, value in labelled if value]
+    return f"catalogue metadata: {'; '.join(parts)}" if parts else ""
 
 
 def plan_assets(
@@ -383,17 +477,18 @@ def plan_assets(
     """Decide what each slot needs.
 
     Checked in this order per slot, and the first match wins:
-      1. Claimed by a ledger record of the wrong tier -> `stale`.
-      2. Claimed by a ledger record of the right tier -> `satisfied`.
-      3. Unknown kind -> `blocked`.
-      4. `capture` with no artifact bound to it -> `blocked`.
-      5. Otherwise, the kind's normal action from `KIND_TO_ACTION`.
+      1. Bound source conflicts with its acquisition/use policy -> `blocked`.
+      2. Claimed by a ledger record of the wrong tier -> `stale`.
+      3. Claimed by a ledger record of the right tier -> `satisfied`.
+      4. Unknown kind -> `blocked`.
+      5. Source slot with no artifact bound to it -> `blocked`.
+      6. Otherwise, the kind's normal action from `KIND_TO_ACTION`.
 
-    Step 1 exists because slot ids are positional. Adding a `[SHOT:]` marker
-    renumbers every slot after it, so a ledger written against the earlier plan
-    still claims slot ids that now name different shots -- and a check of "is
-    this slot id claimed" accepts that silently, putting a graphic card into an
-    archival slot with no error raised anywhere.
+    The stale-ledger check exists because slot ids are positional. Adding a
+    `[SHOT:]` marker renumbers every slot after it, so a ledger written against
+    the earlier plan still claims slot ids that now name different shots -- and
+    a check of "is this slot id claimed" accepts that silently, putting a
+    graphic card into an archival slot with no error raised anywhere.
 
     `artifacts` is the whole catalogue read by `load_artifacts`, not just
     the bound subset -- that lets the `blocked` reason for an unbound
@@ -406,11 +501,27 @@ def plan_assets(
         for slot_id in record.used_in_slots:
             claimed_by.setdefault(slot_id, (record.asset_id, record.tier))
 
-    bindings = artifact_urls_by_slot(artifacts)
+    bindings = artifact_bindings_by_slot(artifacts)
 
     items: list[PlanItem] = []
     for slot in slots:
         tier = KIND_TO_TIER.get(slot.kind, "")
+        action = KIND_TO_ACTION.get(slot.kind)
+        artifact = bindings.get(slot.slot_id)
+
+        if action in ("fetch", "shoot") and artifact is not None:
+            policy_block = _artifact_policy_block(artifact, slot, action)
+            if policy_block is not None:
+                items.append(
+                    PlanItem(
+                        slot_id=slot.slot_id,
+                        kind=slot.kind,
+                        tier=tier,
+                        action=_BLOCKED,
+                        reason=policy_block,
+                    )
+                )
+                continue
 
         if slot.slot_id in claimed_by:
             asset_id, record_tier = claimed_by[slot.slot_id]
@@ -466,7 +577,7 @@ def plan_assets(
 
         action = KIND_TO_ACTION[slot.kind]
 
-        if action in ("fetch", "shoot") and slot.slot_id not in bindings:
+        if action in ("fetch", "shoot") and artifact is None:
             if not artifacts:
                 reason = (
                     "research/artifacts.json has no artifacts at all; catalogue an "
@@ -507,10 +618,12 @@ def plan_assets(
                 f"then download the first usable, licensed hit"
             )
         elif action == "fetch":
-            reason = f"fetch {bindings[slot.slot_id]!r} via yt-dlp, gated on the claims ledger"
+            reason = (
+                f"fetch {artifact.url!r} via yt-dlp, gated on the claims ledger"
+            )
         elif action == "shoot":
             reason = (
-                f"capture {bindings[slot.slot_id]!r} with the headless browser "
+                f"capture {artifact.url!r} with the headless browser "
                 f"(or render it, if it is a document)"
             )
         else:
@@ -583,16 +696,18 @@ def execute_plan(
     capture_runner: capture.Runner | None = None,
     capture_transport: capture.Transport | None = None,
     now: datetime | None = None,
-    artifacts: dict[str, str] | None = None,
+    artifacts: dict[str, Artifact | str] | None = None,
     typography: dict | None = None,
     palette: dict | None = None,
     quality: str = "animatic",
 ) -> tuple[list[AssetRecord], list[Finding]]:
     """Source everything the plan calls for, returning new records and any failures.
 
-    `artifacts` (slot_id -> URL, as from `artifact_urls_by_slot(load_artifacts(...))`)
-    supplies the URL a `fetch` item needs; `plan_assets` already proved one
-    exists for every `fetch` item it produced, by construction.
+    `artifacts` accepts complete ``Artifact`` bindings (the CLI path) or the
+    legacy slot_id -> URL mapping. Complete bindings preserve catalogue
+    identity and rights context in the resulting provenance notes. Their
+    acquisition and duration policies are rechecked immediately before I/O so
+    a stale, externally constructed plan cannot bypass a catalogue change.
 
     `typography` and `palette` are the style pack dicts a `draw` item needs to
     render a card; they are loaded from `style/` by the caller. A `draw` item
@@ -730,7 +845,31 @@ def execute_plan(
             continue
 
         if item.action == "shoot":
-            url = artifacts.get(slot.slot_id)
+            binding = artifacts.get(slot.slot_id)
+            if not binding:
+                findings.append(
+                    Finding(
+                        gate="assets",
+                        severity="error",
+                        message=(
+                            f"No artifact URL available for slot {slot.slot_id!r} "
+                            "at execution time."
+                        ),
+                    )
+                )
+                continue
+            artifact = _artifact_from_binding(slot.slot_id, binding)
+            policy_block = _artifact_policy_block(artifact, slot, item.action)
+            if policy_block is not None:
+                findings.append(
+                    Finding(
+                        gate="assets",
+                        severity="error",
+                        message=f"Acquisition refused: {policy_block}.",
+                    )
+                )
+                continue
+            url = artifact.url
             out_path = out_dir / f"{slot.slot_id}-capture.mp4"
             try:
                 result = capture.capture_to_video(
@@ -770,7 +909,10 @@ def execute_plan(
                     retrieved_at=_iso_utc(resolved_now),
                     local_path=str(out_path),
                     used_in_slots=(slot.slot_id,),
-                    notes=f"{result.kind} capture{inspection_note}",
+                    notes=_join_notes(
+                        f"{result.kind} capture{inspection_note}",
+                        _artifact_provenance_note(artifact),
+                    ),
                 )
             )
             continue
@@ -843,8 +985,8 @@ def execute_plan(
             continue
 
         if item.action == "fetch":
-            url = artifacts.get(slot.slot_id)
-            if not url:
+            binding = artifacts.get(slot.slot_id)
+            if not binding:
                 # plan_assets already blocks a fetch item with no artifact URL,
                 # so this only fires if the caller passed a different
                 # `artifacts` mapping to execute_plan than it planned against.
@@ -860,6 +1002,18 @@ def execute_plan(
                 )
                 continue
 
+            artifact = _artifact_from_binding(slot.slot_id, binding)
+            policy_block = _artifact_policy_block(artifact, slot, item.action)
+            if policy_block is not None:
+                findings.append(
+                    Finding(
+                        gate="assets",
+                        severity="error",
+                        message=f"Acquisition refused: {policy_block}.",
+                    )
+                )
+                continue
+            url = artifact.url
             out_path = out_dir / f"{slot.slot_id}-capture.mp4"
             try:
                 fields = ytdlp.fetch_primary(
@@ -878,6 +1032,10 @@ def execute_plan(
 
             fields = dict(fields)
             fields["used_in_slots"] = (slot.slot_id,)
+            fields["notes"] = _join_notes(
+                str(fields.get("notes", "")),
+                _artifact_provenance_note(artifact),
+            )
             records.append(AssetRecord(**fields))
             continue
 
