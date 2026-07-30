@@ -60,6 +60,7 @@ class FakeTimeline:
         }
         self.track_names: dict[tuple[str, int], str] = {}
         self.markers: list[tuple] = []
+        self.marker_add_calls: list[tuple] = []
         self.rename_calls: list[str] = []
         self.subtitle_items: list[FakeSubtitleItem] = []
 
@@ -97,6 +98,7 @@ class FakeTimeline:
         return []
 
     def AddMarker(self, *args):
+        self.marker_add_calls.append(args)
         self.markers.append(args)
         return True
 
@@ -104,6 +106,13 @@ class FakeTimeline:
         for index, marker in enumerate(self.markers):
             if marker[0] == frame:
                 self.markers[index] = (*marker[:5], custom_data)
+                return True
+        return False
+
+    def DeleteMarkerAtFrame(self, frame):
+        for index, marker in enumerate(self.markers):
+            if marker[0] == frame:
+                del self.markers[index]
                 return True
         return False
 
@@ -389,6 +398,7 @@ def test_compiler_shaped_plan_builds_tracks_markers_and_reuses_immutably(
     assert generated.track_names[("audio", 5)] == "A5"
     assert generated.track_names[("subtitle", 1)] == "SUBTITLES"
     assert len(generated.markers) == 2
+    assert all(call[5] == "" for call in generated.marker_add_calls)
     identity = next(value for value in generated.markers if value[0] == 0)
     assert "Fusion titles/transitions" in identity[3]
     assert json.loads(identity[5])["style"]["status"] == "disabled"
@@ -603,6 +613,138 @@ def test_imported_fcpxml_marker_is_enriched_without_duplicate_collision(
     enriched = json.loads(generated.markers[0][5])
     assert enriched["build_id"] == plan["build_id"]
     assert enriched["marker_ids"] == ["marker-1"]
+
+
+@pytest.mark.parametrize("failed_update", [1, 2])
+def test_marker_metadata_failure_rolls_back_new_markers_and_retry_fails_closed(
+    tmp_path: Path,
+    failed_update: int,
+) -> None:
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    project = FakeProject()
+    original_import = project.media_pool.ImportTimelineFromFile
+
+    def import_with_flaky_marker_update(path, options):
+        timeline = original_import(path, options)
+        original_update = timeline.UpdateMarkerCustomData
+        calls = 0
+
+        def flaky_update(frame, custom_data):
+            nonlocal calls
+            calls += 1
+            if calls == failed_update:
+                return False
+            return original_update(frame, custom_data)
+
+        timeline.UpdateMarkerCustomData = flaky_update
+        return timeline
+
+    project.media_pool.ImportTimelineFromFile = import_with_flaky_marker_update
+    resolve = FakeResolve(project)
+
+    with pytest.raises(
+        ResolveExecutionError,
+        match="UpdateMarkerCustomData",
+    ):
+        execute_build(
+            resolve,
+            plan,
+            project_root=project_root,
+            plan_path=plan_path,
+        )
+
+    generated = project.timelines[-1]
+    assert generated.markers == []
+    assert resolve.manager.save_calls == 0
+
+    with pytest.raises(
+        ImmutableTimelineError,
+        match="complete RabbitHole markers",
+    ):
+        execute_build(
+            resolve,
+            plan,
+            project_root=project_root,
+            plan_path=plan_path,
+        )
+    assert resolve.manager.save_calls == 0
+
+
+def test_marker_failure_restores_preexisting_custom_data(tmp_path: Path) -> None:
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    project = FakeProject()
+    original_import = project.media_pool.ImportTimelineFromFile
+
+    def import_with_existing_marker_and_flaky_update(path, options):
+        timeline = original_import(path, options)
+        timeline.markers.append(
+            (30, "Blue", "FCPXML marker", "Evidence", 1, "original")
+        )
+        original_update = timeline.UpdateMarkerCustomData
+        calls = 0
+
+        def flaky_update(frame, custom_data):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return False
+            return original_update(frame, custom_data)
+
+        timeline.UpdateMarkerCustomData = flaky_update
+        return timeline
+
+    project.media_pool.ImportTimelineFromFile = (
+        import_with_existing_marker_and_flaky_update
+    )
+
+    with pytest.raises(
+        ResolveExecutionError,
+        match="UpdateMarkerCustomData",
+    ):
+        execute_build(
+            FakeResolve(project),
+            plan,
+            project_root=project_root,
+            plan_path=plan_path,
+        )
+
+    generated = project.timelines[-1]
+    assert generated.markers == [
+        (30, "Blue", "FCPXML marker", "Evidence", 1, "original")
+    ]
+
+
+def test_marker_rollback_failure_is_explicit(tmp_path: Path) -> None:
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    project = FakeProject()
+    original_import = project.media_pool.ImportTimelineFromFile
+
+    def import_with_unrecoverable_marker_update(path, options):
+        timeline = original_import(path, options)
+        timeline.UpdateMarkerCustomData = lambda frame, custom_data: False
+        timeline.DeleteMarkerAtFrame = lambda frame: False
+        return timeline
+
+    project.media_pool.ImportTimelineFromFile = (
+        import_with_unrecoverable_marker_update
+    )
+    resolve = FakeResolve(project)
+
+    with pytest.raises(
+        ResolveExecutionError,
+        match="marker rollback incomplete",
+    ):
+        execute_build(
+            resolve,
+            plan,
+            project_root=project_root,
+            plan_path=plan_path,
+        )
+
+    assert resolve.manager.save_calls == 0
 
 
 def test_import_integrity_validates_duration_linked_clips_and_subtitles(
@@ -1406,6 +1548,31 @@ def test_render_rejects_modified_subtitle_timing_before_configuration(
     with pytest.raises(
         ImmutableTimelineError,
         match="subtitle cue timing does not match",
+    ):
+        execute_render(resolve, plan, project_root=project_root)
+
+    assert project.render_format_codec is None
+    assert project.render_mode is None
+    assert project.render_settings is None
+    assert project.render_jobs == []
+
+
+def test_render_rejects_incomplete_marker_contract_before_configuration(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "episode"
+    _, plan = compiler_shaped_plan(project_root)
+    project = FakeProject()
+    resolve = FakeResolve(project)
+    execute_build(resolve, plan, project_root=project_root)
+    timeline = project.timelines[-1]
+    timeline.markers = [
+        marker for marker in timeline.markers if marker[0] == 0
+    ]
+
+    with pytest.raises(
+        ImmutableTimelineError,
+        match="complete RabbitHole markers",
     ):
         execute_render(resolve, plan, project_root=project_root)
 

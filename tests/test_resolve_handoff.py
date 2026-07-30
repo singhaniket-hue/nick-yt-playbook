@@ -278,7 +278,10 @@ def test_handoff_refuses_timeline_with_wrong_immutable_identity_before_archive(
     }
     resolve = FakeResolve(current)
 
-    with pytest.raises(ResolveHandoffError, match="no RabbitHole marker"):
+    with pytest.raises(
+        ResolveHandoffError,
+        match="complete RabbitHole markers",
+    ):
         package_handoff(
             project,
             resolve=resolve,

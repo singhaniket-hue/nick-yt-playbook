@@ -187,7 +187,12 @@ keeps a complete native caption import, appends the SRT only when the imported
 subtitle count is exactly zero, and refuses a partial count to prevent
 duplicates. The resulting cues remain editable on the subtitle track.
 Review-warning and human-review markers use Resolve-supported Yellow; Resolve
-rejects `Orange` as a marker color.
+rejects `Orange` as a marker color. The runner creates each marker first and
+then attaches its machine-readable JSON with `UpdateMarkerCustomData`, avoiding
+Resolve's combined marker-payload rejection. A failed metadata update rolls
+back only marker changes made by that call. Build reuse, render, and handoff
+require the complete per-frame RabbitHole marker contract, so a partial marker
+set can never authenticate an immutable timeline.
 
 `resolve prepare` creates A3/A4 under
 `resolve/audio-stems/<content-sha256>/`. The directory is immutable: changing

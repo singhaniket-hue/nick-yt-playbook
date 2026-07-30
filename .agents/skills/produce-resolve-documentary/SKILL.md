@@ -215,8 +215,13 @@ runner must keep a complete native caption import, append the SRT only when the
 imported subtitle count is exactly zero, and fail closed on a partial count so
 it never duplicates captions. Validate exact cue timing and normalized text
 after import, on immutable timeline reuse, and before render. Use only
-Resolve-supported marker colors;
-warning and human-review markers are Yellow because Resolve rejects `Orange`.
+Resolve-supported marker colors; warning and human-review markers are Yellow
+because Resolve rejects `Orange`.
+Create a marker with empty custom data first, then attach its JSON through
+`UpdateMarkerCustomData`; Resolve can reject the equivalent combined
+`AddMarker` call. Roll back only marker changes made by a failed call, and
+validate the complete per-frame RabbitHole marker contract before reuse,
+render, or handoff.
 
 Never proceed while the user reports an active render. Never stop a render,
 clear a render queue, quit Resolve, switch databases/projects, delete a

@@ -1465,7 +1465,7 @@ def _timeline_marker_documents(timeline: Any) -> list[dict[str, Any]]:
     if not isinstance(marker_map, Mapping):
         raise ImmutableTimelineError("timeline returned invalid marker metadata")
     documents: list[dict[str, Any]] = []
-    for marker in marker_map.values():
+    for raw_frame, marker in marker_map.items():
         if not isinstance(marker, Mapping):
             continue
         raw = marker.get("customData", marker.get("custom_data"))
@@ -1476,7 +1476,15 @@ def _timeline_marker_documents(timeline: Any) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         if isinstance(decoded, dict):
-            documents.append(decoded)
+            try:
+                frame = int(float(raw_frame))
+            except (TypeError, ValueError) as exc:
+                raise ImmutableTimelineError(
+                    f"timeline returned invalid marker frame {raw_frame!r}"
+                ) from exc
+            document = dict(decoded)
+            document["_timeline_frame"] = frame
+            documents.append(document)
     return documents
 
 
@@ -1696,36 +1704,7 @@ def _validate_expected_timeline(
 
     marker_getter = getattr(timeline, "GetMarkers", None)
     if callable(marker_getter):
-        marker_documents = _timeline_marker_documents(timeline)
-        expected_build_id = str(
-            plan.get("build_id") or f"b-{build_hash_for_plan(plan)}"
-        )
-        identity_found = any(
-            custom.get("build_id") == expected_build_id
-            for custom in marker_documents
-        )
-        if not identity_found:
-            raise ImmutableTimelineError(
-                f"existing {expected_name!r} has no RabbitHole marker for "
-                f"{expected_build_id!r}"
-            )
-        raw_style = plan.get("style")
-        if isinstance(raw_style, Mapping):
-            try:
-                expected_style_hash = style_contract_hash(raw_style)
-            except ResolveStyleError as exc:
-                raise ImmutableTimelineError(str(exc)) from exc
-            style_found = any(
-                isinstance(custom.get("style"), Mapping)
-                and custom["style"].get("contract_sha256")
-                == expected_style_hash
-                for custom in marker_documents
-            )
-            if not style_found:
-                raise ImmutableTimelineError(
-                    f"existing {expected_name!r} has no matching Resolve "
-                    f"style marker for {expected_style_hash}"
-                )
+        _validate_complete_marker_contract(timeline, plan)
     validation = plan.get("timeline_validation")
     if isinstance(validation, Mapping):
         start = int(_call_required(timeline, "GetStartFrame"))
@@ -1896,14 +1875,9 @@ def _style_marker_summary(
     }
 
 
-def _add_plan_markers(
-    timeline: Any,
+def _group_plan_marker_records(
     plan: Mapping[str, Any],
-    *,
-    style_result: Mapping[str, Any] | None = None,
-) -> None:
-    """Add machine-readable plan/review markers to a newly imported timeline."""
-
+) -> dict[int, dict[str, list[dict[str, Any]]]]:
     raw_markers = plan.get("markers")
     markers = (
         [dict(item) for item in raw_markers if isinstance(item, Mapping)]
@@ -1918,27 +1892,17 @@ def _add_plan_markers(
         and not isinstance(raw_reviews, (str, bytes))
         else []
     )
-    raw_provenance = plan.get("provenance")
-    provenance = (
-        [dict(item) for item in raw_provenance if isinstance(item, Mapping)]
-        if isinstance(raw_provenance, Sequence)
-        and not isinstance(raw_provenance, (str, bytes))
-        else []
-    )
-
     grouped: dict[int, dict[str, list[dict[str, Any]]]] = {}
     for marker in markers:
         frame = int(marker.get("frame", marker.get("start_frame", 0)))
-        grouped.setdefault(frame, {"markers": [], "reviews": []})["markers"].append(
-            marker
-        )
+        grouped.setdefault(frame, {"markers": [], "reviews": []})[
+            "markers"
+        ].append(marker)
     for review in reviews:
         frame = int(review.get("frame", review.get("start_frame", 0)))
-        grouped.setdefault(frame, {"markers": [], "reviews": []})["reviews"].append(
-            review
-        )
-
-    build_id = str(plan.get("build_id") or f"b-{build_hash_for_plan(plan)}")
+        grouped.setdefault(frame, {"markers": [], "reviews": []})[
+            "reviews"
+        ].append(review)
     if 0 not in grouped:
         grouped[0] = {
             "markers": [
@@ -1951,25 +1915,58 @@ def _add_plan_markers(
             ],
             "reviews": [],
         }
-    existing_raw = _call_required(timeline, "GetMarkers")
-    if not isinstance(existing_raw, Mapping):
-        raise ResolveExecutionError("GetMarkers() returned invalid metadata")
-    existing = dict(existing_raw)
-    style_summary = _style_marker_summary(style_result)
+    return grouped
+
+
+def _validate_complete_marker_contract(
+    timeline: Any,
+    plan: Mapping[str, Any],
+) -> None:
+    """Require every RabbitHole marker document before reuse or rendering."""
+
+    documents = _timeline_marker_documents(timeline)
+    grouped = _group_plan_marker_records(plan)
+    build_id = str(plan.get("build_id") or f"b-{build_hash_for_plan(plan)}")
+    raw_provenance = plan.get("provenance")
+    provenance = (
+        [dict(item) for item in raw_provenance if isinstance(item, Mapping)]
+        if isinstance(raw_provenance, Sequence)
+        and not isinstance(raw_provenance, (str, bytes))
+        else []
+    )
+    build_documents = [
+        document
+        for document in documents
+        if document.get("build_id") == build_id
+    ]
+    if len(build_documents) != len(grouped):
+        raise ImmutableTimelineError(
+            f"existing {_timeline_name(timeline)!r} has "
+            f"{len(build_documents)} complete RabbitHole markers for "
+            f"{build_id!r}; expected {len(grouped)}"
+        )
+
+    style_documents: list[dict[str, Any]] = []
     for frame, entries in sorted(grouped.items()):
+        matches = [
+            document
+            for document in build_documents
+            if document.get("_timeline_frame") == frame
+        ]
+        if len(matches) != 1:
+            raise ImmutableTimelineError(
+                f"existing {_timeline_name(timeline)!r} has {len(matches)} "
+                f"RabbitHole markers for {build_id!r} at frame {frame}; "
+                "expected exactly one"
+            )
+        actual = matches[0]
         frame_markers = entries["markers"]
         frame_reviews = entries["reviews"]
         primary: Mapping[str, Any] = (
             frame_markers[0] if frame_markers else frame_reviews[0]
         )
         marker_id = str(primary.get("id") or f"frame-{frame}")
-        kind = str(primary.get("kind") or "review")
-        severity = (
-            str(frame_reviews[0].get("severity"))
-            if frame_reviews and frame_reviews[0].get("severity") is not None
-            else None
-        )
-        custom_data = {
+        expected_fields = {
             "schema": "rabbithole.resolve-marker.v1",
             "build_id": build_id,
             "marker_id": marker_id,
@@ -1983,55 +1980,216 @@ def _add_plan_markers(
             "review": frame_reviews,
             "markers": frame_markers,
         }
-        if style_summary is not None:
-            custom_data["style"] = style_summary
-        note_parts = [
-            str(item.get("arg") or item.get("message") or item.get("kind") or "")
-            for item in (*frame_markers, *frame_reviews)
-        ]
-        if frame == 0 and style_summary is not None:
-            note_parts.append(
-                "Resolve style="
-                f"{style_summary.get('status')}; "
-                "Fusion titles/transitions and V4 texture remain editable "
-                "manual intent"
+        for field, expected in expected_fields.items():
+            if actual.get(field) != expected:
+                raise ImmutableTimelineError(
+                    f"existing {_timeline_name(timeline)!r} RabbitHole marker "
+                    f"at frame {frame} has invalid {field!r} metadata"
+                )
+        actual_style = actual.get("style")
+        if not isinstance(actual_style, Mapping):
+            raise ImmutableTimelineError(
+                f"existing {_timeline_name(timeline)!r} RabbitHole marker at "
+                f"frame {frame} has no Resolve style metadata"
             )
-        note = " | ".join(part for part in note_parts if part)[:2048]
-        duration = max(
-            1,
-            max(
-                (
-                    int(item.get("duration_frames", 1))
-                    for item in (*frame_markers, *frame_reviews)
-                ),
-                default=1,
-            ),
+        style_documents.append(dict(actual_style))
+
+    if any(style != style_documents[0] for style in style_documents[1:]):
+        raise ImmutableTimelineError(
+            f"existing {_timeline_name(timeline)!r} has inconsistent Resolve "
+            "style metadata across RabbitHole markers"
         )
-        encoded = json.dumps(custom_data, ensure_ascii=False, sort_keys=True)
-        existing_marker = existing.get(frame, existing.get(float(frame)))
-        if isinstance(existing_marker, Mapping):
-            updated = _call_required(
-                timeline, "UpdateMarkerCustomData", frame, encoded
+    style = style_documents[0]
+    raw_style = plan.get("style")
+    if isinstance(raw_style, Mapping):
+        try:
+            expected_style_hash = style_contract_hash(raw_style)
+        except ResolveStyleError as exc:
+            raise ImmutableTimelineError(str(exc)) from exc
+        if style.get("contract_sha256") != expected_style_hash:
+            raise ImmutableTimelineError(
+                f"existing {_timeline_name(timeline)!r} has no matching Resolve "
+                f"style marker for {expected_style_hash}"
             )
-            if updated is not True:
-                raise ResolveExecutionError(
-                    f"UpdateMarkerCustomData() did not succeed at frame {frame}"
-                )
-        else:
-            added = _call_required(
-                timeline,
-                "AddMarker",
-                frame,
-                _marker_color(kind, severity),
-                f"RH {kind}: {marker_id}"[:128],
-                note,
-                duration,
-                encoded,
+    else:
+        expected_disabled = {
+            "status": "disabled",
+            "contract_sha256": None,
+            "eligible_clip_count": 0,
+            "applied_clip_count": 0,
+            "methods": [],
+            "fusion": "not_requested",
+        }
+        if any(style.get(key) != value for key, value in expected_disabled.items()):
+            raise ImmutableTimelineError(
+                f"existing {_timeline_name(timeline)!r} has invalid disabled "
+                "Resolve style metadata"
             )
-            if added is not True:
-                raise ResolveExecutionError(
-                    f"AddMarker() did not succeed at frame {frame}"
+
+
+def _add_plan_markers(
+    timeline: Any,
+    plan: Mapping[str, Any],
+    *,
+    style_result: Mapping[str, Any] | None = None,
+) -> None:
+    """Add machine-readable plan/review markers to a newly imported timeline."""
+
+    raw_provenance = plan.get("provenance")
+    provenance = (
+        [dict(item) for item in raw_provenance if isinstance(item, Mapping)]
+        if isinstance(raw_provenance, Sequence)
+        and not isinstance(raw_provenance, (str, bytes))
+        else []
+    )
+    grouped = _group_plan_marker_records(plan)
+    build_id = str(plan.get("build_id") or f"b-{build_hash_for_plan(plan)}")
+    existing_raw = _call_required(timeline, "GetMarkers")
+    if not isinstance(existing_raw, Mapping):
+        raise ResolveExecutionError("GetMarkers() returned invalid metadata")
+    existing = dict(existing_raw)
+    style_summary = _style_marker_summary(style_result)
+    created_frames: list[int] = []
+    updated_existing: list[tuple[int, str]] = []
+    try:
+        for frame, entries in sorted(grouped.items()):
+            frame_markers = entries["markers"]
+            frame_reviews = entries["reviews"]
+            primary: Mapping[str, Any] = (
+                frame_markers[0] if frame_markers else frame_reviews[0]
+            )
+            marker_id = str(primary.get("id") or f"frame-{frame}")
+            kind = str(primary.get("kind") or "review")
+            severity = (
+                str(frame_reviews[0].get("severity"))
+                if frame_reviews
+                and frame_reviews[0].get("severity") is not None
+                else None
+            )
+            custom_data = {
+                "schema": "rabbithole.resolve-marker.v1",
+                "build_id": build_id,
+                "marker_id": marker_id,
+                "marker_ids": [
+                    str(item.get("id") or f"frame-{frame}")
+                    for item in frame_markers
+                ],
+                "provenance": _marker_provenance(
+                    primary, frame_reviews, provenance
+                ),
+                "review": frame_reviews,
+                "markers": frame_markers,
+            }
+            if style_summary is not None:
+                custom_data["style"] = style_summary
+            note_parts = [
+                str(
+                    item.get("arg")
+                    or item.get("message")
+                    or item.get("kind")
+                    or ""
                 )
+                for item in (*frame_markers, *frame_reviews)
+            ]
+            if frame == 0 and style_summary is not None:
+                note_parts.append(
+                    "Resolve style="
+                    f"{style_summary.get('status')}; "
+                    "Fusion titles/transitions and V4 texture remain editable "
+                    "manual intent"
+                )
+            note = " | ".join(part for part in note_parts if part)[:2048]
+            duration = max(
+                1,
+                max(
+                    (
+                        int(item.get("duration_frames", 1))
+                        for item in (*frame_markers, *frame_reviews)
+                    ),
+                    default=1,
+                ),
+            )
+            encoded = json.dumps(
+                custom_data, ensure_ascii=False, sort_keys=True
+            )
+            existing_marker = existing.get(frame, existing.get(float(frame)))
+            if isinstance(existing_marker, Mapping):
+                previous = existing_marker.get(
+                    "customData", existing_marker.get("custom_data", "")
+                )
+                updated_existing.append(
+                    (frame, previous if isinstance(previous, str) else "")
+                )
+                updated = _call_required(
+                    timeline, "UpdateMarkerCustomData", frame, encoded
+                )
+                if updated is not True:
+                    raise ResolveExecutionError(
+                        "UpdateMarkerCustomData() did not succeed at frame "
+                        f"{frame}"
+                    )
+            else:
+                added = _call_required(
+                    timeline,
+                    "AddMarker",
+                    frame,
+                    _marker_color(kind, severity),
+                    f"RH {kind}: {marker_id}"[:128],
+                    note,
+                    duration,
+                    "",
+                )
+                if added is not True:
+                    raise ResolveExecutionError(
+                        f"AddMarker() did not succeed at frame {frame}"
+                    )
+                created_frames.append(frame)
+                updated = _call_required(
+                    timeline, "UpdateMarkerCustomData", frame, encoded
+                )
+                if updated is not True:
+                    raise ResolveExecutionError(
+                        "UpdateMarkerCustomData() did not persist metadata for "
+                        f"the new marker at frame {frame}"
+                    )
+    except Exception as exc:
+        rollback_failures: list[str] = []
+        delete_marker = getattr(timeline, "DeleteMarkerAtFrame", None)
+        for frame in reversed(created_frames):
+            try:
+                deleted = (
+                    delete_marker(frame) if callable(delete_marker) else False
+                )
+            except Exception as rollback_exc:
+                rollback_failures.append(
+                    f"delete frame {frame}: {rollback_exc}"
+                )
+            else:
+                if deleted is not True:
+                    rollback_failures.append(f"delete frame {frame}: rejected")
+        restore_custom = getattr(timeline, "UpdateMarkerCustomData", None)
+        for frame, previous in reversed(updated_existing):
+            try:
+                restored = (
+                    restore_custom(frame, previous)
+                    if callable(restore_custom)
+                    else False
+                )
+            except Exception as rollback_exc:
+                rollback_failures.append(
+                    f"restore frame {frame}: {rollback_exc}"
+                )
+            else:
+                if restored is not True:
+                    rollback_failures.append(
+                        f"restore frame {frame}: rejected"
+                    )
+        if rollback_failures:
+            raise ResolveExecutionError(
+                f"{exc}; marker rollback incomplete: "
+                + "; ".join(rollback_failures)
+            ) from exc
+        raise
 
 
 def _create_project_when_none(
