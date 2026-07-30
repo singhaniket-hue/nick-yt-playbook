@@ -187,6 +187,11 @@ to discard one because two titles occupy the same connected lane. Imported
 primary-story transitions are counted separately from linked clips and titles
 in the immutable timeline contract.
 
+Resolve can compact empty FCPXML audio lanes during import. The runner accepts
+only the exact compacted count pattern, inserts the missing empty logical lanes
+at their intended positions, and then names and validates A1-A5. Unexpected
+audio layouts still fail closed before save or render.
+
 Resolve 21 can ignore valid FCPXML `caption` elements. `resolve prepare`
 therefore emits a checksum-pinned `subtitles.srt` beside the FCPXML. The runner
 keeps a complete native caption import, appends the SRT only when the imported

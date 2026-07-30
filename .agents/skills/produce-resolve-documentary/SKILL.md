@@ -230,6 +230,10 @@ not discard a same-lane source caption or chapter card. Count primary-story
 transition items separately from linked clips and generated titles during
 timeline validation.
 
+Resolve may compact empty FCPXML audio lanes. Accept only an exact compacted
+audio-count pattern, insert missing logical lanes at their intended positions,
+then name and validate A1-A5. Fail closed on any other imported audio layout.
+
 Never proceed while the user reports an active render. Never stop a render,
 clear a render queue, quit Resolve, switch databases/projects, delete a
 timeline, or mutate `EDITORIAL_*`. Build or reuse only the immutable

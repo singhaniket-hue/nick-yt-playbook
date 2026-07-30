@@ -382,7 +382,7 @@ def test_compile_is_deterministic_and_preserves_render_offsets(tmp_path):
     assert first["timeline_name"].startswith("AUTO_BUILD_")
     assert first["project_root"] == "."
     assert first["fps"] == 30
-    assert first["compiler_version"] == "resolve-compiler.v9"
+    assert first["compiler_version"] == "resolve-compiler.v10"
     assert first["render"]["format"] == "mp4"
     assert first["render"]["codec"] == "H264"
     assert first["render"]["mode"] == "single_clip"

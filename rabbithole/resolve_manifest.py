@@ -33,7 +33,7 @@ from rabbithole.sources.soundgen import (
 
 
 SCHEMA_VERSION = "resolve-plan.v1"
-COMPILER_VERSION = "resolve-compiler.v9"
+COMPILER_VERSION = "resolve-compiler.v10"
 DEFAULT_FPS = 30
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080

@@ -14,6 +14,7 @@ from rabbithole.resolve_runner import (
     QueueError,
     ResolveExecutionError,
     ResolveUnavailableError,
+    _ensure_and_name_tracks,
     _marker_color,
     connect_resolve,
     enqueue_job,
@@ -83,7 +84,7 @@ class FakeTimeline:
     def GetTrackCount(self, kind):
         return self.counts[kind]
 
-    def AddTrack(self, kind):
+    def AddTrack(self, kind, options=None):
         self.counts[kind] += 1
         return True
 
@@ -423,6 +424,69 @@ def test_compiler_shaped_plan_builds_tracks_markers_and_reuses_immutably(
     assert len(project.media_pool.calls) == 1
     assert len(project.media_pool.import_media_calls) == 1
     assert len(generated.markers) == 2
+
+
+def test_track_contract_restores_audio_lanes_compacted_by_resolve(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "episode"
+    _, plan = compiler_shaped_plan(project_root)
+    plan["audio"] = [
+        {"id": "voice", "track": "A1", "media_path": "narration/vo.wav"},
+        {"id": "music", "track": "A3", "media_path": "audio/music.wav"},
+        {"id": "sfx", "track": "A4", "media_path": "audio/sfx.wav"},
+    ]
+
+    class CompactedAudioTimeline(FakeTimeline):
+        def __init__(self):
+            super().__init__(
+                "AUTO_BUILD_DEADBEEFCAFE",
+                video_tracks=4,
+                audio_tracks=3,
+                subtitle_tracks=1,
+            )
+            self.audio_items = {
+                1: [object()],
+                2: [object()],
+                3: [object()],
+            }
+            self.audio_insertions: list[dict] = []
+
+        def GetItemListInTrack(self, kind, index):
+            if kind == "audio":
+                return list(self.audio_items.get(index, []))
+            return super().GetItemListInTrack(kind, index)
+
+        def AddTrack(self, kind, options=None):
+            if kind != "audio":
+                return super().AddTrack(kind, options)
+            if isinstance(options, dict) and "index" in options:
+                index = int(options["index"])
+                self.audio_items = {
+                    position + 1 if position >= index else position: items
+                    for position, items in self.audio_items.items()
+                }
+                self.audio_items[index] = []
+                self.audio_insertions.append(dict(options))
+            else:
+                self.audio_items[self.counts["audio"] + 1] = []
+            self.counts["audio"] += 1
+            return True
+
+    timeline = CompactedAudioTimeline()
+
+    _ensure_and_name_tracks(timeline, plan)
+
+    assert timeline.audio_insertions == [
+        {"audioType": "stereo", "index": 2}
+    ]
+    assert [
+        len(timeline.GetItemListInTrack("audio", index))
+        for index in range(1, 6)
+    ] == [1, 0, 1, 1, 0]
+    assert [
+        timeline.GetTrackName("audio", index) for index in range(1, 6)
+    ] == ["A1", "A2", "A3", "A4", "A5"]
 
 
 def test_no_current_project_allows_only_deterministic_create(tmp_path: Path) -> None:

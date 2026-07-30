@@ -1826,6 +1826,79 @@ def _track_specs(plan: Mapping[str, Any], kind: str) -> list[dict[str, Any]]:
     return result
 
 
+def _materialize_sparse_audio_tracks(
+    timeline: Any,
+    plan: Mapping[str, Any],
+    specs: Sequence[Mapping[str, Any]],
+    count: int,
+) -> int:
+    """Restore logical A-track gaps that Resolve compacts during FCPXML import."""
+
+    getter = getattr(timeline, "GetItemListInTrack", None)
+    if not callable(getter) or count <= 0:
+        return count
+    raw_audio = plan.get("audio")
+    audio_clips = (
+        [item for item in raw_audio if isinstance(item, Mapping)]
+        if isinstance(raw_audio, Sequence)
+        and not isinstance(raw_audio, (str, bytes))
+        else []
+    )
+    desired = max((int(spec["index"]) for spec in specs), default=0)
+    ids_by_index = {
+        int(spec["index"]): str(spec["id"]) for spec in specs
+    }
+    expected_counts = [
+        sum(
+            1
+            for clip in audio_clips
+            if clip.get("media_path")
+            and str(clip.get("track") or "") == ids_by_index.get(index, "")
+        )
+        for index in range(1, desired + 1)
+    ]
+    actual_counts = [
+        len(
+            _sequence_values(
+                getter("audio", index),
+                label=f"GetItemListInTrack('audio', {index})",
+            )
+        )
+        for index in range(1, count + 1)
+    ]
+
+    def trim_trailing_zeros(values: Sequence[int]) -> list[int]:
+        result = list(values)
+        while result and result[-1] == 0:
+            result.pop()
+        return result
+
+    expected_logical = trim_trailing_zeros(expected_counts)
+    actual = trim_trailing_zeros(actual_counts)
+    if actual == expected_logical:
+        return count
+    expected_compact = [value for value in expected_counts if value > 0]
+    if actual != expected_compact:
+        return count
+
+    for index, expected in enumerate(expected_counts, start=1):
+        if expected != 0 or not any(expected_counts[index:]):
+            continue
+        added = _call_required(
+            timeline,
+            "AddTrack",
+            "audio",
+            {"audioType": "stereo", "index": index},
+        )
+        if added is not True:
+            raise ResolveExecutionError(
+                f"AddTrack('audio', index={index}) did not restore "
+                "the compacted Resolve audio-lane gap"
+            )
+        count += 1
+    return count
+
+
 def _ensure_and_name_tracks(timeline: Any, plan: Mapping[str, Any]) -> None:
     """Apply the plan's track contract to a newly imported timeline only."""
 
@@ -1836,6 +1909,13 @@ def _ensure_and_name_tracks(timeline: Any, plan: Mapping[str, Any]) -> None:
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise ResolveExecutionError(
                 f"GetTrackCount({kind!r}) returned {count!r}"
+            )
+        if kind == "audio":
+            count = _materialize_sparse_audio_tracks(
+                timeline,
+                plan,
+                specs,
+                count,
             )
         while count < desired:
             added = _call_required(timeline, "AddTrack", kind)
