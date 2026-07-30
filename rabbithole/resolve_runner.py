@@ -1918,6 +1918,112 @@ def _group_plan_marker_records(
     return grouped
 
 
+_MARKER_ADD_RETRY_DELAYS_SECONDS = (0.05, 0.15, 0.30)
+
+
+def _marker_at_frame(
+    markers: Mapping[Any, Any],
+    frame: int,
+) -> Mapping[str, Any] | None:
+    """Return one Resolve marker while tolerating numeric-string frame keys."""
+
+    for raw_frame, marker in markers.items():
+        try:
+            marker_frame = int(float(raw_frame))
+        except (TypeError, ValueError):
+            continue
+        if marker_frame == frame and isinstance(marker, Mapping):
+            return marker
+    return None
+
+
+def _marker_shell_matches(
+    marker: Mapping[str, Any],
+    *,
+    color: str,
+    name: str,
+    note: str,
+    duration: int,
+) -> bool:
+    """Identify only the marker shell created by the current runner call."""
+
+    try:
+        actual_duration = int(marker.get("duration", 0))
+    except (TypeError, ValueError):
+        return False
+    return (
+        marker.get("color") == color
+        and marker.get("name") == name
+        and marker.get("note") == note
+        and actual_duration == duration
+    )
+
+
+def _add_marker_with_bounded_retry(
+    timeline: Any,
+    *,
+    frame: int,
+    color: str,
+    name: str,
+    note: str,
+    duration: int,
+) -> bool:
+    """Boundedly retry marker creation after a ``False`` response.
+
+    The API returns only a Boolean and no rejection detail. Every retry is
+    bounded, and a marker that appears asynchronously is accepted only when
+    its visible shell exactly matches this call.
+    """
+
+    attempts = len(_MARKER_ADD_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(_MARKER_ADD_RETRY_DELAYS_SECONDS[attempt - 1])
+            current = _call_required(timeline, "GetMarkers")
+            if not isinstance(current, Mapping):
+                raise ResolveExecutionError(
+                    "GetMarkers() returned invalid metadata during marker retry"
+                )
+            existing = _marker_at_frame(current, frame)
+            if existing is not None:
+                return _marker_shell_matches(
+                    existing,
+                    color=color,
+                    name=name,
+                    note=note,
+                    duration=duration,
+                )
+
+        added = _call_required(
+            timeline,
+            "AddMarker",
+            frame,
+            color,
+            name,
+            note,
+            duration,
+            "",
+        )
+        if added is True:
+            return True
+
+        current = _call_required(timeline, "GetMarkers")
+        if not isinstance(current, Mapping):
+            raise ResolveExecutionError(
+                "GetMarkers() returned invalid metadata after AddMarker()"
+            )
+        existing = _marker_at_frame(current, frame)
+        if existing is not None:
+            return _marker_shell_matches(
+                existing,
+                color=color,
+                name=name,
+                note=note,
+                duration=duration,
+            )
+    return False
+
+
 def _validate_complete_marker_contract(
     timeline: Any,
     plan: Mapping[str, Any],
@@ -2112,7 +2218,7 @@ def _add_plan_markers(
             encoded = json.dumps(
                 custom_data, ensure_ascii=False, sort_keys=True
             )
-            existing_marker = existing.get(frame, existing.get(float(frame)))
+            existing_marker = _marker_at_frame(existing, frame)
             if isinstance(existing_marker, Mapping):
                 previous = existing_marker.get(
                     "customData", existing_marker.get("custom_data", "")
@@ -2129,15 +2235,15 @@ def _add_plan_markers(
                         f"{frame}"
                     )
             else:
-                added = _call_required(
+                color = _marker_color(kind, severity)
+                name = f"RH {kind}: {marker_id}"[:128]
+                added = _add_marker_with_bounded_retry(
                     timeline,
-                    "AddMarker",
-                    frame,
-                    _marker_color(kind, severity),
-                    f"RH {kind}: {marker_id}"[:128],
-                    note,
-                    duration,
-                    "",
+                    frame=frame,
+                    color=color,
+                    name=name,
+                    note=note,
+                    duration=duration,
                 )
                 if added is not True:
                     raise ResolveExecutionError(

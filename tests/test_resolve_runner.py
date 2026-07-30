@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import json
 import ast
 import hashlib
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -613,6 +615,94 @@ def test_imported_fcpxml_marker_is_enriched_without_duplicate_collision(
     enriched = json.loads(generated.markers[0][5])
     assert enriched["build_id"] == plan["build_id"]
     assert enriched["marker_ids"] == ["marker-1"]
+
+
+def test_marker_add_retries_when_resolve_is_temporarily_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    project = FakeProject()
+    original_import = project.media_pool.ImportTimelineFromFile
+    sleep_calls: list[float] = []
+
+    def import_with_busy_first_marker(path, options):
+        timeline = original_import(path, options)
+        original_add = timeline.AddMarker
+        calls = 0
+
+        def busy_then_add(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return False
+            return original_add(*args)
+
+        timeline.AddMarker = busy_then_add
+        return timeline
+
+    project.media_pool.ImportTimelineFromFile = import_with_busy_first_marker
+    monkeypatch.setattr(
+        "rabbithole.resolve_runner.time.sleep",
+        sleep_calls.append,
+    )
+
+    execute_build(
+        FakeResolve(project),
+        plan,
+        project_root=project_root,
+        plan_path=plan_path,
+    )
+
+    generated = project.timelines[-1]
+    assert sleep_calls == [0.05]
+    assert len(generated.markers) == 2
+    assert all(
+        json.loads(marker[5])["build_id"] == plan["build_id"]
+        for marker in generated.markers
+    )
+
+
+def test_marker_add_permanent_rejection_still_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    project = FakeProject()
+    original_import = project.media_pool.ImportTimelineFromFile
+    add_calls = 0
+
+    def import_with_rejected_markers(path, options):
+        timeline = original_import(path, options)
+
+        def reject_marker(*args):
+            nonlocal add_calls
+            add_calls += 1
+            return False
+
+        timeline.AddMarker = reject_marker
+        return timeline
+
+    project.media_pool.ImportTimelineFromFile = import_with_rejected_markers
+    monkeypatch.setattr(
+        "rabbithole.resolve_runner.time.sleep",
+        lambda _seconds: None,
+    )
+    resolve = FakeResolve(project)
+
+    with pytest.raises(ResolveExecutionError, match="AddMarker"):
+        execute_build(
+            resolve,
+            plan,
+            project_root=project_root,
+            plan_path=plan_path,
+        )
+
+    assert add_calls == 4
+    assert project.timelines[-1].markers == []
+    assert resolve.manager.save_calls == 0
 
 
 @pytest.mark.parametrize("failed_update", [1, 2])
@@ -1597,8 +1687,58 @@ def test_workspace_bootstrap_is_python36_parseable_and_guards_before_import() ->
 
     ast.parse(source, feature_version=(3, 6))
     assert source.index("_require_supported_python()") < source.index(
-        "from rabbithole.resolve_runner import run_pending_jobs"
+        "_fresh_run_pending_jobs(source_root)"
     )
+
+
+def test_workspace_bootstrap_reloads_changed_checkout_in_same_interpreter(
+    tmp_path: Path,
+) -> None:
+    source_script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "rabbithole_resolve_runner.py"
+    )
+    checkout = tmp_path / "checkout"
+    scripts = checkout / "scripts"
+    package = checkout / "rabbithole"
+    scripts.mkdir(parents=True)
+    package.mkdir()
+    bootstrap = scripts / "rabbithole_resolve_runner.py"
+    bootstrap.write_text(
+        source_script.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    runner_module = package / "resolve_runner.py"
+    runner_module.write_text(
+        "def run_pending_jobs(**_kwargs):\n"
+        "    return [{'revision': 'first'}]\n",
+        encoding="utf-8",
+    )
+    probe = (
+        "import runpy, sys\n"
+        "from pathlib import Path\n"
+        "bootstrap = Path(sys.argv[1])\n"
+        "runner = Path(sys.argv[2])\n"
+        "globals_ = {'RUN_RABBITHOLE_RESOLVE_RUNNER': True, "
+        "'PROJECT_ROOT': 'episode', 'JOB_ID': 'job'}\n"
+        "first = runpy.run_path(str(bootstrap), init_globals=globals_)['RESULTS']\n"
+        "runner.write_text(\"def run_pending_jobs(**_kwargs):\\n"
+        "    return [{'revision': 'second-version'}]\\n\", encoding='utf-8')\n"
+        "second = runpy.run_path(str(bootstrap), init_globals=globals_)['RESULTS']\n"
+        "assert first == [{'revision': 'first'}], first\n"
+        "assert second == [{'revision': 'second-version'}], second\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", probe, str(bootstrap), str(runner_module)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 def test_non_auto_timeline_name_is_refused() -> None:

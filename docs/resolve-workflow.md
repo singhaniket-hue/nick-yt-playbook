@@ -189,10 +189,12 @@ duplicates. The resulting cues remain editable on the subtitle track.
 Review-warning and human-review markers use Resolve-supported Yellow; Resolve
 rejects `Orange` as a marker color. The runner creates each marker first and
 then attaches its machine-readable JSON with `UpdateMarkerCustomData`, avoiding
-Resolve's combined marker-payload rejection. A failed metadata update rolls
-back only marker changes made by that call. Build reuse, render, and handoff
-require the complete per-frame RabbitHole marker contract, so a partial marker
-set can never authenticate an immutable timeline.
+Resolve's combined marker-payload rejection. A transient `False` response is
+handled defensively with short, fixed retries; an asynchronously appearing
+marker is accepted only when its visible shell matches exactly. A failed
+metadata update rolls back only marker changes made by that call. Build reuse,
+render, and handoff require the complete per-frame RabbitHole marker contract,
+so a partial marker set can never authenticate an immutable timeline.
 
 `resolve prepare` creates A3/A4 under
 `resolve/audio-stems/<content-sha256>/`. The directory is immutable: changing
@@ -270,6 +272,11 @@ durable enqueue step reads only the small plan/FCPXML/SRT artifacts; it does not
 rescan large media. After Resolve reports idle, the runner authenticates the
 queue document and rechecks the plan, FCPXML, SRT, and every linked video/audio
 file before mutation.
+Resolve's embedded Console keeps imported Python modules alive for the entire
+application session. The in-app bootstrap therefore drops cached RabbitHole
+modules on every execution, imports from the queue-selected checkout, and
+verifies that module path before it claims a job. Updating the repository never
+requires quitting Resolve merely to pick up a runner fix.
 Before configuring a render, it validates the selected immutable timeline's
 identity marker, style marker, track contract, duration, item counts, and exact
 subtitle cue timing/text again.

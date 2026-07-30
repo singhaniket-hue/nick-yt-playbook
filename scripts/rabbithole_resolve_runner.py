@@ -11,6 +11,7 @@ Python 3.11. An older Console therefore receives a clear, non-mutating error
 before the project package is imported or a queued job is claimed.
 """
 
+import importlib
 import json
 import os
 from pathlib import Path
@@ -86,9 +87,37 @@ def _bootstrap_source(pointer):
     for candidate in candidates:
         if (candidate / "rabbithole" / "resolve_runner.py").is_file():
             text = os.fspath(candidate.resolve())
-            if text not in sys.path:
-                sys.path.insert(0, text)
-            return
+            while text in sys.path:
+                sys.path.remove(text)
+            sys.path.insert(0, text)
+            return Path(text)
+    raise RuntimeError(
+        "Cannot find the RabbitHole runner package beside this script or in "
+        "the queued-project pointer."
+    )
+
+
+def _drop_cached_package_modules(package_name="rabbithole"):
+    """Remove checkout-owned code cached by Resolve's persistent Console."""
+
+    prefix = package_name + "."
+    for name in tuple(sys.modules):
+        if name == package_name or name.startswith(prefix):
+            del sys.modules[name]
+    importlib.invalidate_caches()
+
+
+def _fresh_run_pending_jobs(source_root):
+    _drop_cached_package_modules()
+    module = importlib.import_module("rabbithole.resolve_runner")
+    module_path = Path(module.__file__).resolve()
+    expected_root = Path(source_root).resolve()
+    if expected_root not in module_path.parents:
+        raise RuntimeError(
+            "Resolve loaded RabbitHole from an unexpected checkout: "
+            + os.fspath(module_path)
+        )
+    return module.run_pending_jobs
 
 
 def main():
@@ -108,8 +137,8 @@ def main():
         except RuntimeError:
             pointer = None
 
-    _bootstrap_source(pointer)
-    from rabbithole.resolve_runner import run_pending_jobs
+    source_root = _bootstrap_source(pointer)
+    run_pending_jobs = _fresh_run_pending_jobs(source_root)
 
     results = run_pending_jobs(
         resolve=globals().get("resolve"),

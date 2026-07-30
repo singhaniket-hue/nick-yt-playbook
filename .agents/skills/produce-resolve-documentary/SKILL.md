@@ -219,9 +219,11 @@ Resolve-supported marker colors; warning and human-review markers are Yellow
 because Resolve rejects `Orange`.
 Create a marker with empty custom data first, then attach its JSON through
 `UpdateMarkerCustomData`; Resolve can reject the equivalent combined
-`AddMarker` call. Roll back only marker changes made by a failed call, and
-validate the complete per-frame RabbitHole marker contract before reuse,
-render, or handoff.
+`AddMarker` call. Defensively handle a transient `False` response only with
+short fixed retries; accept an asynchronously appearing marker only when its
+visible shell matches exactly, and otherwise fail closed. Roll back only marker
+changes made by a failed call, and validate the complete per-frame RabbitHole
+marker contract before reuse, render, or handoff.
 
 Never proceed while the user reports an active render. Never stop a render,
 clear a render queue, quit Resolve, switch databases/projects, delete a
@@ -237,7 +239,10 @@ import sys; print(sys.version)
 Execute the printed loader only when the Console is Python 3.11+. If it is
 older, stop before claiming the job and use manual FCPXML import, the explicit
 FFmpeg backend, or Resolve Studio's external bridge. Never claim that unit
-tests prove a Free Console runtime.
+tests prove a Free Console runtime. Resolve's Console persists Python modules
+for the full application session, so every loader run must discard cached
+RabbitHole package modules, import from the queue-selected checkout, and verify
+the imported module path before claiming a job.
 
 Review evidence, redactions, subtitles, editable provenance-derived source
 captions, source audio, rights, and grade on the generated timeline. Generated
