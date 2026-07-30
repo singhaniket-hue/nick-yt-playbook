@@ -151,7 +151,8 @@ def build_fcpxml(
             },
         )
 
-    event = ET.SubElement(fcpxml, "event", {"name": "RabbitHole Auto Builds"})
+    library = ET.SubElement(fcpxml, "library")
+    event = ET.SubElement(library, "event", {"name": "RabbitHole Auto Builds"})
     project = ET.SubElement(event, "project", {"name": str(plan["timeline_name"])})
     sequence = ET.SubElement(
         project,
@@ -607,6 +608,8 @@ def _append_audio_track(
                 "lane": str(lane),
             },
         )
+        note = ET.SubElement(item, "note")
+        note.text = f"id={clip['id']} track={track_id}"
         gain_db = _audio_gain_db(clip)
         if abs(gain_db) > 1e-9:
             ET.SubElement(
@@ -614,8 +617,6 @@ def _append_audio_track(
                 "adjust-volume",
                 {"amount": f"{_number(gain_db)}dB"},
             )
-        note = ET.SubElement(item, "note")
-        note.text = f"id={clip['id']} track={track_id}"
 
 
 def _append_caption(
@@ -686,19 +687,6 @@ def _append_title(
         },
     )
     source_caption = kind == "source_caption"
-    if source_caption:
-        # Basic Title is born centred. FCPXML transform coordinates are
-        # percentages of frame size, so this places the editable title within
-        # lower-left title-safe while leaving the generator and text editable.
-        ET.SubElement(
-            title,
-            "adjust-transform",
-            {
-                "position": "-38 -42",
-                "scale": "1 1",
-                "rotation": "0",
-            },
-        )
     style_id = _xml_id(f"ts-{overlay['id']}")
     text = ET.SubElement(title, "text")
     styled = ET.SubElement(text, "text-style", {"ref": style_id})
@@ -717,6 +705,18 @@ def _append_title(
     note.text = f"id={overlay['id']} kind={kind} track={track_id}"
     if source_caption:
         note.text += " editable=1 layout=bottom-left"
+        # Basic Title is born centred. FCPXML transform coordinates are
+        # percentages of frame size, so this places the editable title within
+        # lower-left title-safe while leaving the generator and text editable.
+        ET.SubElement(
+            title,
+            "adjust-transform",
+            {
+                "position": "-38 -42",
+                "scale": "1 1",
+                "rotation": "0",
+            },
+        )
 
 
 def _validate_plan(plan: Mapping[str, Any]) -> None:

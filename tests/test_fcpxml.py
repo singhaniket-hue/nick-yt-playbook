@@ -25,11 +25,18 @@ def test_fcpxml_is_deterministic_and_uses_valid_effect_references(tmp_path):
 
     assert first == second
     assert document.attrib["version"] == "1.10"
+    assert [child.tag for child in document] == ["resources", "library"]
+    library = document.find("./library")
+    assert library is not None
+    assert library.attrib == {}
+    assert len(library.findall("./event")) == 1
     effects = {
         effect.attrib["id"]: effect.attrib["name"]
         for effect in document.findall("./resources/effect")
     }
-    transitions = document.findall("./event/project/sequence/spine/transition")
+    transitions = document.findall(
+        "./library/event/project/sequence/spine/transition"
+    )
     assert transitions
     for transition in transitions:
         filter_video = transition.find("filter-video")
@@ -42,7 +49,7 @@ def test_fcpxml_maps_primary_and_connected_items_to_resolve_tracks(tmp_path):
     plan = compile_resolve_plan(root)
     document = ET.fromstring(build_fcpxml(plan, project_root=root))
 
-    spine = document.find("./event/project/sequence/spine")
+    spine = document.find("./library/event/project/sequence/spine")
     assert spine is not None
     assert spine.find("./clip") is None
     assert spine.find("./spine") is None
@@ -182,6 +189,10 @@ def test_fcpxml_preserves_audio_clip_gain_as_editable_volume_adjustment(tmp_path
         item.find("adjust-volume").attrib["amount"]
         for item in audio
     } == {"-0.125dB"}
+    assert {
+        tuple(child.tag for child in item)
+        for item in audio
+    } == {("note", "adjust-volume")}
 
 
 def test_fcpxml_omits_identity_audio_volume_adjustment(tmp_path):
@@ -273,6 +284,12 @@ def test_source_caption_uses_editable_basic_title_in_bottom_left(tmp_path):
     assert "editable=1 layout=bottom-left" in (
         source_caption.findtext("note") or ""
     )
+    assert [child.tag for child in source_caption] == [
+        "text",
+        "text-style-def",
+        "note",
+        "adjust-transform",
+    ]
     authored = next(
         title
         for title in document.findall(".//title")
