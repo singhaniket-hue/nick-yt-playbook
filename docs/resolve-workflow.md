@@ -162,7 +162,7 @@ The build contains:
 - V1 primary footage
 - V2 evidence, chapter, censor, and highlight overlays
 - V3 designed titles and graphics
-- V4 texture and finishing overlays
+- V4 texture/finishing overlays and deterministic title-collision overflow
 - A1 narration
 - A2 original-source bites
 - A3 a full-length music stem with the approved constant-power
@@ -180,6 +180,12 @@ below it. The Resolve scripting layer imports that timeline, names and validates
 the tracks, adds metadata markers, applies a checksum-matched archival grade
 when available, records manual Fusion/template intent, and configures the render
 job.
+
+Editable titles are interval-allocated across V3 and V4. This preserves a
+source caption and chapter card that begin together instead of allowing Resolve
+to discard one because two titles occupy the same connected lane. Imported
+primary-story transitions are counted separately from linked clips and titles
+in the immutable timeline contract.
 
 Resolve 21 can ignore valid FCPXML `caption` elements. `resolve prepare`
 therefore emits a checksum-pinned `subtitles.srt` beside the FCPXML. The runner

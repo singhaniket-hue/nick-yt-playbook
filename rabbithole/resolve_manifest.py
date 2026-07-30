@@ -33,7 +33,7 @@ from rabbithole.sources.soundgen import (
 
 
 SCHEMA_VERSION = "resolve-plan.v1"
-COMPILER_VERSION = "resolve-compiler.v8"
+COMPILER_VERSION = "resolve-compiler.v9"
 DEFAULT_FPS = 30
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
@@ -44,7 +44,7 @@ _VIDEO_TRACKS = (
     ("V1", "base_footage"),
     ("V2", "evidence_and_inserts"),
     ("V3", "text_and_graphics"),
-    ("V4", "grain_and_texture"),
+    ("V4", "grain_texture_and_title_overflow"),
 )
 _AUDIO_TRACKS = (
     ("A1", "narration"),
@@ -803,6 +803,7 @@ def _compile_loaded(
     overlays.extend(
         _compile_source_caption_overlays(clips, provenance, overlays)
     )
+    _assign_non_overlapping_title_tracks(overlays)
     for overlay in overlays:
         if "redact" in overlay["kind"]:
             _add_review(
@@ -1051,6 +1052,7 @@ def _compile_loaded(
                 if overlay.get("text")
                 and overlay.get("kind") not in _SUBTITLE_KINDS
             ),
+            "video_transition_count": _primary_transition_count(clips),
             "audio_clip_count": sum(
                 1 for clip in audio if clip.get("media_path")
             ),
@@ -1662,6 +1664,48 @@ def _default_transition_frames(kind: str) -> int:
     return 0
 
 
+def _primary_transition_count(clips: Sequence[Mapping[str, Any]]) -> int:
+    """Count transitions that FCPXML will materialize on the V1 storyline."""
+
+    primary = sorted(
+        (
+            clip
+            for clip in clips
+            if str(clip.get("track") or "V1") == "V1"
+        ),
+        key=lambda item: (int(item["start_frame"]), str(item["id"])),
+    )
+    previous: Mapping[str, Any] | None = None
+    cursor = 0
+    count = 0
+    supported = {"cross_dissolve", "dip_to_black", "fade"}
+    for clip in primary:
+        start = int(clip["start_frame"])
+        if start > cursor:
+            previous = None
+        if (
+            previous is not None
+            and start == int(previous["end_frame"])
+            and previous.get("asset_id")
+            and previous.get("media_path")
+            and clip.get("asset_id")
+            and clip.get("media_path")
+        ):
+            transition = clip.get("transition") or {}
+            kind = str(transition.get("kind") or "cut")
+            requested = int(transition.get("duration_frames") or 0)
+            duration = min(
+                requested,
+                max(0, int(previous["duration_frames"]) // 2),
+                max(0, int(clip["duration_frames"]) // 2),
+            )
+            if kind in supported and duration > 0:
+                count += 1
+        cursor = max(cursor, int(clip["end_frame"]))
+        previous = clip
+    return count
+
+
 def _compile_markers(
     raw_markers: Sequence[Mapping[str, Any]], fps: int
 ) -> list[dict[str, Any]]:
@@ -1721,6 +1765,134 @@ def _compile_overlays(
             }
             subtitles.append(subtitle)
     return overlays, subtitles
+
+
+def _assign_non_overlapping_title_tracks(
+    overlays: Sequence[dict[str, Any]],
+) -> None:
+    """Allocate editable titles across V3/V4 without dropping collisions."""
+
+    candidates = [
+        overlay
+        for overlay in overlays
+        if overlay.get("text")
+        and str(overlay.get("kind") or "").lower() not in _SUBTITLE_KINDS
+    ]
+    requested_tracks: list[str] = []
+    for overlay in candidates:
+        requested = str(overlay.get("track") or "V3")
+        if requested not in {"V3", "V4"}:
+            raise ResolveManifestError(
+                f"title overlay {overlay['id']!r} has invalid track {requested!r}"
+            )
+        requested_tracks.append(requested)
+
+    order = sorted(
+        range(len(candidates)),
+        key=lambda index: (
+            int(candidates[index]["start_frame"]),
+            int(candidates[index]["end_frame"]),
+            str(candidates[index]["id"]),
+        ),
+    )
+    adjacency: list[set[int]] = [set() for _ in candidates]
+    active: list[int] = []
+    for index in order:
+        start = int(candidates[index]["start_frame"])
+        active = [
+            other
+            for other in active
+            if int(candidates[other]["end_frame"]) > start
+        ]
+        if len(active) >= 2:
+            conflicts = ", ".join(
+                str(candidates[other]["id"]) for other in active
+            )
+            raise ResolveManifestError(
+                f"title overlay {candidates[index]['id']!r} overlaps more than "
+                f"two available Resolve title lanes ({conflicts})"
+            )
+        for other in active:
+            adjacency[index].add(other)
+            adjacency[other].add(index)
+        active.append(index)
+
+    colors: dict[int, int] = {}
+    for root in order:
+        if root in colors:
+            continue
+        colors[root] = 0
+        component: list[int] = []
+        pending = [root]
+        while pending:
+            index = pending.pop()
+            component.append(index)
+            for neighbor in adjacency[index]:
+                expected = 1 - colors[index]
+                if neighbor in colors:
+                    if colors[neighbor] != expected:
+                        raise ResolveManifestError(
+                            "editable title overlaps cannot fit on Resolve "
+                            "tracks V3/V4"
+                        )
+                    continue
+                colors[neighbor] = expected
+                pending.append(neighbor)
+
+        fixed_flips = {
+            1 ^ colors[index]
+            for index in component
+            if requested_tracks[index] == "V4"
+        }
+        if len(fixed_flips) > 1:
+            fixed_ids = ", ".join(
+                str(candidates[index]["id"])
+                for index in component
+                if requested_tracks[index] == "V4"
+            )
+            raise ResolveManifestError(
+                f"fixed V4 title overlays overlap each other ({fixed_ids})"
+            )
+        if fixed_flips:
+            flip = next(iter(fixed_flips))
+        else:
+            preference_order = sorted(
+                component,
+                key=lambda index: (
+                    int(candidates[index]["start_frame"]),
+                    0
+                    if str(candidates[index].get("kind") or "")
+                    == "source_caption"
+                    else 1,
+                    str(candidates[index]["id"]),
+                ),
+            )
+
+            def score(candidate_flip: int) -> tuple[Any, ...]:
+                assigned_v3 = {
+                    index
+                    for index in component
+                    if (colors[index] ^ candidate_flip) == 0
+                }
+                return (
+                    sum(
+                        1
+                        for index in assigned_v3
+                        if str(candidates[index].get("kind") or "")
+                        == "source_caption"
+                    ),
+                    len(assigned_v3),
+                    tuple(
+                        1 if index in assigned_v3 else 0
+                        for index in preference_order
+                    ),
+                )
+
+            flip = max((0, 1), key=score)
+        for index in component:
+            candidates[index]["track"] = (
+                "V3" if (colors[index] ^ flip) == 0 else "V4"
+            )
 
 
 def _source_caption_text(asset: Mapping[str, Any]) -> str:

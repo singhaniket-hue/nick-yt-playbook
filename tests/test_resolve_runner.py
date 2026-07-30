@@ -837,8 +837,10 @@ def test_marker_rollback_failure_is_explicit(tmp_path: Path) -> None:
     assert resolve.manager.save_calls == 0
 
 
+@pytest.mark.parametrize("include_transition_contract", [True, False])
 def test_import_integrity_validates_duration_linked_clips_and_subtitles(
     tmp_path: Path,
+    include_transition_contract: bool,
 ) -> None:
     project_root = tmp_path / "episode"
     plan_path, plan = compiler_shaped_plan(project_root)
@@ -848,7 +850,24 @@ def test_import_integrity_validates_duration_linked_clips_and_subtitles(
             "slot_id": "s001",
             "track": "V1",
             "start_frame": 0,
+            "end_frame": 15,
+            "duration_frames": 15,
+            "asset_id": "asset-1",
             "media_path": "assets/evidence.png",
+        },
+        {
+            "id": "clip-1b",
+            "slot_id": "s001b",
+            "track": "V1",
+            "start_frame": 15,
+            "end_frame": 30,
+            "duration_frames": 15,
+            "asset_id": "asset-1b",
+            "media_path": "assets/evidence-continued.png",
+            "transition": {
+                "kind": "cross_dissolve",
+                "duration_frames": 6,
+            },
         },
         {
             "id": "clip-2",
@@ -856,7 +875,7 @@ def test_import_integrity_validates_duration_linked_clips_and_subtitles(
             "track": "V2",
             "start_frame": 15,
             "media_path": "assets/insert.png",
-        }
+        },
     ]
     plan["audio"] = [
         {
@@ -876,20 +895,27 @@ def test_import_integrity_validates_duration_linked_clips_and_subtitles(
             "text": "Archive source",
         }
     ]
-    plan["timeline_validation"] = {
+    validation = {
         "start_frame": 0,
         "end_frame": 30,
-        "video_clip_count": 2,
+        "video_clip_count": 3,
         "video_title_count": 1,
         "audio_clip_count": 1,
         "subtitle_count": 1,
     }
+    if include_transition_contract:
+        validation["video_transition_count"] = 1
+    plan["timeline_validation"] = validation
 
     class LinkedItem:
         def GetMediaPoolItem(self):
             return object()
 
     class GeneratedTitle:
+        def GetMediaPoolItem(self):
+            return None
+
+    class GeneratedTransition:
         def GetMediaPoolItem(self):
             return None
 
@@ -902,7 +928,13 @@ def test_import_integrity_validates_duration_linked_clips_and_subtitles(
 
         def GetItemListInTrack(self, kind, index):
             if kind == "video":
-                if index in {1, 2}:
+                if index == 1:
+                    return [
+                        LinkedItem(),
+                        GeneratedTransition(),
+                        LinkedItem(),
+                    ]
+                if index == 2:
                     return [LinkedItem()]
                 if index == 3:
                     return [GeneratedTitle()]

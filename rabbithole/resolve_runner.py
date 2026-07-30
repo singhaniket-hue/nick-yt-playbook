@@ -1488,6 +1488,57 @@ def _timeline_marker_documents(timeline: Any) -> list[dict[str, Any]]:
     return documents
 
 
+def _primary_transition_count_from_plan(
+    clips: Sequence[Mapping[str, Any]],
+) -> int:
+    """Infer the pre-v9 V1 transition contract from a compiled plan."""
+
+    primary = sorted(
+        (
+            clip
+            for clip in clips
+            if str(clip.get("track") or "V1") == "V1"
+        ),
+        key=lambda item: (int(item["start_frame"]), str(item["id"])),
+    )
+    previous: Mapping[str, Any] | None = None
+    cursor = 0
+    count = 0
+    supported = {"cross_dissolve", "dip_to_black", "fade"}
+    for clip in primary:
+        start = int(clip["start_frame"])
+        if (
+            "end_frame" not in clip
+            or "duration_frames" not in clip
+        ):
+            previous = None
+            cursor = max(cursor, start)
+            continue
+        if start > cursor:
+            previous = None
+        if (
+            previous is not None
+            and start == int(previous["end_frame"])
+            and previous.get("asset_id")
+            and previous.get("media_path")
+            and clip.get("asset_id")
+            and clip.get("media_path")
+        ):
+            transition = clip.get("transition") or {}
+            kind = str(transition.get("kind") or "cut")
+            requested = int(transition.get("duration_frames") or 0)
+            duration = min(
+                requested,
+                max(0, int(previous["duration_frames"]) // 2),
+                max(0, int(clip["duration_frames"]) // 2),
+            )
+            if kind in supported and duration > 0:
+                count += 1
+        cursor = max(cursor, int(clip["end_frame"]))
+        previous = clip
+    return count
+
+
 def _validate_imported_items(
     timeline: Any,
     plan: Mapping[str, Any],
@@ -1529,8 +1580,14 @@ def _validate_imported_items(
     expected_title_total = int(
         validation.get("video_title_count", len(title_overlays))
     )
+    transition_contract = validation.get("video_transition_count")
+    expected_transition_total = (
+        _primary_transition_count_from_plan(clips)
+        if transition_contract is None
+        else int(transition_contract)
+    )
     actual_media_total = 0
-    actual_title_total = 0
+    actual_generated_total = 0
     for spec in _track_specs(plan, "video"):
         items = _sequence_values(
             getter("video", spec["index"]),
@@ -1546,12 +1603,20 @@ def _validate_imported_items(
             for overlay in title_overlays
             if str(overlay.get("track") or "V3") == spec["id"]
         )
-        expected_track_total = expected_media_track + expected_title_track
+        expected_transition_track = (
+            expected_transition_total if spec["id"] == "V1" else 0
+        )
+        expected_track_total = (
+            expected_media_track
+            + expected_title_track
+            + expected_transition_track
+        )
         if len(items) != expected_track_total:
             raise ImmutableTimelineError(
                 f"imported {spec['id']} has {len(items)} items; "
                 f"expected {expected_media_track} media clips and "
-                f"{expected_title_track} titles"
+                f"{expected_title_track} titles and "
+                f"{expected_transition_track} transitions"
             )
         linked_count = 0
         for item in items:
@@ -1566,25 +1631,30 @@ def _validate_imported_items(
         unlinked_count = len(items) - linked_count
         if (
             linked_count != expected_media_track
-            or unlinked_count != expected_title_track
+            or unlinked_count
+            != expected_title_track + expected_transition_track
         ):
             raise ImmutableTimelineError(
                 f"imported {spec['id']} contains {linked_count} linked media "
                 f"items and {unlinked_count} unlinked/generated items; expected "
                 f"{expected_media_track} linked media clips and "
-                f"{expected_title_track} titles"
+                f"{expected_title_track} titles plus "
+                f"{expected_transition_track} transitions"
             )
         actual_media_total += linked_count
-        actual_title_total += unlinked_count
+        actual_generated_total += unlinked_count
     if actual_media_total != expected_total:
         raise ImmutableTimelineError(
             f"imported timeline has {actual_media_total} linked video clips; "
             f"expected {expected_total}"
         )
-    if actual_title_total != expected_title_total:
+    if actual_generated_total != (
+        expected_title_total + expected_transition_total
+    ):
         raise ImmutableTimelineError(
-            f"imported timeline has {actual_title_total} generated titles; "
-            f"expected {expected_title_total}"
+            f"imported timeline has {actual_generated_total} generated video "
+            f"items; expected {expected_title_total} titles and "
+            f"{expected_transition_total} transitions"
         )
 
     raw_audio = plan.get("audio")

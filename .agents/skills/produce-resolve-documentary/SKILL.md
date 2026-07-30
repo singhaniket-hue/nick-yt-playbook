@@ -225,6 +225,11 @@ visible shell matches exactly, and otherwise fail closed. Roll back only marker
 changes made by a failed call, and validate the complete per-frame RabbitHole
 marker contract before reuse, render, or handoff.
 
+Interval-allocate simultaneous editable titles across V3/V4 so Resolve does
+not discard a same-lane source caption or chapter card. Count primary-story
+transition items separately from linked clips and generated titles during
+timeline validation.
+
 Never proceed while the user reports an active render. Never stop a render,
 clear a render queue, quit Resolve, switch databases/projects, delete a
 timeline, or mutate `EDITORIAL_*`. Build or reuse only the immutable

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from rabbithole.resolve_manifest import (
+    _assign_non_overlapping_title_tracks,
     build_resolve_srt,
     compile_resolve_plan,
     write_resolve_bundle,
@@ -381,7 +382,7 @@ def test_compile_is_deterministic_and_preserves_render_offsets(tmp_path):
     assert first["timeline_name"].startswith("AUTO_BUILD_")
     assert first["project_root"] == "."
     assert first["fps"] == 30
-    assert first["compiler_version"] == "resolve-compiler.v8"
+    assert first["compiler_version"] == "resolve-compiler.v9"
     assert first["render"]["format"] == "mp4"
     assert first["render"]["codec"] == "H264"
     assert first["render"]["mode"] == "single_clip"
@@ -397,6 +398,7 @@ def test_compile_is_deterministic_and_preserves_render_offsets(tmp_path):
         "end_frame": first["duration_frames"],
         "video_clip_count": 3,
         "video_title_count": 1,
+        "video_transition_count": 1,
         "audio_clip_count": 2,
         "subtitle_count": len(first["subtitles"]),
     }
@@ -713,6 +715,82 @@ def test_authored_source_caption_covers_span_without_generated_duplicate(
         and not overlay.get("generated", False)
         for overlay in plan["overlays"]
     )
+
+
+def test_simultaneous_source_caption_and_chapter_card_use_separate_tracks(
+    tmp_path,
+):
+    root = _project(tmp_path)
+    edl_path = root / "edit" / "edl.json"
+    edl = json.loads(edl_path.read_text(encoding="utf-8"))
+    edl["overlays"].extend(
+        [
+            {
+                "kind": "source_caption",
+                "start": 0.0,
+                "end": 1.0,
+                "text": "Source label",
+                "detail": {"position": "lower-left"},
+            },
+            {
+                "kind": "chapter_card",
+                "start": 0.0,
+                "end": 1.2,
+                "text": "Chapter One",
+                "detail": {},
+            },
+        ]
+    )
+    _write_json(edl_path, edl)
+
+    plan = compile_resolve_plan(root)
+
+    tracks_by_text = {
+        overlay["text"]: overlay["track"]
+        for overlay in plan["overlays"]
+        if overlay.get("text") in {"Source label", "Chapter One"}
+    }
+    assert tracks_by_text == {
+        "Source label": "V3",
+        "Chapter One": "V4",
+    }
+
+
+def test_title_allocator_reserves_future_fixed_v4_interval():
+    overlays = [
+        {
+            "id": "a",
+            "kind": "chapter_card",
+            "track": "V3",
+            "start_frame": 0,
+            "end_frame": 10,
+            "text": "Short flexible title",
+        },
+        {
+            "id": "b",
+            "kind": "chapter_card",
+            "track": "V3",
+            "start_frame": 0,
+            "end_frame": 20,
+            "text": "Long flexible title",
+        },
+        {
+            "id": "c",
+            "kind": "texture",
+            "track": "V4",
+            "start_frame": 10,
+            "end_frame": 15,
+            "text": "Fixed finishing overlay",
+        },
+    ]
+
+    _assign_non_overlapping_title_tracks(overlays)
+
+    assert {overlay["id"]: overlay["track"] for overlay in overlays} == {
+        "a": "V4",
+        "b": "V3",
+        "c": "V4",
+    }
 
 
 def test_known_burned_attribution_provider_does_not_get_second_caption(

@@ -37,7 +37,9 @@ def test_fcpxml_is_deterministic_and_uses_valid_effect_references(tmp_path):
     transitions = document.findall(
         "./library/event/project/sequence/spine/transition"
     )
-    assert transitions
+    assert len(transitions) == plan["timeline_validation"][
+        "video_transition_count"
+    ]
     for transition in transitions:
         filter_video = transition.find("filter-video")
         assert filter_video is not None
