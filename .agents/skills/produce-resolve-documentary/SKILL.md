@@ -209,6 +209,15 @@ job or render. Resolve stem preparation must fail closed when
 `research/source-audio.json` contains bites until their A1/A3 duck automation
 can be baked faithfully; use the FFmpeg renderer for that case.
 
+`prepare` must also emit a checksum-pinned `subtitles.srt` beside the FCPXML.
+Resolve 21 may ignore otherwise-valid FCPXML `caption` elements. The in-app
+runner must keep a complete native caption import, append the SRT only when the
+imported subtitle count is exactly zero, and fail closed on a partial count so
+it never duplicates captions. Validate exact cue timing and normalized text
+after import, on immutable timeline reuse, and before render. Use only
+Resolve-supported marker colors;
+warning and human-review markers are Yellow because Resolve rejects `Orange`.
+
 Never proceed while the user reports an active render. Never stop a render,
 clear a render queue, quit Resolve, switch databases/projects, delete a
 timeline, or mutate `EDITORIAL_*`. Build or reuse only the immutable
@@ -269,7 +278,8 @@ uv run rabbithole resolve restore-handoff <handoff.zip> --out <restore-directory
 ```
 
 Treat the source-inclusive DRA as primary. Treat the DRP as a lightweight
-backup, not a media archive. Restore the DRA manually in Resolve's Project
+backup, not a media archive. The verified package must include the plan,
+FCPXML, and subtitle SRT sidecar. Restore the DRA manually in Resolve's Project
 Manager and duplicate `AUTO_BUILD_<hash>` to `EDITORIAL_v1` before editing.
 
 ## Finish and publish

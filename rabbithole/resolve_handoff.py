@@ -412,7 +412,7 @@ def _plan_paths(plan: Mapping[str, Any], project_root: Path) -> list[tuple[str, 
     output_paths = plan.get("output_paths")
     if not isinstance(output_paths, Mapping):
         return result
-    for key in ("plan", "fcpxml"):
+    for key in ("plan", "fcpxml", "subtitles"):
         raw = output_paths.get(key)
         if not isinstance(raw, str) or not raw:
             continue

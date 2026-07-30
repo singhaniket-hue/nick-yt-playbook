@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from rabbithole.resolve_manifest import compile_resolve_plan, write_resolve_bundle
+from rabbithole.resolve_manifest import (
+    build_resolve_srt,
+    compile_resolve_plan,
+    write_resolve_bundle,
+)
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -377,7 +381,7 @@ def test_compile_is_deterministic_and_preserves_render_offsets(tmp_path):
     assert first["timeline_name"].startswith("AUTO_BUILD_")
     assert first["project_root"] == "."
     assert first["fps"] == 30
-    assert first["compiler_version"] == "resolve-compiler.v5"
+    assert first["compiler_version"] == "resolve-compiler.v6"
     assert first["render"]["format"] == "mp4"
     assert first["render"]["codec"] == "H264"
     assert first["render"]["mode"] == "single_clip"
@@ -816,13 +820,58 @@ def test_bundle_paths_and_current_pointer_are_atomic_contract(tmp_path):
 
     assert result["plan_path"].is_file()
     assert result["fcpxml_path"].is_file()
+    assert result["subtitles_path"].is_file()
     assert result["current_path"] == root / "resolve" / "current.json"
     current = json.loads(result["current_path"].read_text(encoding="utf-8"))
     assert current["build_id"] == result["build_id"]
     assert current["plan_path"] == result["plan"]["output_paths"]["plan"]
     assert current["fcpxml_path"] == result["plan"]["output_paths"]["fcpxml"]
     assert (
+        current["subtitles_path"]
+        == result["plan"]["output_paths"]["subtitles"]
+    )
+    assert (
         current["fcpxml_sha256"]
         == result["plan"]["output_paths"]["fcpxml_sha256"]
         == result["fcpxml_sha256"]
+    )
+    assert (
+        current["subtitles_sha256"]
+        == result["plan"]["output_paths"]["subtitles_sha256"]
+        == result["subtitles_sha256"]
+        == _sha256(result["subtitles_path"])
+    )
+    assert result["subtitles_path"].read_text(encoding="utf-8") == (
+        "1\n"
+        "00:00:00,000 --> 00:00:01,100\n"
+        "One & sentence.\n"
+    )
+
+
+def test_resolve_srt_is_sorted_utf8_and_frame_deterministic():
+    plan = {
+        "fps": 30,
+        "subtitles": [
+            {
+                "id": "later",
+                "start_frame": 30,
+                "end_frame": 61,
+                "text": "English stays Latin",
+            },
+            {
+                "id": "first",
+                "start_frame": 1,
+                "end_frame": 30,
+                "text": "रात finally silent है।",
+            },
+        ],
+    }
+
+    assert build_resolve_srt(plan) == (
+        "1\n"
+        "00:00:00,033 --> 00:00:01,000\n"
+        "रात finally silent है।\n\n"
+        "2\n"
+        "00:00:01,000 --> 00:00:02,033\n"
+        "English stays Latin\n"
     )

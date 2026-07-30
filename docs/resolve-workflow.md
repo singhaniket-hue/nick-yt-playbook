@@ -181,6 +181,14 @@ the tracks, adds metadata markers, applies a checksum-matched archival grade
 when available, records manual Fusion/template intent, and configures the render
 job.
 
+Resolve 21 can ignore valid FCPXML `caption` elements. `resolve prepare`
+therefore emits a checksum-pinned `subtitles.srt` beside the FCPXML. The runner
+keeps a complete native caption import, appends the SRT only when the imported
+subtitle count is exactly zero, and refuses a partial count to prevent
+duplicates. The resulting cues remain editable on the subtitle track.
+Review-warning and human-review markers use Resolve-supported Yellow; Resolve
+rejects `Orange` as a marker color.
+
 `resolve prepare` creates A3/A4 under
 `resolve/audio-stems/<content-sha256>/`. The directory is immutable: changing
 timing, a generated sound, the sound manifest, or the SFX style map creates a
@@ -251,13 +259,15 @@ Every mutating operation uses a project-scoped lock containing:
 The runner fails closed when the lock belongs to a live process, when Resolve is
 already rendering, when the current project is unsafe for the requested job, or
 when a path escapes the episode or requested handoff directory. Each queued job
-also pins the plan and compiler-recorded FCPXML SHA-256 values plus the expected
-linked-media checksum set. Once compilation has prepared a bundle, the durable
-enqueue step reads only the small plan/FCPXML artifacts; it does not rescan large
-media. After Resolve reports idle, the runner authenticates the queue document
-and rechecks the plan, FCPXML, and every linked video/audio file before mutation.
+also pins the plan and compiler-recorded FCPXML/SRT SHA-256 values plus the
+expected linked-media checksum set. Once compilation has prepared a bundle, the
+durable enqueue step reads only the small plan/FCPXML/SRT artifacts; it does not
+rescan large media. After Resolve reports idle, the runner authenticates the
+queue document and rechecks the plan, FCPXML, SRT, and every linked video/audio
+file before mutation.
 Before configuring a render, it validates the selected immutable timeline's
-identity marker, style marker, track contract, duration, and item counts again.
+identity marker, style marker, track contract, duration, item counts, and exact
+subtitle cue timing/text again.
 
 The runner intentionally has no code path that calls:
 
@@ -325,7 +335,7 @@ The handoff job asks Resolve to create:
 
 The portable ZIP also contains:
 
-- `resolve-plan.v1.json` and FCPXML
+- `resolve-plan.v1.json`, FCPXML, and the deterministic subtitle SRT
 - source timing, EDL, provenance, optional source-audio/highlight manifests
 - LUTs, Fusion templates, fonts supplied by the project, and their licence notes
 - chapter/credit/QC reports when the episode already contains them

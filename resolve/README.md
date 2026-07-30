@@ -38,6 +38,12 @@ they arrive on V3 as editable lower-left Basic Title items. The
 `RabbitholeSource` Fusion title remains an optional editor-applied treatment,
 not a prerequisite for receiving or editing source attribution.
 
+Spoken subtitles also remain editable. Because Resolve 21 can ignore valid
+FCPXML `caption` elements, `resolve prepare` writes a checksum-pinned
+`subtitles.srt`. The runner appends it only when FCPXML produced exactly zero
+subtitle items and fails closed on a partial import. The editor handoff carries
+the SRT beside the plan and FCPXML.
+
 Generated sound follows the same deterministic handoff rule. Before compiling
 FCPXML, `resolve prepare` freezes the approved mix decisions into immutable,
 content-addressed A3 music and A4 SFX WAV stems inside the episode. Resolve

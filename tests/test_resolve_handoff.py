@@ -29,6 +29,12 @@ class FakeTimeline:
     def GetName(self):
         return self.name
 
+    def GetStartFrame(self):
+        return 0
+
+    def GetItemListInTrack(self, kind, index):
+        return []
+
 
 class FakeProject:
     def __init__(
@@ -91,9 +97,23 @@ def _plan(project: Path) -> dict:
     media = project / "assets" / "clip.mp4"
     media.parent.mkdir(parents=True, exist_ok=True)
     media.write_bytes(b"x" * 1024)
-    return {
+    build_dir = project / "resolve" / "builds" / "b-deadbeefcafe"
+    build_dir.mkdir(parents=True)
+    (build_dir / "timeline.fcpxml").write_text(
+        '<fcpxml version="1.10"/>', encoding="utf-8"
+    )
+    (build_dir / "subtitles.srt").write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nTest subtitle\n",
+        encoding="utf-8",
+    )
+    plan = {
         "build_id": "b-deadbeefcafe",
         "timeline_name": "AUTO_BUILD_DEADBEEFCAFE",
+        "output_paths": {
+            "plan": "resolve/builds/b-deadbeefcafe/resolve-plan.v1.json",
+            "fcpxml": "resolve/builds/b-deadbeefcafe/timeline.fcpxml",
+            "subtitles": "resolve/builds/b-deadbeefcafe/subtitles.srt",
+        },
         "provenance": [
             {
                 "asset_id": "clip",
@@ -102,6 +122,10 @@ def _plan(project: Path) -> dict:
         ],
         "audio": [{"media_path": "assets/clip.mp4"}],
     }
+    (build_dir / "resolve-plan.v1.json").write_text(
+        json.dumps(plan), encoding="utf-8"
+    )
+    return plan
 
 
 def test_source_inclusive_handoff_manifest_checksums_defaults_and_zip(
@@ -174,6 +198,15 @@ def test_source_inclusive_handoff_manifest_checksums_defaults_and_zip(
     assert (
         package / "project-files" / "project" / "chapters.txt"
     ).is_file()
+    assert (
+        package
+        / "project-files"
+        / "project"
+        / "resolve"
+        / "builds"
+        / "b-deadbeefcafe"
+        / "subtitles.srt"
+    ).read_text(encoding="utf-8").endswith("Test subtitle\n")
     assert Path(result["zip_path"]).is_file()
     assert Path(result["zip_path"] + ".sha256").is_file()
     assert validate_handoff(package)["valid"] is True

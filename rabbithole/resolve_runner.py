@@ -918,6 +918,38 @@ def timeline_import_path(
     return value
 
 
+def subtitle_import_path(
+    plan: Mapping[str, Any], plan_path: Path, project_root: Path
+) -> Path:
+    """Resolve the compiler's deterministic SRT sidecar inside the project."""
+
+    output_paths = plan.get("output_paths")
+    if not isinstance(output_paths, Mapping):
+        raise ResolveExecutionError("Resolve plan has no output_paths object")
+    raw = output_paths.get("subtitles")
+    if not isinstance(raw, str) or not raw:
+        raise ResolveExecutionError(
+            "Resolve plan has no subtitle SRT fallback path"
+        )
+    value = Path(raw).expanduser()
+    if not value.is_absolute():
+        path_kind = output_paths.get("subtitles_path_kind")
+        plan_relative = (plan_path.parent / value).resolve(strict=False)
+        project_relative = (project_root / value).resolve(strict=False)
+        if path_kind == "project-relative" or project_relative.exists():
+            value = project_relative
+        else:
+            value = plan_relative
+    value = value.resolve(strict=False)
+    if not is_path_within(value, project_root):
+        raise ResolveExecutionError(f"subtitle import path escapes project: {value}")
+    if not value.is_file():
+        raise ResolveExecutionError(
+            f"subtitle import file does not exist: {value}"
+        )
+    return value
+
+
 def _validated_sha256(value: Any, *, label: str) -> str:
     if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
         raise QueueError(f"{label} has no valid SHA-256 checksum")
@@ -964,6 +996,38 @@ def _plan_fcpxml_sha256(plan: Mapping[str, Any]) -> str:
         output_paths.get("fcpxml_sha256"),
         label="Resolve plan output_paths.fcpxml_sha256",
     )
+
+
+def _plan_subtitles_sha256(plan: Mapping[str, Any]) -> str:
+    output_paths = plan.get("output_paths")
+    if not isinstance(output_paths, Mapping):
+        raise QueueError("Resolve plan has no output_paths object")
+    return _validated_sha256(
+        output_paths.get("subtitles_sha256"),
+        label="Resolve plan output_paths.subtitles_sha256",
+    )
+
+
+def _verified_subtitle_import_path(
+    plan: Mapping[str, Any], plan_path: Path, project_root: Path
+) -> Path:
+    path = subtitle_import_path(plan, plan_path, project_root)
+    try:
+        expected = _plan_subtitles_sha256(plan)
+    except QueueError as exc:
+        raise ResolveExecutionError(str(exc)) from exc
+    try:
+        actual = _file_sha256(path)
+    except OSError as exc:
+        raise ResolveExecutionError(
+            f"cannot hash Resolve subtitle SRT {path}: {exc}"
+        ) from exc
+    if actual != expected:
+        raise ResolveExecutionError(
+            "Resolve subtitle SRT does not match the checksum recorded in the "
+            f"plan: expected {expected}, got {actual}: {path}"
+        )
+    return path
 
 
 def _collect_plan_media_expectations(
@@ -1142,6 +1206,26 @@ def _validate_queued_inputs(
             f"{fcpxml}"
         )
 
+    output_paths = plan.get("output_paths")
+    if isinstance(output_paths, Mapping) and output_paths.get("subtitles"):
+        try:
+            subtitles = subtitle_import_path(plan, plan_path, project_root)
+        except ResolveExecutionError as exc:
+            raise QueueError(str(exc)) from exc
+        expected_subtitles_sha256 = _plan_subtitles_sha256(plan)
+        try:
+            actual_subtitles_sha256 = _file_sha256(subtitles)
+        except OSError as exc:
+            raise QueueError(
+                f"cannot hash queued subtitle SRT {subtitles}: {exc}"
+            ) from exc
+        if actual_subtitles_sha256 != expected_subtitles_sha256:
+            raise QueueError(
+                "subtitle SRT changed after enqueue: "
+                f"expected {expected_subtitles_sha256}, got "
+                f"{actual_subtitles_sha256}: {subtitles}"
+            )
+
     expected_media = dict(job["media_sha256"])
     actual_media = _validate_plan_media_integrity(plan, project_root)
     if actual_media != expected_media:
@@ -1199,6 +1283,178 @@ def _sequence_values(value: Any, *, label: str) -> list[Any]:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return list(value)
     raise ImmutableTimelineError(f"{label} returned {value!r}, expected a list")
+
+
+def _expected_subtitle_count(plan: Mapping[str, Any]) -> int:
+    validation = plan.get("timeline_validation")
+    if isinstance(validation, Mapping) and validation.get("subtitle_count") is not None:
+        return int(validation["subtitle_count"])
+    raw = plan.get("subtitles")
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        return len(raw)
+    return 0
+
+
+def _subtitle_items(timeline: Any) -> list[Any]:
+    getter = getattr(timeline, "GetItemListInTrack", None)
+    if not callable(getter):
+        raise ImmutableTimelineError(
+            "timeline cannot validate imported subtitle items"
+        )
+    return _sequence_values(
+        getter("subtitle", 1),
+        label="GetItemListInTrack('subtitle', 1)",
+    )
+
+
+def _normalized_subtitle_text(value: Any) -> str:
+    lines = [
+        " ".join(line.split())
+        for line in str(value or "").replace("\r", "").split("\n")
+        if line.strip()
+    ]
+    return "\n".join(lines)
+
+
+def _validate_subtitle_items(
+    timeline: Any,
+    items: Sequence[Any],
+    plan: Mapping[str, Any],
+    *,
+    require_text: bool,
+) -> None:
+    """Validate cue placement, and SRT-expanded text, before saving the build."""
+
+    raw_subtitles = plan.get("subtitles")
+    subtitles = (
+        [item for item in raw_subtitles if isinstance(item, Mapping)]
+        if isinstance(raw_subtitles, Sequence)
+        and not isinstance(raw_subtitles, (str, bytes))
+        else []
+    )
+    timeline_start = int(_call_required(timeline, "GetStartFrame"))
+    expected_timing: list[tuple[int, int]] = []
+    expected_records: list[tuple[int, int, str]] = []
+    for subtitle in subtitles:
+        start = timeline_start + int(subtitle.get("start_frame", 0))
+        raw_end = subtitle.get("end_frame")
+        if raw_end is None:
+            raw_end = int(subtitle.get("start_frame", 0)) + int(
+                subtitle.get("duration_frames", 0)
+            )
+        end = timeline_start + int(raw_end)
+        expected_timing.append((start, end))
+        expected_records.append(
+            (start, end, _normalized_subtitle_text(subtitle.get("text")))
+        )
+
+    actual_timing: list[tuple[int, int]] = []
+    actual_records: list[tuple[int, int, str]] = []
+    for position, item in enumerate(items):
+        start_getter = getattr(item, "GetStart", None)
+        end_getter = getattr(item, "GetEnd", None)
+        if not callable(start_getter) or not callable(end_getter):
+            raise ImmutableTimelineError(
+                f"subtitle item {position + 1} cannot report its frame range"
+            )
+        start = int(start_getter())
+        end = int(end_getter())
+        actual_timing.append((start, end))
+        if require_text:
+            name_getter = getattr(item, "GetName", None)
+            if not callable(name_getter):
+                raise ImmutableTimelineError(
+                    f"subtitle item {position + 1} cannot report its text"
+                )
+            actual_records.append(
+                (start, end, _normalized_subtitle_text(name_getter()))
+            )
+
+    if sorted(actual_timing) != sorted(expected_timing):
+        raise ImmutableTimelineError(
+            "imported subtitle cue timing does not match the Resolve plan"
+        )
+    if require_text and sorted(actual_records) != sorted(expected_records):
+        raise ImmutableTimelineError(
+            "imported subtitle text or timing does not match the Resolve plan"
+        )
+
+
+def _ensure_imported_subtitles(
+    project: Any,
+    media_pool: Any,
+    timeline: Any,
+    plan: Mapping[str, Any],
+    plan_path: Path,
+    project_root: Path,
+) -> dict[str, Any]:
+    """Use the SRT sidecar only when Resolve ignored every FCPXML caption."""
+
+    expected = _expected_subtitle_count(plan)
+    items = _subtitle_items(timeline)
+    actual = len(items)
+    if actual == expected:
+        _validate_subtitle_items(
+            timeline,
+            items,
+            plan,
+            require_text=True,
+        )
+        return {
+            "status": "not_required" if expected == 0 else "fcpxml",
+            "count": actual,
+        }
+    if actual:
+        raise ImmutableTimelineError(
+            f"imported timeline has {actual} subtitles; expected {expected}; "
+            "refusing to append an SRT over a partial FCPXML caption import"
+        )
+    if expected == 0:
+        return {"status": "not_required", "count": 0}
+
+    subtitles_path = _verified_subtitle_import_path(
+        plan, plan_path, project_root
+    )
+    selected = _call_required(project, "SetCurrentTimeline", timeline)
+    if selected is not True:
+        raise ResolveExecutionError(
+            "SetCurrentTimeline() did not select the imported timeline before "
+            "subtitle fallback"
+        )
+    imported = _sequence_values(
+        _call_required(media_pool, "ImportMedia", [os.fspath(subtitles_path)]),
+        label="ImportMedia([subtitles.srt])",
+    )
+    if len(imported) != 1 or imported[0] is None:
+        raise ResolveExecutionError(
+            "ImportMedia([subtitles.srt]) did not create exactly one subtitle "
+            f"Media Pool item; returned {len(imported)}"
+        )
+    appended = _sequence_values(
+        _call_required(media_pool, "AppendToTimeline", imported),
+        label="AppendToTimeline([subtitle MediaPoolItem])",
+    )
+    if not appended:
+        raise ResolveExecutionError(
+            "AppendToTimeline() did not append the subtitle Media Pool item"
+        )
+    items = _subtitle_items(timeline)
+    actual = len(items)
+    if actual != expected:
+        raise ImmutableTimelineError(
+            f"SRT fallback produced {actual} editable subtitles; expected {expected}"
+        )
+    _validate_subtitle_items(
+        timeline,
+        items,
+        plan,
+        require_text=True,
+    )
+    return {
+        "status": "srt_imported",
+        "count": actual,
+        "path": os.fspath(subtitles_path),
+    }
 
 
 def _timeline_marker_documents(timeline: Any) -> list[dict[str, Any]]:
@@ -1431,6 +1687,12 @@ def _validate_expected_timeline(
             raise ImmutableTimelineError(
                 f"existing {expected_name!r} has no subtitle track"
             )
+    _validate_subtitle_items(
+        timeline,
+        _subtitle_items(timeline),
+        plan,
+        require_text=True,
+    )
 
     marker_getter = getattr(timeline, "GetMarkers", None)
     if callable(marker_getter):
@@ -1567,7 +1829,7 @@ def _marker_color(kind: str, severity: str | None = None) -> str:
     if severity == "error":
         return "Red"
     if severity in {"warning", "human"}:
-        return "Orange"
+        return "Yellow"
     if "chapter" in kind:
         return "Purple"
     if "highlight" in kind:
@@ -1896,6 +2158,14 @@ def execute_build(
             )
 
     _ensure_and_name_tracks(imported, plan_data)
+    subtitle_result = _ensure_imported_subtitles(
+        project,
+        media_pool,
+        imported,
+        plan_data,
+        plan_file,
+        root,
+    )
     try:
         style_result = apply_style_to_new_timeline(
             project,
@@ -1928,6 +2198,7 @@ def execute_build(
     )
     payload = asdict(result)
     payload["style"] = style_result
+    payload["subtitles"] = subtitle_result
     payload["saved"] = True
     return payload
 

@@ -33,7 +33,7 @@ from rabbithole.sources.soundgen import (
 
 
 SCHEMA_VERSION = "resolve-plan.v1"
-COMPILER_VERSION = "resolve-compiler.v5"
+COMPILER_VERSION = "resolve-compiler.v6"
 DEFAULT_FPS = 30
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
@@ -333,7 +333,7 @@ def write_resolve_bundle(
     overrides_path: Path | None = None,
     update_current: bool = True,
 ) -> dict[str, Any]:
-    """Compile and atomically write a Resolve plan plus deterministic FCPXML.
+    """Compile and atomically write a Resolve plan, FCPXML, and subtitle SRT.
 
     The return value is a plain dictionary so orchestration layers can serialize
     it directly.  Paths in the result are ``Path`` objects.
@@ -357,23 +357,33 @@ def write_resolve_bundle(
 
     plan_path = destination / "resolve-plan.v1.json"
     fcpxml_path = destination / "timeline.fcpxml"
+    subtitles_path = destination / "subtitles.srt"
     portable_plan_path, plan_path_kind = _path_for_plan(plan_path, root)
     portable_xml_path, xml_path_kind = _path_for_plan(fcpxml_path, root)
+    portable_subtitles_path, subtitles_path_kind = _path_for_plan(
+        subtitles_path, root
+    )
     plan["output_paths"] = {
         "plan": portable_plan_path,
         "plan_path_kind": plan_path_kind,
         "fcpxml": portable_xml_path,
         "fcpxml_path_kind": xml_path_kind,
+        "subtitles": portable_subtitles_path,
+        "subtitles_path_kind": subtitles_path_kind,
     }
 
     from .fcpxml import build_fcpxml
 
     fcpxml_text = build_fcpxml(plan, project_root=root)
     fcpxml_sha256 = _sha256_bytes(fcpxml_text.encode("utf-8"))
+    subtitles_text = build_resolve_srt(plan)
+    subtitles_sha256 = _sha256_bytes(subtitles_text.encode("utf-8"))
     plan["output_paths"]["fcpxml_sha256"] = fcpxml_sha256
+    plan["output_paths"]["subtitles_sha256"] = subtitles_sha256
     plan_text = _canonical_json(plan, pretty=True) + "\n"
-    _atomic_write_text(plan_path, plan_text)
     _atomic_write_text(fcpxml_path, fcpxml_text)
+    _atomic_write_text(subtitles_path, subtitles_text)
+    _atomic_write_text(plan_path, plan_text)
 
     current_path: Path | None = None
     if update_current:
@@ -385,6 +395,8 @@ def write_resolve_bundle(
             "plan_path": portable_plan_path,
             "fcpxml_path": portable_xml_path,
             "fcpxml_sha256": fcpxml_sha256,
+            "subtitles_path": portable_subtitles_path,
+            "subtitles_sha256": subtitles_sha256,
         }
         _atomic_write_text(current_path, _canonical_json(current, pretty=True) + "\n")
 
@@ -394,11 +406,89 @@ def write_resolve_bundle(
         "output_dir": destination,
         "plan_path": plan_path,
         "fcpxml_path": fcpxml_path,
+        "subtitles_path": subtitles_path,
         "current_path": current_path,
         "plan_sha256": _sha256_bytes(plan_text.encode("utf-8")),
         "fcpxml_sha256": fcpxml_sha256,
+        "subtitles_sha256": subtitles_sha256,
         "plan": plan,
     }
+
+
+def _srt_timestamp(frame: int, fps: int) -> str:
+    """Return one deterministic SubRip timestamp rounded to the nearest ms."""
+
+    if frame < 0:
+        raise ResolveManifestError("subtitle frames cannot be negative")
+    total_ms = (frame * 1000 + fps // 2) // fps
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+
+def build_resolve_srt(plan: Mapping[str, Any]) -> str:
+    """Build a UTF-8 SubRip sidecar with one cue per Resolve-plan subtitle.
+
+    Resolve 21 accepts the sidecar as a Media Pool subtitle clip and expands it
+    into native, editable subtitle items when appended to a timeline.  The
+    FCPXML remains the primary interchange document; this file is a deterministic
+    fallback for Resolve versions that ignore FCPXML ``caption`` elements.
+    """
+
+    fps = int(plan.get("fps", DEFAULT_FPS))
+    if fps <= 0:
+        raise ResolveManifestError("subtitle SRT generation requires positive fps")
+    raw_subtitles = plan.get("subtitles")
+    subtitles = (
+        [item for item in raw_subtitles if isinstance(item, Mapping)]
+        if isinstance(raw_subtitles, Sequence)
+        and not isinstance(raw_subtitles, (str, bytes))
+        else []
+    )
+    blocks: list[str] = []
+    for index, subtitle in enumerate(
+        sorted(
+            subtitles,
+            key=lambda item: (
+                int(item.get("start_frame", 0)),
+                str(item.get("id") or ""),
+            ),
+        ),
+        start=1,
+    ):
+        start = int(subtitle.get("start_frame", 0))
+        raw_end = subtitle.get("end_frame")
+        if raw_end is None:
+            raw_end = start + int(subtitle.get("duration_frames", 0))
+        end = int(raw_end)
+        if start < 0 or end <= start:
+            raise ResolveManifestError(
+                f"subtitle {subtitle.get('id', index)!r} has invalid frame range "
+                f"{start}:{end}"
+            )
+        # Empty physical lines delimit SRT cues.  Preserve authored line breaks
+        # while removing blank lines so one plan entry always remains one cue.
+        text_lines = [
+            " ".join(line.split())
+            for line in str(subtitle.get("text") or "").replace("\r", "").split("\n")
+            if line.strip()
+        ]
+        text = "\n".join(text_lines)
+        if not text:
+            raise ResolveManifestError(
+                f"subtitle {subtitle.get('id', index)!r} has no text"
+            )
+        blocks.append(
+            "\n".join(
+                (
+                    str(index),
+                    f"{_srt_timestamp(start, fps)} --> {_srt_timestamp(end, fps)}",
+                    text,
+                )
+            )
+        )
+    return "\n\n".join(blocks) + "\n" if blocks else ""
 
 
 def _compile_loaded(
@@ -489,6 +579,7 @@ def _compile_loaded(
     timeline_name = f"AUTO_BUILD_{build_digest[:12].upper()}"
     default_plan_path = f"resolve/builds/{build_id}/resolve-plan.v1.json"
     default_xml_path = f"resolve/builds/{build_id}/timeline.fcpxml"
+    default_subtitles_path = f"resolve/builds/{build_id}/subtitles.srt"
 
     review_flags: list[dict[str, Any]] = []
     missing_media: list[dict[str, Any]] = []
@@ -918,6 +1009,8 @@ def _compile_loaded(
             "plan_path_kind": "project-relative",
             "fcpxml": default_xml_path,
             "fcpxml_path_kind": "project-relative",
+            "subtitles": default_subtitles_path,
+            "subtitles_path_kind": "project-relative",
         },
         "fps": fps,
         "resolution": {"width": width, "height": height},
@@ -2970,6 +3063,7 @@ __all__ = [
     "DEFAULT_FPS",
     "ResolveManifestError",
     "SCHEMA_VERSION",
+    "build_resolve_srt",
     "compile_resolve_plan",
     "write_resolve_bundle",
 ]

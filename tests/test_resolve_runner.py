@@ -12,6 +12,7 @@ from rabbithole.resolve_runner import (
     QueueError,
     ResolveExecutionError,
     ResolveUnavailableError,
+    _marker_color,
     connect_resolve,
     enqueue_job,
     execute_build,
@@ -19,10 +20,27 @@ from rabbithole.resolve_runner import (
     install_runner,
     read_status,
     run_pending_jobs,
+    subtitle_import_path,
     timeline_import_path,
     timeline_name_for_plan,
 )
 from rabbithole.resolve_safety import ResolveBusyError, UnsafeWriteError
+
+
+class FakeSubtitleItem:
+    def __init__(self, start: int, end: int, text: str) -> None:
+        self.start = start
+        self.end = end
+        self.text = text
+
+    def GetStart(self):
+        return self.start
+
+    def GetEnd(self):
+        return self.end
+
+    def GetName(self):
+        return self.text
 
 
 class FakeTimeline:
@@ -43,9 +61,16 @@ class FakeTimeline:
         self.track_names: dict[tuple[str, int], str] = {}
         self.markers: list[tuple] = []
         self.rename_calls: list[str] = []
+        self.subtitle_items: list[FakeSubtitleItem] = []
 
     def GetName(self):
         return self.name
+
+    def GetStartFrame(self):
+        return 0
+
+    def GetEndFrame(self):
+        return 30
 
     def SetName(self, name):
         self.rename_calls.append(name)
@@ -65,6 +90,11 @@ class FakeTimeline:
 
     def GetTrackName(self, kind, index):
         return self.track_names.get((kind, index))
+
+    def GetItemListInTrack(self, kind, index):
+        if kind == "subtitle" and index == 1:
+            return list(self.subtitle_items)
+        return []
 
     def AddMarker(self, *args):
         self.markers.append(args)
@@ -94,12 +124,54 @@ class FakeMediaPool:
     def __init__(self, project) -> None:
         self.project = project
         self.calls: list[tuple[str, dict]] = []
+        self.import_media_calls: list[list[str]] = []
+        self.append_calls: list[list[object]] = []
 
     def ImportTimelineFromFile(self, path, options):
         self.calls.append((path, dict(options)))
         timeline = FakeTimeline(options["timelineName"])
         self.project.timelines.append(timeline)
         return timeline
+
+    def ImportMedia(self, paths):
+        values = list(paths)
+        self.import_media_calls.append(values)
+        text = Path(values[0]).read_text(encoding="utf-8")
+        cues = []
+        for block in (value for value in text.strip().split("\n\n") if value.strip()):
+            lines = block.splitlines()
+            start_raw, end_raw = lines[1].split(" --> ")
+
+            def frame(timestamp):
+                hours, minutes, seconds_ms = timestamp.split(":")
+                seconds, milliseconds = seconds_ms.split(",")
+                total_ms = (
+                    int(hours) * 3_600_000
+                    + int(minutes) * 60_000
+                    + int(seconds) * 1000
+                    + int(milliseconds)
+                )
+                return (total_ms * 30 + 500) // 1000
+
+            cues.append(
+                FakeSubtitleItem(
+                    frame(start_raw),
+                    frame(end_raw),
+                    "\n".join(lines[2:]),
+                )
+            )
+        return [{"path": values[0], "subtitle_cues": cues}]
+
+    def AppendToTimeline(self, items):
+        values = list(items)
+        self.append_calls.append(values)
+        timeline = self.project.current
+        if timeline is None:
+            return []
+        timeline.subtitle_items.extend(values[0]["subtitle_cues"])
+        # Resolve returns one TimelineItem for the imported SRT MediaPoolItem;
+        # the timeline itself expands that item into every individual cue.
+        return [object()]
 
 
 class FakeProject:
@@ -195,6 +267,13 @@ class FakeResolve:
         return self.manager
 
 
+@pytest.mark.parametrize("severity", ["warning", "human"])
+def test_review_marker_severities_use_resolve_supported_yellow(
+    severity: str,
+) -> None:
+    assert _marker_color("review", severity) == "Yellow"
+
+
 def compiler_shaped_plan(project: Path) -> tuple[Path, dict]:
     build_id = "b-deadbeefcafe"
     build_dir = project / "resolve" / "builds" / build_id
@@ -202,6 +281,12 @@ def compiler_shaped_plan(project: Path) -> tuple[Path, dict]:
     fcpxml = build_dir / "timeline.fcpxml"
     fcpxml.write_text("<fcpxml version=\"1.10\"/>", encoding="utf-8")
     fcpxml_sha256 = hashlib.sha256(fcpxml.read_bytes()).hexdigest()
+    subtitles = build_dir / "subtitles.srt"
+    subtitles.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nTest subtitle\n",
+        encoding="utf-8",
+    )
+    subtitles_sha256 = hashlib.sha256(subtitles.read_bytes()).hexdigest()
     plan = {
         "schema_version": "resolve-plan.v1",
         "build_id": build_id,
@@ -212,6 +297,9 @@ def compiler_shaped_plan(project: Path) -> tuple[Path, dict]:
             "fcpxml": f"resolve/builds/{build_id}/timeline.fcpxml",
             "fcpxml_path_kind": "project-relative",
             "fcpxml_sha256": fcpxml_sha256,
+            "subtitles": f"resolve/builds/{build_id}/subtitles.srt",
+            "subtitles_path_kind": "project-relative",
+            "subtitles_sha256": subtitles_sha256,
         },
         "tracks": {
             "video": [
@@ -249,7 +337,14 @@ def compiler_shaped_plan(project: Path) -> tuple[Path, dict]:
                 "license": "CC BY",
             }
         ],
-        "subtitles": [{"id": "subtitle-1", "start_frame": 0, "end_frame": 30}],
+        "subtitles": [
+            {
+                "id": "subtitle-1",
+                "start_frame": 0,
+                "end_frame": 30,
+                "text": "Test subtitle",
+            }
+        ],
     }
     plan_path = build_dir / "resolve-plan.v1.json"
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
@@ -269,6 +364,9 @@ def test_compiler_shaped_plan_builds_tracks_markers_and_reuses_immutably(
     assert timeline_import_path(plan, plan_path, project_root) == (
         project_root / plan["output_paths"]["fcpxml"]
     ).resolve()
+    assert subtitle_import_path(plan, plan_path, project_root) == (
+        project_root / plan["output_paths"]["subtitles"]
+    ).resolve()
 
     result = execute_build(
         resolve, plan, project_root=project_root, plan_path=plan_path
@@ -280,6 +378,10 @@ def test_compiler_shaped_plan_builds_tracks_markers_and_reuses_immutably(
     assert resolve.manager.save_calls == 1
     assert resolve.manager.created == []
     assert len(project.media_pool.calls) == 1
+    assert len(project.media_pool.import_media_calls) == 1
+    assert len(project.media_pool.append_calls) == 1
+    assert result["subtitles"]["status"] == "srt_imported"
+    assert result["subtitles"]["count"] == 1
 
     generated = project.timelines[-1]
     assert generated.counts == {"video": 4, "audio": 5, "subtitle": 1}
@@ -291,6 +393,7 @@ def test_compiler_shaped_plan_builds_tracks_markers_and_reuses_immutably(
     assert "Fusion titles/transitions" in identity[3]
     assert json.loads(identity[5])["style"]["status"] == "disabled"
     marker = next(value for value in generated.markers if value[0] == 30)
+    assert marker[1] == "Yellow"
     custom_data = json.loads(marker[5])
     assert custom_data["build_id"] == "b-deadbeefcafe"
     assert custom_data["marker_id"] == "marker-1"
@@ -306,6 +409,7 @@ def test_compiler_shaped_plan_builds_tracks_markers_and_reuses_immutably(
     assert second["reused"] is True
     assert resolve.manager.save_calls == 1
     assert len(project.media_pool.calls) == 1
+    assert len(project.media_pool.import_media_calls) == 1
     assert len(generated.markers) == 2
 
 
@@ -319,6 +423,142 @@ def test_no_current_project_allows_only_deterministic_create(tmp_path: Path) -> 
     assert result["project_created"] is True
     assert resolve.manager.created[0][0].startswith("RABBITHOLE_my_episode_")
     assert not hasattr(resolve.manager, "LoadProject")
+
+
+def test_native_fcpxml_subtitles_skip_srt_fallback(tmp_path: Path) -> None:
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    project = FakeProject()
+
+    def import_with_native_caption(path, options):
+        project.media_pool.calls.append((path, dict(options)))
+        timeline = FakeTimeline(options["timelineName"], subtitle_tracks=1)
+        timeline.subtitle_items.append(
+            FakeSubtitleItem(0, 30, "Test subtitle")
+        )
+        project.timelines.append(timeline)
+        return timeline
+
+    project.media_pool.ImportTimelineFromFile = import_with_native_caption
+    result = execute_build(
+        FakeResolve(project),
+        plan,
+        project_root=project_root,
+        plan_path=plan_path,
+    )
+
+    assert result["subtitles"] == {"status": "fcpxml", "count": 1}
+    assert project.media_pool.import_media_calls == []
+    assert project.media_pool.append_calls == []
+
+
+def test_native_fcpxml_subtitles_reject_wrong_text(tmp_path: Path) -> None:
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    project = FakeProject()
+
+    def import_with_wrong_caption(path, options):
+        project.media_pool.calls.append((path, dict(options)))
+        timeline = FakeTimeline(options["timelineName"], subtitle_tracks=1)
+        timeline.subtitle_items.append(
+            FakeSubtitleItem(0, 30, "Wrong subtitle")
+        )
+        project.timelines.append(timeline)
+        return timeline
+
+    project.media_pool.ImportTimelineFromFile = import_with_wrong_caption
+    resolve = FakeResolve(project)
+
+    with pytest.raises(
+        ImmutableTimelineError,
+        match="subtitle text or timing does not match",
+    ):
+        execute_build(
+            resolve,
+            plan,
+            project_root=project_root,
+            plan_path=plan_path,
+        )
+
+    assert project.media_pool.import_media_calls == []
+    assert project.media_pool.append_calls == []
+    assert resolve.manager.save_calls == 0
+
+
+def test_srt_fallback_rejects_shifted_cue_timing(tmp_path: Path) -> None:
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    project = FakeProject()
+
+    def append_shifted_subtitles(items):
+        values = list(items)
+        project.media_pool.append_calls.append(values)
+        cues = values[0]["subtitle_cues"]
+        project.current.subtitle_items.extend(
+            FakeSubtitleItem(
+                cue.GetStart() + 300,
+                cue.GetEnd() + 300,
+                cue.GetName(),
+            )
+            for cue in cues
+        )
+        return [object()]
+
+    project.media_pool.AppendToTimeline = append_shifted_subtitles
+    resolve = FakeResolve(project)
+
+    with pytest.raises(
+        ImmutableTimelineError,
+        match="subtitle cue timing does not match",
+    ):
+        execute_build(
+            resolve,
+            plan,
+            project_root=project_root,
+            plan_path=plan_path,
+        )
+
+    assert len(project.media_pool.import_media_calls) == 1
+    assert len(project.media_pool.append_calls) == 1
+    assert resolve.manager.save_calls == 0
+
+
+def test_partial_fcpxml_subtitles_fail_without_srt_append(tmp_path: Path) -> None:
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    plan["subtitles"].append(
+        {
+            "id": "subtitle-2",
+            "start_frame": 36,
+            "end_frame": 60,
+            "text": "Second subtitle",
+        }
+    )
+    project = FakeProject()
+
+    def import_with_partial_caption(path, options):
+        project.media_pool.calls.append((path, dict(options)))
+        timeline = FakeTimeline(options["timelineName"], subtitle_tracks=1)
+        timeline.subtitle_items.append(
+            FakeSubtitleItem(0, 30, "Test subtitle")
+        )
+        project.timelines.append(timeline)
+        return timeline
+
+    project.media_pool.ImportTimelineFromFile = import_with_partial_caption
+    with pytest.raises(
+        ImmutableTimelineError,
+        match="partial FCPXML caption import",
+    ):
+        execute_build(
+            FakeResolve(project),
+            plan,
+            project_root=project_root,
+            plan_path=plan_path,
+        )
+
+    assert project.media_pool.import_media_calls == []
+    assert project.media_pool.append_calls == []
 
 
 def test_new_build_is_not_reported_successful_when_save_fails(
@@ -438,7 +678,11 @@ def test_import_integrity_validates_duration_linked_clips_and_subtitles(
             if kind == "audio":
                 return [LinkedItem()] if index == 3 else []
             if kind == "subtitle":
-                return [object()] if index == 1 else []
+                return (
+                    [FakeSubtitleItem(86400, 86430, "Test subtitle")]
+                    if index == 1
+                    else []
+                )
             return []
 
     project = FakeProject()
@@ -495,7 +739,11 @@ def test_import_integrity_fails_before_save_for_unlinked_clip(
             if kind == "video":
                 return [UnlinkedItem()] if index == 1 else []
             if kind == "subtitle":
-                return [object()] if index == 1 else []
+                return (
+                    [FakeSubtitleItem(0, 30, "Test subtitle")]
+                    if index == 1
+                    else []
+                )
             return []
 
     project = FakeProject()
@@ -753,6 +1001,33 @@ def test_queue_refuses_fcpxml_changed_after_enqueue(
     assert [result["state"] for result in results] == ["failed"]
     assert results[0]["error"]["type"] == "QueueError"
     assert "FCPXML changed after enqueue" in results[0]["error"]["message"]
+    assert project.media_pool.calls == []
+
+
+def test_queue_refuses_subtitle_srt_changed_after_enqueue(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    job = enqueue_job(project_root, "build", plan_path)
+    subtitles = project_root / plan["output_paths"]["subtitles"]
+    subtitles.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nTampered\n",
+        encoding="utf-8",
+    )
+    project = FakeProject()
+
+    results = run_pending_jobs(
+        resolve=FakeResolve(project),
+        project_root=project_root,
+        job_id=job["job_id"],
+    )
+
+    assert [result["state"] for result in results] == ["failed"]
+    assert results[0]["error"]["type"] == "QueueError"
+    assert "subtitle SRT changed after enqueue" in results[0]["error"]["message"]
     assert project.media_pool.calls == []
 
 
@@ -1108,6 +1383,30 @@ def test_render_revalidates_immutable_timeline_before_configuration(
     timeline.track_names[("video", 1)] = "EDITED"
 
     with pytest.raises(ImmutableTimelineError, match="expected 'V1'"):
+        execute_render(resolve, plan, project_root=project_root)
+
+    assert project.render_format_codec is None
+    assert project.render_mode is None
+    assert project.render_settings is None
+    assert project.render_jobs == []
+
+
+def test_render_rejects_modified_subtitle_timing_before_configuration(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "episode"
+    _, plan = compiler_shaped_plan(project_root)
+    project = FakeProject()
+    resolve = FakeResolve(project)
+    execute_build(resolve, plan, project_root=project_root)
+    timeline = project.timelines[-1]
+    timeline.subtitle_items[0].start += 30
+    timeline.subtitle_items[0].end += 30
+
+    with pytest.raises(
+        ImmutableTimelineError,
+        match="subtitle cue timing does not match",
+    ):
         execute_render(resolve, plan, project_root=project_root)
 
     assert project.render_format_codec is None
