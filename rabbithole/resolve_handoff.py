@@ -79,6 +79,17 @@ _ZIP_STORED_SUFFIXES = frozenset(
     }
 )
 _COPY_BUFFER_BYTES = 1024 * 1024
+_RESOLVE_ARTIFACT_KEYS = (
+    "plan",
+    "fcpxml",
+    "subtitles",
+    "presentation_subtitles",
+)
+_CHECKSUMMED_RESOLVE_ARTIFACT_KEYS = (
+    "fcpxml",
+    "subtitles",
+    "presentation_subtitles",
+)
 
 
 class ResolveHandoffError(RuntimeError):
@@ -407,21 +418,87 @@ def _with_default_sources(
     return combined
 
 
-def _plan_paths(plan: Mapping[str, Any], project_root: Path) -> list[tuple[str, Path]]:
-    result: list[tuple[str, Path]] = []
+def _plan_paths(
+    plan: Mapping[str, Any], project_root: Path
+) -> list[tuple[str, str, Path]]:
+    """Resolve and authenticate every portable timeline-bundle artifact."""
+
     output_paths = plan.get("output_paths")
     if not isinstance(output_paths, Mapping):
-        return result
-    for key in ("plan", "fcpxml", "subtitles"):
+        raise ResolveHandoffError(
+            "handoff plan has no output_paths artifact contract"
+        )
+
+    result: list[tuple[str, str, Path]] = []
+    for key in _RESOLVE_ARTIFACT_KEYS:
         raw = output_paths.get(key)
         if not isinstance(raw, str) or not raw:
-            continue
+            raise ResolveHandoffError(
+                f"handoff plan is missing required output_paths.{key}"
+            )
+        path_kind = output_paths.get(f"{key}_path_kind")
+        if path_kind not in {"project-relative", "external-absolute"}:
+            raise ResolveHandoffError(
+                f"handoff plan has invalid output_paths.{key}_path_kind"
+            )
         source = Path(raw).expanduser()
-        if not source.is_absolute():
+        if path_kind == "project-relative":
+            if source.is_absolute():
+                raise ResolveHandoffError(
+                    f"output_paths.{key} must be relative to the project"
+                )
             source = project_root / source
+        elif not source.is_absolute():
+            raise ResolveHandoffError(
+                f"output_paths.{key} must be absolute when path_kind is "
+                "external-absolute"
+            )
         source = source.resolve(strict=False)
-        if source.is_file() and is_path_within(source, project_root):
-            result.append((source.name, source))
+        if path_kind == "project-relative" and not is_path_within(
+            source, project_root
+        ):
+            raise ResolveHandoffError(
+                f"output_paths.{key} escapes the project root: {raw}"
+            )
+        if not source.is_file():
+            raise ResolveHandoffError(
+                f"required Resolve artifact is missing: output_paths.{key}={source}"
+            )
+
+        if key in _CHECKSUMMED_RESOLVE_ARTIFACT_KEYS:
+            checksum_key = f"{key}_sha256"
+            expected = output_paths.get(checksum_key)
+            if not isinstance(expected, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", expected
+            ):
+                raise ResolveHandoffError(
+                    f"handoff plan has no valid output_paths.{checksum_key}"
+                )
+            actual = _sha256(source)
+            if actual != expected:
+                raise ResolveHandoffError(
+                    f"Resolve artifact checksum mismatch for output_paths.{key}: "
+                    f"expected {expected}, got {actual}"
+                )
+        result.append((key, source.name, source))
+
+    plan_source = next(source for key, _, source in result if key == "plan")
+    try:
+        persisted_plan = json.loads(plan_source.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ResolveHandoffError(
+            f"required Resolve plan artifact is not valid JSON: {plan_source}: {exc}"
+        ) from exc
+    if persisted_plan != dict(plan):
+        raise ResolveHandoffError(
+            "persisted Resolve plan does not match the requested handoff plan"
+        )
+
+    resolved_sources = [source for _, _, source in result]
+    if len(set(resolved_sources)) != len(resolved_sources):
+        raise ResolveHandoffError(
+            "Resolve artifact paths must be distinct for plan, FCPXML, and both SRTs"
+        )
     return result
 
 
@@ -436,8 +513,9 @@ def _copy_project_files(
         | str
         | None
     ),
-) -> list[str]:
-    sources = _plan_paths(plan, project_root)
+) -> tuple[list[str], dict[str, str]]:
+    plan_sources = _plan_paths(plan, project_root)
+    sources = [(name, source) for _, name, source in plan_sources]
     sources.extend(_normalize_sources(include_files))
     canonical_defaults = (
         project_root / "narration" / "timing.json",
@@ -461,6 +539,10 @@ def _copy_project_files(
     destination_root = staging / "project-files"
     destination_root.mkdir(parents=True, exist_ok=True)
     copied: list[str] = []
+    resolve_artifacts: dict[str, str] = {}
+    artifact_roles = {
+        source: role for role, _, source in plan_sources
+    }
     seen_targets: set[str] = set()
     for requested_name, source in sources:
         if not source.exists():
@@ -474,10 +556,17 @@ def _copy_project_files(
             target = destination_root / "extra" / name
         key = os.path.normcase(os.fspath(target.resolve(strict=False)))
         if key in seen_targets:
+            role = artifact_roles.get(source)
+            if role is not None:
+                resolve_artifacts[role] = target.relative_to(staging).as_posix()
             continue
         seen_targets.add(key)
         _copy_source(source, target)
-        copied.append(target.relative_to(staging).as_posix())
+        relative_target = target.relative_to(staging).as_posix()
+        copied.append(relative_target)
+        role = artifact_roles.get(source)
+        if role is not None:
+            resolve_artifacts[role] = relative_target
     if not copied:
         _atomic_text(
             destination_root / "README.txt",
@@ -486,7 +575,12 @@ def _copy_project_files(
         copied.append(
             (destination_root / "README.txt").relative_to(staging).as_posix()
         )
-    return copied
+    if set(resolve_artifacts) != set(_RESOLVE_ARTIFACT_KEYS):
+        missing = sorted(set(_RESOLVE_ARTIFACT_KEYS) - set(resolve_artifacts))
+        raise ResolveHandoffError(
+            f"required Resolve artifacts were not copied: {missing}"
+        )
+    return copied, resolve_artifacts
 
 
 def _readme(
@@ -758,6 +852,10 @@ def package_handoff(
     if not isinstance(include_proxy_media, bool):
         raise ResolveHandoffError("include_proxy_media must be a boolean")
     plan_data = dict(plan or {})
+    # Authenticate the complete compiler bundle before asking Resolve to write
+    # a potentially large archive. The copy step repeats this check to close
+    # the gap between preflight and packaging.
+    _plan_paths(plan_data, root)
     output_root = validate_handoff_output_root(
         destination or (root / "resolve" / "handoffs"), project_root=root
     )
@@ -902,6 +1000,9 @@ def package_handoff(
                 root / "resolve" / "presets",
             )
             default_licenses = (root / "licenses", root / "licences")
+            project_files, resolve_artifacts = _copy_project_files(
+                staging, root, plan_data, include_files
+            )
             copied = {
                 "fonts": _copy_category(
                     staging,
@@ -918,9 +1019,7 @@ def package_handoff(
                     "licenses",
                     _with_default_sources(default_licenses, licenses),
                 ),
-                "project_files": _copy_project_files(
-                    staging, root, plan_data, include_files
-                ),
+                "project_files": project_files,
             }
             readme = staging / README_FILENAME
             _atomic_text(
@@ -955,6 +1054,13 @@ def package_handoff(
                     "fixed_overhead_bytes": 64 * 1024 * 1024,
                 },
                 "copied": copied,
+                "resolve_artifacts": {
+                    role: {
+                        "path": relative,
+                        "sha256": _sha256(staging / relative),
+                    }
+                    for role, relative in sorted(resolve_artifacts.items())
+                },
                 "restore": {
                     "automatic_import_performed": False,
                     "validation_hooks_supported": True,
@@ -1073,6 +1179,96 @@ def _parse_checksums(path: Path) -> dict[str, str]:
     return checksums
 
 
+def _validate_resolve_artifacts(
+    root: Path,
+    manifest: Mapping[str, Any],
+    checksums: Mapping[str, str],
+) -> None:
+    """Verify the plan, FCPXML, and both subtitle deliverables as one bundle."""
+
+    raw_artifacts = manifest.get("resolve_artifacts")
+    if not isinstance(raw_artifacts, Mapping):
+        raise HandoffValidationError(
+            "handoff manifest has no resolve_artifacts contract"
+        )
+    if set(raw_artifacts) != set(_RESOLVE_ARTIFACT_KEYS):
+        missing = sorted(set(_RESOLVE_ARTIFACT_KEYS) - set(raw_artifacts))
+        extra = sorted(set(raw_artifacts) - set(_RESOLVE_ARTIFACT_KEYS))
+        raise HandoffValidationError(
+            "handoff resolve_artifacts inventory mismatch; "
+            f"missing={missing}, extra={extra}"
+        )
+
+    paths: dict[str, Path] = {}
+    relative_paths: dict[str, str] = {}
+    for role in _RESOLVE_ARTIFACT_KEYS:
+        record = raw_artifacts.get(role)
+        if not isinstance(record, Mapping):
+            raise HandoffValidationError(
+                f"handoff resolve_artifacts.{role} must be an object"
+            )
+        raw_path = record.get("path")
+        declared_digest = record.get("sha256")
+        if not isinstance(raw_path, str):
+            raise HandoffValidationError(
+                f"handoff resolve_artifacts.{role}.path must be a string"
+            )
+        relative = _validate_portable_relative(
+            raw_path, label=f"handoff resolve_artifacts.{role}.path"
+        )
+        if not isinstance(declared_digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", declared_digest
+        ):
+            raise HandoffValidationError(
+                f"handoff resolve_artifacts.{role}.sha256 is invalid"
+            )
+        path = root / PurePosixPath(relative)
+        if not path.is_file():
+            raise HandoffValidationError(
+                f"required Resolve artifact is missing: {relative}"
+            )
+        checksum_digest = checksums.get(relative)
+        if checksum_digest != declared_digest:
+            raise HandoffValidationError(
+                f"Resolve artifact {role} is not covered by its declared "
+                "package checksum"
+            )
+        paths[role] = path
+        relative_paths[role] = relative
+
+    if len(set(relative_paths.values())) != len(_RESOLVE_ARTIFACT_KEYS):
+        raise HandoffValidationError(
+            "Resolve artifact roles must point to four distinct package files"
+        )
+
+    try:
+        plan = json.loads(paths["plan"].read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HandoffValidationError(
+            f"bundled Resolve plan is invalid JSON: {exc}"
+        ) from exc
+    if not isinstance(plan, Mapping):
+        raise HandoffValidationError("bundled Resolve plan must be a JSON object")
+    if plan.get("build_id") != manifest.get("build_id") or plan.get(
+        "timeline_name"
+    ) != manifest.get("timeline_name"):
+        raise HandoffValidationError(
+            "bundled Resolve plan identity does not match the handoff manifest"
+        )
+    output_paths = plan.get("output_paths")
+    if not isinstance(output_paths, Mapping):
+        raise HandoffValidationError(
+            "bundled Resolve plan has no output_paths artifact contract"
+        )
+    for role in _CHECKSUMMED_RESOLVE_ARTIFACT_KEYS:
+        expected = output_paths.get(f"{role}_sha256")
+        packaged = raw_artifacts[role]["sha256"]
+        if expected != packaged:
+            raise HandoffValidationError(
+                f"bundled Resolve plan checksum does not authenticate {role}"
+            )
+
+
 def _validate_directory(
     root: Path,
     *,
@@ -1137,6 +1333,8 @@ def _validate_directory(
             raise HandoffValidationError(
                 f"checksum mismatch for {relative}: expected {digest}, got {actual}"
             )
+
+    _validate_resolve_artifacts(root, manifest, expected)
 
     context = HandoffValidationContext(root, manifest, restored_project)
     for hook in hooks:

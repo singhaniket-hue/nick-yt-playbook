@@ -8,18 +8,23 @@ having -- see graphics.py's own note that a filter which draws nothing exits 0.
 
 from __future__ import annotations
 
+import json
 import subprocess
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image
 
+import rabbithole.cards as cards_module
 from rabbithole.cards import (
     CARD_KINDS,
     MAX_ITEMS,
+    TEXT_SAFE_INSET_FRACTION,
     TITLE_SAFE_FRACTION,
     CardSpec,
+    _measured_line_width,
     build_card,
     card_ass,
     classify,
@@ -32,6 +37,7 @@ from rabbithole.jsonio import read_json
 from rabbithole.render import FRAMINGS, cut_segment
 from rabbithole.slots import Slot
 from rabbithole.sources.plates import load_grade
+from rabbithole.subtitles import pick_font
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STYLE_DIR = REPO_ROOT / "style"
@@ -96,6 +102,53 @@ def test_classify_maps_representative_episode_details(detail, expected):
 
 def test_classify_falls_back_rather_than_raising():
     assert classify("something nobody anticipated") == "label"
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "red-blue rectangles settle into a labelled test grid and stop moving",
+        "an unlabelled diagnostic frame",
+        "account totals",
+        "platform overview",
+        "iconic geometry",
+    ],
+)
+def test_classify_does_not_match_cues_inside_other_words(detail):
+    assert classify(detail) == "label"
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "evidence label: anomaly documented | meaning unknown",
+        "three labels confirmed date | playful reference | intent uncertain",
+    ],
+)
+def test_classify_keeps_explicit_singular_and_plural_label_directives(detail):
+    assert classify(detail) == "callout"
+
+
+def test_webdriver_s322_motion_direction_falls_back_to_a_blocked_label_card():
+    detail = "red-blue rectangles settle into a labelled test grid and stop moving"
+    slot = Slot(
+        slot_id="s322",
+        kind="graphic",
+        detail=detail,
+        start=1007.928,
+        end=1010.981,
+        queries=(),
+        marker_word_index=2500,
+    )
+
+    spec, findings = spec_for_slot(slot)
+
+    assert findings == []
+    assert spec.kind == "label"
+    assert spec.heading == detail
+    assert spec.items == ()
+    assert spec.duration == pytest.approx(3.053)
+    assert "unstructured label" in production_note_reason(detail, spec)
 
 
 def test_every_classified_kind_has_an_event_builder():
@@ -501,6 +554,79 @@ def test_short_timeline_labels_keep_single_line_text(style):
     assert all(r"\N" not in line for line in body_events)
 
 
+def test_upload_timeline_labels_are_measured_inside_inset_clip_boxes(style):
+    """Regression for the upload card whose first label lost its left words.
+
+    A position inside title-safe is not sufficient: left/right anchored glyphs
+    also need an inset anchor, a clip box inside the 1.30x detail crop, and each
+    hard-wrapped line must measure narrower than the space remaining from that
+    anchor to its clip edge.
+    """
+    import re
+
+    typo, pal, _ = style
+    width = 1920
+    height = 1080
+    doc = card_ass(
+        CardSpec(
+            kind="timeline",
+            heading="UPLOAD",
+            duration=3.0,
+            items=(
+                "ONE UPLOAD ABOUT EVERY TWO MINUTES",
+                "PEAK OBSERVED PERIOD",
+            ),
+        ),
+        typo,
+        pal,
+        width=width,
+        height=height,
+    )
+    body_events = [
+        line
+        for line in doc.splitlines()
+        if line.startswith("Dialogue:") and ",CardBody," in line
+    ]
+    assert len(body_events) == 2
+
+    body_size = int(
+        re.search(r"^Style: CardBody,[^,]+,(\d+),", doc, re.MULTILINE).group(1)
+    )
+    body_font, _findings = pick_font(typo)
+    detail_crop_left = width * (1 - 1 / 1.30) / 2
+    detail_crop_right = width - detail_crop_left
+    expected_title_safe_margin = width * (1 - TITLE_SAFE_FRACTION) / 2
+    expected_text_inset = width * TITLE_SAFE_FRACTION * TEXT_SAFE_INSET_FRACTION
+
+    for event in body_events:
+        position = re.search(r"\\pos\((-?\d+),(-?\d+)\)", event)
+        clip = re.search(r"\\clip\((\d+),(\d+),(\d+),(\d+)\)", event)
+        assert position and clip
+        x = int(position.group(1))
+        clip_left, _clip_top, clip_right, _clip_bottom = map(int, clip.groups())
+
+        assert clip_left > detail_crop_left
+        assert clip_right < detail_crop_right
+        assert clip_left >= expected_title_safe_margin - 1
+        assert clip_right <= width - expected_title_safe_margin + 1
+        assert min(x - clip_left, clip_right - x) >= expected_text_inset * 0.20
+
+        payload = event.rsplit("}", 1)[-1]
+        for rendered_line in payload.split(r"\N"):
+            measured = _measured_line_width(
+                rendered_line,
+                body_size,
+                font_family=body_font,
+            )
+            if r"\an4" in event:
+                available = clip_right - x
+            elif r"\an6" in event:
+                available = x - clip_left
+            else:
+                available = 2 * min(x - clip_left, clip_right - x)
+            assert measured <= available
+
+
 def test_comparison_items_wrap_and_are_clipped_to_their_own_columns(style):
     import re
 
@@ -723,6 +849,57 @@ def test_normal_numeric_stat_keeps_the_large_figure_layout(style):
 # --- real renders ----------------------------------------------------------------
 
 
+def test_card_frame_counts_preserve_authored_timing_then_add_one_handle():
+    assert cards_module._card_frame_counts(1.0, 30) == (30, 31)
+    assert cards_module._card_frame_counts(1.01, 30) == (30, 31)
+    assert cards_module._card_frame_counts(2.95, 30) == (88, 89)
+
+
+@pytest.mark.parametrize(
+    ("duration", "fps"),
+    [(2.95, 30), (2.9, 30), (3.123, 30), (0.5, 6)],
+)
+def test_card_handle_covers_independently_rounded_resolve_endpoint(
+    duration, fps
+):
+    authored, encoded = cards_module._card_frame_counts(duration, fps)
+    resolve_endpoint = int(
+        (Decimal(str(duration)) * Decimal(fps)).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+    )
+
+    assert encoded == authored + 1
+    # Resolve source-end values are exclusive. An encoded count of 89 safely
+    # serves Resolve's half-up endpoint 89 even when authored half-even timing
+    # chose 88 visible frames.
+    assert resolve_endpoint <= encoded
+
+
+def test_card_handle_covers_absolute_slot_endpoint_rounding_regression():
+    # Representative authored card boundary: local nearest-frame timing is 81
+    # frames, while independently rounding its absolute timeline endpoints asks
+    # Resolve for 82 source frames.
+    fps = 30
+    slot_start = 996.515
+    slot_end = 999.220
+    authored, encoded = cards_module._card_frame_counts(
+        slot_end - slot_start, fps
+    )
+
+    def resolve_frame(seconds: float) -> int:
+        return int(
+            (Decimal(str(seconds)) * Decimal(fps)).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+
+    required_source_frames = resolve_frame(slot_end) - resolve_frame(slot_start)
+    assert authored == 81
+    assert required_source_frames == 82
+    assert encoded == required_source_frames
+
+
 @pytest.mark.parametrize("kind,detail", [
     ("callout", "UAPA clause callout"),
     ("checklist", "criteria: unemployed | lazy | online"),
@@ -816,6 +993,91 @@ def test_a_card_spans_its_requested_duration(style, tmp_path):
     out = build_card(spec, tmp_path / "c.mp4", typo, pal, grade, tmp_path / "work",
                      width=640, height=360, fps=12)
     assert probe_duration(out) == pytest.approx(2.5, abs=0.15)
+
+
+def test_half_frame_card_encodes_h264_cfr_with_an_identical_terminal_handle(
+    style, tmp_path
+):
+    typo, pal, grade = style
+    spec, _ = parse_detail("UAPA clause callout", 2.95)
+    work_dir = tmp_path / "terminal-work"
+    out = build_card(
+        spec,
+        tmp_path / "terminal-handle.mp4",
+        typo,
+        pal,
+        grade,
+        work_dir,
+        width=320,
+        height=180,
+        fps=30,
+    )
+
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,"
+            "nb_frames,duration",
+            "-of",
+            "json",
+            str(out),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    stream = json.loads(probe.stdout)["streams"][0]
+    assert stream["codec_name"] == "h264"
+    assert stream["width"] == 320
+    assert stream["height"] == 180
+    assert stream["pix_fmt"] == "yuv420p"
+    assert stream["r_frame_rate"] == "30/1"
+    assert stream["avg_frame_rate"] == "30/1"
+    assert int(stream["nb_frames"]) == 89
+    assert float(stream["duration"]) == pytest.approx(89 / 30, abs=1e-6)
+
+    def decoded_frame(index: int) -> bytes:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-i",
+                str(out),
+                "-vf",
+                f"select=eq(n\\,{index})",
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "-",
+            ],
+            capture_output=True,
+            check=True,
+        )
+        assert len(result.stdout) == 320 * 180 * 3
+        return result.stdout
+
+    penultimate = np.frombuffer(decoded_frame(87), dtype=np.uint8).astype(np.int16)
+    terminal = np.frombuffer(decoded_frame(88), dtype=np.uint8).astype(np.int16)
+    encoded_delta = np.abs(penultimate - terminal)
+    # ``tpad=stop_mode=clone`` repeats the filtered frame before H.264. Lossy
+    # inter-frame quantization can move a few decoded bytes, so assert visual
+    # identity tightly enough to distinguish a clone from the animated grain's
+    # next authored frame.
+    assert encoded_delta.mean() < 0.5
+    assert encoded_delta.max() < 24
+    # The ASS contract remains authored at 2.95 seconds. Only the encoded media
+    # carries the 89th handle frame.
+    assert "0:00:02.95" in (
+        work_dir / "terminal-handle.ass"
+    ).read_text(encoding="utf-8")
 
 
 def test_more_items_put_more_ink_on_screen(style, tmp_path):

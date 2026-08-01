@@ -26,7 +26,26 @@ tracks:
     A4: "SFX"
     A5: "ROOM TONE + UTILITY"
   subtitle:
-    S1: "HINGLISH / DEVANAGARI"
+    S1: "PRESENTATION_SUBTITLES"
+
+captions:
+  presentation_track: S1
+  editable: true
+  full_upload_sidecar: "subtitles.srt"
+  presentation_fallback: "presentation-subtitles.srt"
+  exclude_during:
+    - source_led_cold_open
+    - text_led_card
+    - quote
+    - document
+    - article
+    - browser_recording
+  fill_color: "#f4f1e8"
+  backing_color: "#000000"
+  backing_opacity: 0.65
+  note: >-
+    The complete sidecar is for upload/accessibility. Only selective cues belong
+    on the Resolve presentation track; never compete with text-heavy evidence.
 
 narration:
   lufs_target: -15
@@ -83,6 +102,9 @@ motion:
   alternate_axis: true
   heavy_freeze: true
   easing: smooth
+  live_webpage_capture: chromium_motion
+  live_webpage_pattern: establish_scroll_or_push_hold
+  static_pan_allowed_for: [static_document, static_image]
 
 transitions:
   default: hard_cut
@@ -103,7 +125,7 @@ titles:
   title_color: "#f4f1e8"
   background_color: "#08090b"
   font_fallbacks:
-    monospace: ["IBM Plex Mono", "Courier New"]
+    monospace: ["Courier New", "IBM Plex Mono"]
     devanagari: ["Noto Sans Devanagari", "Mangal"]
 
 review_flags:

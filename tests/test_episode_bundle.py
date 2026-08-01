@@ -130,6 +130,26 @@ def _episode(root: Path) -> Path:
     return root
 
 
+def _repository_contract(
+    *,
+    revision: str = "a" * 40,
+    state: str = "clean",
+) -> dict[str, object]:
+    reproducible = state == "clean"
+    return {
+        "available": True,
+        "head_commit": revision,
+        "project_path": "projects/episode",
+        "reproducible": reproducible,
+        "reproducible_revision": revision if reproducible else None,
+        "schema_version": (
+            episode_bundle_module.REPOSITORY_CONTRACT_SCHEMA_VERSION
+        ),
+        "vcs": "git",
+        "worktree_state": state,
+    }
+
+
 def test_package_is_deterministic_portable_and_excludes_machine_state(
     tmp_path: Path,
 ) -> None:
@@ -142,12 +162,20 @@ def test_package_is_deterministic_portable_and_excludes_machine_state(
     (episode / "handoffs" / "old.zip").write_bytes(b"handoff")
     (episode / ".cache").mkdir()
     (episode / ".cache" / "index").write_bytes(b"cache")
+    (episode / "assets" / ".cardwork").mkdir()
+    (episode / "assets" / ".cardwork" / "frame.png").write_bytes(b"working")
+    (episode / "assets" / ".capturework").mkdir()
+    (episode / "assets" / ".capturework" / "frame.png").write_bytes(b"working")
     (episode / "resolve" / "builds" / "b-123").mkdir(parents=True)
     (episode / "resolve" / "builds" / "b-123" / "timeline.fcpxml").write_text(
         "generated", encoding="utf-8"
     )
     (episode / "resolve" / "queue").mkdir()
     (episode / "resolve" / "queue" / "job.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (episode / "resolve" / "review-approvals").mkdir()
+    (episode / "resolve" / "review-approvals" / "caption-style.json").write_text(
         "{}", encoding="utf-8"
     )
     (episode / "resolve" / ".resolve-runner.lock").write_text(
@@ -190,8 +218,11 @@ def test_package_is_deterministic_portable_and_excludes_machine_state(
         assert "renders/" not in joined
         assert "handoffs/" not in joined
         assert ".cache/" not in joined
+        assert ".cardwork/" not in joined
+        assert ".capturework/" not in joined
         assert "resolve/builds/" not in joined
         assert "resolve/queue/" not in joined
+        assert "resolve/review-approvals/" not in joined
         assert ".resolve-runner.lock" not in joined
         assert "project/resolve/current.json" not in names
         assert "project/resolve/audio-stems/current.json" in names
@@ -200,6 +231,161 @@ def test_package_is_deterministic_portable_and_excludes_machine_state(
         )
         assert not any(f"audio-stems/{'f' * 64}/" in name for name in names)
         assert all(info.date_time == (1980, 1, 1, 0, 0, 0) for info in archive.infolist())
+
+
+@pytest.mark.parametrize("state", ["clean", "dirty"])
+def test_manifest_and_readme_record_repository_reproducibility_without_overclaiming(
+    tmp_path: Path,
+    monkeypatch,
+    state: str,
+) -> None:
+    episode = _episode(tmp_path / "episode")
+    contract = _repository_contract(state=state)
+    monkeypatch.setattr(
+        episode_bundle_module,
+        "_discover_repository_contract",
+        lambda _root: dict(contract),
+    )
+    bundle = tmp_path / f"{state}.zip"
+
+    result = package_episode(episode, bundle)
+
+    assert result["repository_contract"] == contract
+    with zipfile.ZipFile(bundle) as archive:
+        manifest = json.loads(
+            archive.read("project/.rabbithole-bundle/manifest.json")
+        )
+        readme = archive.read(
+            "project/.rabbithole-bundle/README.txt"
+        ).decode("utf-8")
+    assert manifest["repository_contract"] == contract
+    if state == "clean":
+        assert contract["reproducible_revision"] in readme
+        assert "clean Git revision" in readme
+        assert "context only" not in readme
+    else:
+        assert manifest["repository_contract"]["reproducible"] is False
+        assert manifest["repository_contract"]["reproducible_revision"] is None
+        assert "context only" in readme
+        assert "does NOT reproduce" in readme
+
+
+def test_git_probe_records_dirty_head_only_as_context(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    episode = _episode(repository / "episode")
+    revision = "b" * 40
+
+    def fake_git(_cwd: Path, *arguments: str) -> bytes | None:
+        if arguments == ("rev-parse", "--show-toplevel"):
+            return (str(repository) + "\n").encode("utf-8")
+        if arguments == ("rev-parse", "--verify", "HEAD"):
+            return (revision + "\n").encode("ascii")
+        if arguments[0] == "status":
+            return b" M rabbithole/episode_bundle.py\0"
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(episode_bundle_module, "_run_git", fake_git)
+
+    contract = episode_bundle_module._discover_repository_contract(episode)
+
+    assert contract == {
+        "available": True,
+        "head_commit": revision,
+        "project_path": "episode",
+        "reproducible": False,
+        "reproducible_revision": None,
+        "schema_version": (
+            episode_bundle_module.REPOSITORY_CONTRACT_SCHEMA_VERSION
+        ),
+        "vcs": "git",
+        "worktree_state": "dirty",
+    }
+
+
+@pytest.mark.parametrize("work_directory", [".cardwork", ".capturework"])
+@pytest.mark.parametrize("path_key", ["local_path", "local_paths"])
+def test_transient_workdirs_are_excluded_but_referenced_inputs_fail_closed(
+    tmp_path: Path,
+    work_directory: str,
+    path_key: str,
+) -> None:
+    episode = _episode(tmp_path / "episode")
+    work = episode / "assets" / work_directory
+    work.mkdir()
+    (work / "input.png").write_bytes(b"referenced source")
+    relative = f"assets/{work_directory}/input.png"
+    value: object = relative if path_key == "local_path" else [relative]
+    (episode / "referenced-input.json").write_text(
+        json.dumps({path_key: value}),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / f"{work_directory}-{path_key}.zip"
+    with pytest.raises(EpisodeBundleValidationError, match="excluded"):
+        package_episode(episode, output)
+    assert not output.exists()
+
+
+def test_restore_rejects_mismatched_destination_repository_before_extraction(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    episode = _episode(tmp_path / "episode")
+    source_contract = _repository_contract(revision="c" * 40)
+    destination_contract = _repository_contract(revision="d" * 40)
+    calls = 0
+
+    def discover(_root: Path) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return dict(source_contract if calls <= 2 else destination_contract)
+
+    monkeypatch.setattr(
+        episode_bundle_module,
+        "_discover_repository_contract",
+        discover,
+    )
+    bundle = tmp_path / "episode.zip"
+    package_episode(episode, bundle)
+    destination = tmp_path / "destination" / "episode"
+
+    with pytest.raises(
+        EpisodeBundleValidationError,
+        match="destination Git revision does not match",
+    ):
+        restore_episode_bundle(bundle, destination)
+    assert not destination.exists()
+
+
+def test_restore_reports_dirty_source_contract_as_nonreproducible(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    episode = _episode(tmp_path / "episode")
+    contract = _repository_contract(revision="e" * 40, state="dirty")
+    monkeypatch.setattr(
+        episode_bundle_module,
+        "_discover_repository_contract",
+        lambda _root: dict(contract),
+    )
+    bundle = tmp_path / "episode.zip"
+    package_episode(episode, bundle)
+
+    result = restore_episode_bundle(
+        bundle,
+        tmp_path / "destination" / "episode",
+    )
+
+    assert result["repository_verification"] == {
+        "expected_revision": None,
+        "observed_revision": None,
+        "reproducible": False,
+        "status": "source_worktree_not_reproducible",
+    }
 
 
 def test_restored_audio_stem_selection_is_reusable_without_bundled_repo_style(

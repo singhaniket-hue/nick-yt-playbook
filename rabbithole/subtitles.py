@@ -607,7 +607,15 @@ def _run(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProces
     return result
 
 
-def burn(video_path: Path, ass_path: Path, out_path: Path) -> Path:
+def burn(
+    video_path: Path,
+    ass_path: Path,
+    out_path: Path,
+    *,
+    authored_frame_count: int | None = None,
+    safe_trailing_frames: int = 0,
+    fps: int | None = None,
+) -> Path:
     """Burn subtitles into a video, hard-coded.
 
     The `ass=` filter has the exact same problem `sources/plates.py`'s
@@ -631,11 +639,39 @@ def burn(video_path: Path, ass_path: Path, out_path: Path) -> Path:
     (`sources/plates.PLATE_CRF`/`PLATE_MAXRATE`/`PLATE_BUFSIZE`). The audio
     stream is copied (`-c:a copy`), not re-encoded, so a mix already placed
     by `audiomix.build_mix` is untouched.
+
+    Card generation may supply an exact authored frame count, output fps, and
+    a small number of safe trailing frames. In that mode the filter trims to
+    the authored frame boundary and ``tpad`` clones its final rendered frame;
+    the clone is a Resolve media handle, not an extension of ASS event timing.
+    Omitting the keywords preserves the normal subtitle-burn path byte for
+    byte.
     """
     video_path = Path(video_path).resolve()
     ass_path = Path(ass_path).resolve()
     out_path = Path(out_path).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    exact_frame_contract = (
+        authored_frame_count is not None
+        or safe_trailing_frames != 0
+        or fps is not None
+    )
+    if exact_frame_contract:
+        if (
+            isinstance(authored_frame_count, bool)
+            or not isinstance(authored_frame_count, int)
+            or authored_frame_count <= 0
+        ):
+            raise ValueError("authored_frame_count must be a positive integer")
+        if (
+            isinstance(safe_trailing_frames, bool)
+            or not isinstance(safe_trailing_frames, int)
+            or safe_trailing_frames < 0
+        ):
+            raise ValueError("safe_trailing_frames must be a nonnegative integer")
+        if isinstance(fps, bool) or not isinstance(fps, int) or fps <= 0:
+            raise ValueError("fps must be a positive integer")
 
     # Homebrew's regular FFmpeg 8 formula omits libass. Its parser reports
     # "No option name near 'subs.ass'", which looks like a quoting bug even
@@ -643,13 +679,31 @@ def burn(video_path: Path, ass_path: Path, out_path: Path) -> Path:
     # encode and point macOS users at the supported formula.
     ffmpeg = require_filter("ass")
 
+    video_filter = f"ass=filename={ass_path.name}"
+    frame_args: list[str] = []
+    if exact_frame_contract:
+        video_filter += f",trim=end_frame={authored_frame_count}"
+        if safe_trailing_frames:
+            video_filter += (
+                f",tpad=stop_mode=clone:stop={safe_trailing_frames}"
+            )
+        frame_args = [
+            "-r",
+            str(fps),
+            "-fps_mode",
+            "cfr",
+            "-frames:v",
+            str(authored_frame_count + safe_trailing_frames),
+        ]
+
     _run(
         [
             ffmpeg, "-y",
             "-i", str(video_path),
-            "-vf", f"ass=filename={ass_path.name}",
+            "-vf", video_filter,
             *video_args(PLATE_CRF, maxrate=PLATE_MAXRATE, bufsize=PLATE_BUFSIZE),
             "-pix_fmt", "yuv420p",
+            *frame_args,
             "-c:a", "copy",
             str(out_path),
         ],

@@ -201,8 +201,10 @@ A Crowley-style video is built from five visual ingredients. For every script pa
 
 ### 1. Case evidence (the backbone)
 
-- Screenshots of posts, profiles, comments, DMs — captured full-page with visible timestamps/URLs (use browser extension **GoFullPage** or built-in `Ctrl+Shift+S` full-page capture in Firefox).
-- Screen recordings of scrolling through profiles, playing original uploads, navigating the Wayback Machine — this "you are there" navigation footage is a genre staple. Record with **OBS Studio** (free) at 1080p/60.
+- Preserve full-page screenshots of posts, profiles, comments, and DMs with visible timestamps/URLs for the case file (use browser extension **GoFullPage** or built-in `Ctrl+Shift+S` full-page capture in Firefox).
+- Present a live article, profile, or archived webpage as real browser motion, not a simulated pan across that preservation screenshot. Establish the actual page and browser context, make one restrained scroll or push to the discussed text, then hold it long enough to read. RabbitHole does this through a targeted Chromium `capture_spec` with `motion: true`; OBS Studio is the manual alternative.
+- Use a static pan only when the source itself is a genuine static document or image, or when movement would add no source context.
+- Screen recordings of playing original uploads and navigating the Wayback Machine provide the same "you are there" context. Record manual material with **OBS Studio** (free) at 1080p/60.
 - Original footage/uploads from the case, downloaded and archived (**yt-dlp** for public videos).
 
 ### 2. Location material
@@ -345,7 +347,8 @@ Build this once as a reusable timeline chunk / PowerBin item. It becomes your vi
 
 ### Evidence presentation effects
 
-- **Screenshot treatment:** never show a flat static screenshot. Place it over a dark blurred backdrop, add a subtle drop shadow, scale-in slowly (100→105% over its duration), and spotlight the relevant line.
+- **Live webpage treatment:** retain real Chromium motion. Establish the page, make one restrained scroll or push to the claim, then hold. Do not fake browser navigation by moving a single screenshot.
+- **Static document/image treatment:** place the genuine static source over a dark blurred backdrop, add a subtle drop shadow, scale in slowly (100→105% over its duration), and spotlight the relevant line.
 - **Highlight:** dim the whole image 40% with an adjustment layer, then mask/window a bright region around the key text — the "flashlight" effect. Animate the mask moving between lines as you narrate them.
 - **Redaction:** black bars (solid color rectangles) over names/faces; Resolve's tracker can pin blurs (Blur ResolveFX + tracked Power Window) to moving faces in video.
 - **Zoom-enhance:** slow push into a detail with a slight blur-then-sharpen and a quiet "processing" whir — the forensic look.
@@ -385,7 +388,7 @@ Every still image moves. On the Edit page, keyframe Transform → Zoom from **10
 - **Map animations:** screen-record Google Earth Studio fly-ins; or in Fusion, animate a location pin dropping onto a dark-styled map with a soft pulse ring (two ellipse nodes, scale+fade keyframes). Animate travel routes with a Paint/Write-on stroke.
 - **Timeline graphics:** a horizontal line with dated nodes lighting up as you narrate events — build once in Fusion with text+shape nodes, save as a macro, retitle per video.
 - **Connection webs:** the "conspiracy board" — photos/usernames connected by lines that draw on (Write-on effect) as you link entities. Powerful for multi-account internet mysteries.
-- **Document scan:** slow vertical pan down a long document/thread screenshot with the flashlight highlight following the read line.
+- **Document scan:** for a genuine static document or image, use a slow vertical pan with the flashlight highlight following the read line. For a live thread or article, record the real browser scroll instead.
 - **Parallax photos:** for key photographs, separate subject from background (Magic Mask in Resolve Studio, or manual masking / free tools like remove.bg for the subject layer), place layers in Fusion 3D at different depths, and drift a camera slowly — the "living photograph" effect used in true-crime docs everywhere.
 - **UI recreations:** rebuild a chat conversation or profile as clean graphics when originals can't be shown (label them "recreation"). Simple rectangles + text in Fusion, messages appearing with typing indicator.
 
@@ -419,6 +422,8 @@ Black (or frozen glitched frame) background · red monospace chapter number ("CH
 
 - **Source captions:** small monospace text bottom-left ("archived post, March 2021 / source: Wayback Machine") — fade in/out, no animation. Constant sourcing on screen is a genre credibility marker.
 - **Names/dates:** simple white sans-serif with a thin red underline that draws on (Write-on rectangle).
+- **Spoken captions:** keep the Resolve presentation track selective. Suppress cues during the source-led cold open and whenever a text-heavy card, quote, document, article, or browser recording already asks the viewer to read. Keep the complete narration SRT as the YouTube upload/accessibility sidecar.
+- **Readability:** presentation captions need a dark, sufficiently opaque backing or outline so white text remains legible over pale footage. Never rely on white glyphs alone, and never solve a collision by stacking captions over evidence text.
 
 ---
 

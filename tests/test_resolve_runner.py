@@ -426,6 +426,49 @@ def test_compiler_shaped_plan_builds_tracks_markers_and_reuses_immutably(
     assert len(generated.markers) == 2
 
 
+def test_selective_plan_imports_presentation_srt_and_names_track(tmp_path):
+    project_root = tmp_path / "episode"
+    plan_path, plan = compiler_shaped_plan(project_root)
+    build_dir = plan_path.parent
+    presentation = build_dir / "presentation-subtitles.srt"
+    presentation.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nTest subtitle\n",
+        encoding="utf-8",
+    )
+    plan["output_paths"].update(
+        {
+            "presentation_subtitles": (
+                "resolve/builds/b-deadbeefcafe/presentation-subtitles.srt"
+            ),
+            "presentation_subtitles_path_kind": "project-relative",
+            "presentation_subtitles_sha256": hashlib.sha256(
+                presentation.read_bytes()
+            ).hexdigest(),
+        }
+    )
+    plan["subtitle_policy"] = {
+        "timeline_track_name": "PRESENTATION_SUBTITLES"
+    }
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+    assert subtitle_import_path(plan, plan_path, project_root) == (
+        presentation.resolve()
+    )
+    project = FakeProject()
+    result = execute_build(
+        FakeResolve(project),
+        plan,
+        project_root=project_root,
+        plan_path=plan_path,
+    )
+
+    assert result["subtitles"]["path"] == str(presentation.resolve())
+    assert project.media_pool.import_media_calls == [[str(presentation.resolve())]]
+    assert project.timelines[-1].track_names[("subtitle", 1)] == (
+        "PRESENTATION_SUBTITLES"
+    )
+
+
 def test_track_contract_restores_audio_lanes_compacted_by_resolve(
     tmp_path: Path,
 ) -> None:

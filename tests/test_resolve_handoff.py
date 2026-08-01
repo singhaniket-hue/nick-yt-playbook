@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -99,20 +100,36 @@ def _plan(project: Path) -> dict:
     media.write_bytes(b"x" * 1024)
     build_dir = project / "resolve" / "builds" / "b-deadbeefcafe"
     build_dir.mkdir(parents=True)
-    (build_dir / "timeline.fcpxml").write_text(
-        '<fcpxml version="1.10"/>', encoding="utf-8"
-    )
-    (build_dir / "subtitles.srt").write_text(
-        "1\n00:00:00,000 --> 00:00:01,000\nTest subtitle\n",
+    fcpxml = build_dir / "timeline.fcpxml"
+    subtitles = build_dir / "subtitles.srt"
+    presentation_subtitles = build_dir / "presentation-subtitles.srt"
+    fcpxml.write_text('<fcpxml version="1.10"/>', encoding="utf-8")
+    subtitles.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nComplete upload subtitle\n",
         encoding="utf-8",
     )
+    presentation_subtitles.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nSelective subtitle\n",
+        encoding="utf-8",
+    )
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
     plan = {
         "build_id": "b-deadbeefcafe",
         "timeline_name": "AUTO_BUILD_DEADBEEFCAFE",
         "output_paths": {
             "plan": "resolve/builds/b-deadbeefcafe/resolve-plan.v1.json",
+            "plan_path_kind": "project-relative",
             "fcpxml": "resolve/builds/b-deadbeefcafe/timeline.fcpxml",
+            "fcpxml_path_kind": "project-relative",
+            "fcpxml_sha256": digest(fcpxml),
             "subtitles": "resolve/builds/b-deadbeefcafe/subtitles.srt",
+            "subtitles_path_kind": "project-relative",
+            "subtitles_sha256": digest(subtitles),
+            "presentation_subtitles": (
+                "resolve/builds/b-deadbeefcafe/presentation-subtitles.srt"
+            ),
+            "presentation_subtitles_path_kind": "project-relative",
+            "presentation_subtitles_sha256": digest(presentation_subtitles),
         },
         "provenance": [
             {
@@ -198,15 +215,31 @@ def test_source_inclusive_handoff_manifest_checksums_defaults_and_zip(
     assert (
         package / "project-files" / "project" / "chapters.txt"
     ).is_file()
-    assert (
+    build_files = (
         package
         / "project-files"
         / "project"
         / "resolve"
         / "builds"
         / "b-deadbeefcafe"
-        / "subtitles.srt"
-    ).read_text(encoding="utf-8").endswith("Test subtitle\n")
+    )
+    assert (build_files / "resolve-plan.v1.json").is_file()
+    assert (build_files / "timeline.fcpxml").is_file()
+    assert (build_files / "subtitles.srt").read_text(
+        encoding="utf-8"
+    ).endswith("Complete upload subtitle\n")
+    assert (build_files / "presentation-subtitles.srt").read_text(
+        encoding="utf-8"
+    ).endswith("Selective subtitle\n")
+    assert set(manifest["resolve_artifacts"]) == {
+        "plan",
+        "fcpxml",
+        "subtitles",
+        "presentation_subtitles",
+    }
+    checksums = (package / "checksums.sha256").read_text(encoding="utf-8")
+    for artifact in manifest["resolve_artifacts"].values():
+        assert f"{artifact['sha256']}  {artifact['path']}" in checksums
     assert Path(result["zip_path"]).is_file()
     assert Path(result["zip_path"] + ".sha256").is_file()
     assert validate_handoff(package)["valid"] is True
@@ -353,6 +386,9 @@ def test_disk_preflight_counts_external_media_without_leaking_absolute_path(
     plan["provenance"].append(
         {"asset_id": "external", "local_path": str(external.resolve())}
     )
+    (project / plan["output_paths"]["plan"]).write_text(
+        json.dumps(plan), encoding="utf-8"
+    )
 
     result = package_handoff(
         project,
@@ -365,6 +401,56 @@ def test_disk_preflight_counts_external_media_without_leaking_absolute_path(
     assert preflight["unique_source_bytes"] == 3072
     assert any(path.endswith("/external-source.mov") for path in preflight["media_paths"])
     assert str(tmp_path.resolve()) not in json.dumps(preflight)
+
+
+def test_handoff_requires_both_subtitle_artifacts_before_resolve_archive(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "episode"
+    project.mkdir()
+    plan = _plan(project)
+    presentation = project / plan["output_paths"]["presentation_subtitles"]
+    presentation.unlink()
+    resolve = FakeResolve(FakeProject())
+
+    with pytest.raises(
+        ResolveHandoffError,
+        match="required Resolve artifact is missing",
+    ):
+        package_handoff(
+            project,
+            resolve=resolve,
+            plan=plan,
+            destination=tmp_path / "handoffs",
+        )
+
+    assert resolve.manager.archive_calls == []
+    assert resolve.manager.export_calls == []
+
+
+def test_handoff_validation_requires_resolve_artifact_contract_even_if_rehashed(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "episode"
+    project.mkdir()
+    result = package_handoff(
+        project,
+        resolve=FakeResolve(FakeProject()),
+        plan=_plan(project),
+        destination=tmp_path / "handoffs",
+    )
+    package = Path(result["package_directory"])
+    manifest_path = package / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["resolve_artifacts"].pop("presentation_subtitles")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    resolve_handoff._write_checksums(package)
+
+    with pytest.raises(
+        HandoffValidationError,
+        match="resolve_artifacts inventory mismatch",
+    ):
+        validate_handoff(package)
 
 
 def test_external_output_root_and_zip_slip_are_rejected(tmp_path: Path) -> None:

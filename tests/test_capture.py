@@ -21,15 +21,20 @@ from rabbithole.sources.capture import (
     ARCHIVE_HOSTS,
     BrowserCaptureRequest,
     BrowserCaptureResponse,
+    BrowserMotionCaptureRequest,
     CaptureCrop,
     CaptureFraming,
+    CaptureMotion,
+    CaptureMotionFraming,
     CaptureRectangle,
     CaptureResult,
     CaptureSpec,
     ScrollTarget,
+    _capture_motion_frames_with_cdp_session,
     _capture_with_cdp_session,
     capture_document,
     capture_page,
+    capture_page_motion,
     capture_to_video,
     fetch_source_bytes,
     find_browser,
@@ -331,6 +336,96 @@ def test_capture_spec_round_trips_through_plain_json():
     assert restored.crop == CaptureCrop(x=20, y=900, width=1280, height=720)
 
 
+def test_motion_capture_spec_round_trips_with_an_authored_tab_click():
+    spec = CaptureSpec.from_value(
+        {
+            "selector": "ytd-rich-grid-renderer",
+            "text": "aqua.flv",
+            "click_text": "Oldest",
+            "motion": {
+                "establish_fraction": 0.2,
+                "move_fraction": 0.55,
+            },
+        }
+    )
+
+    restored = CaptureSpec.from_value(json.loads(json.dumps(spec.to_dict())))
+
+    assert restored == spec
+    assert restored.click_text == "Oldest"
+    assert restored.motion == CaptureMotion(
+        establish_fraction=0.2,
+        move_fraction=0.55,
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ({"motion": True}, "requires selector, text, or scroll_target"),
+        (
+            {"text": "evidence", "motion": True, "full_page": True},
+            "cannot combine with full_page",
+        ),
+        (
+            {
+                "text": "evidence",
+                "motion": True,
+                "crop": {"x": 0, "y": 0, "width": 320, "height": 180},
+            },
+            "cannot combine with full_page or crop",
+        ),
+        (
+            {"text": "evidence", "motion": {"move_fraction": 0}},
+            "move_fraction",
+        ),
+    ],
+)
+def test_invalid_motion_capture_specs_fail_before_browser_io(value, match):
+    with pytest.raises((TypeError, ValueError), match=match):
+        CaptureSpec.from_value(value)
+
+
+def test_still_capture_refuses_a_motion_spec_instead_of_silently_flattening_it(
+    tmp_path,
+):
+    with pytest.raises(ValueError, match="capture_page_motion"):
+        capture_page(
+            "https://example.com",
+            tmp_path / "still.png",
+            browser=Path("browser.exe"),
+            spec={"text": "evidence", "motion": True},
+        )
+
+
+def test_motion_frame_counts_preserve_nearest_frame_then_add_one_handle():
+    assert capture_module._motion_frame_counts(1.0, 30) == (30, 31)
+    assert capture_module._motion_frame_counts(1.01, 30) == (30, 31)
+    assert capture_module._motion_frame_counts(2.95, 30) == (88, 89)
+
+    # The safety ceiling includes the Resolve handle, not only visible frames.
+    assert capture_module._motion_frame_counts(599 / 30, 30) == (599, 600)
+    with pytest.raises(ValueError, match="601 frames.*safe trailing"):
+        capture_module._motion_frame_counts(20.0, 30)
+
+
+@pytest.mark.parametrize(
+    ("duration", "fps"),
+    [(2.95, 30), (2.9, 30), (3.123, 30), (0.5, 6)],
+)
+def test_motion_handle_covers_independently_rounded_resolve_endpoint(
+    duration, fps
+):
+    authored, encoded = capture_module._motion_frame_counts(duration, fps)
+    resolve_endpoint = round(duration * fps)
+
+    assert authored == resolve_endpoint
+    assert encoded == authored + 1
+    # Frame indexes are zero-based: the handle at ``encoded - 1`` is valid if
+    # Resolve asks for the rounded endpoint just beyond the authored range.
+    assert resolve_endpoint <= encoded - 1
+
+
 def test_targeted_capture_retains_a_deterministic_below_fold_crop(tmp_path):
     import numpy as np
     from PIL import Image
@@ -416,6 +511,14 @@ class _FakeCdp:
             expression = params["expression"]
             if expression == "document.readyState":
                 value = "complete"
+            elif "__rabbitholeAuthoredClick = true" in expression:
+                value = {"ok": True, "label": "Oldest"}
+            elif "__rabbitholeAuthoredClickElement" in expression:
+                value = {"ok": True}
+            elif "__rabbitholeMotionFreeze" in expression:
+                value = True
+            elif "__rabbitholeMotionFrame" in expression:
+                value = True
             elif "__rabbitholeCaptureTarget" in expression:
                 value = self.target_result
             else:
@@ -435,6 +538,213 @@ class _FakeCdp:
                 ).decode("ascii")
             }
         return {}
+
+
+def test_cdp_motion_establishes_then_smoothly_pushes_to_the_resolved_target(
+    tmp_path,
+):
+    from PIL import Image
+
+    session = _FakeCdp(
+        target_result={
+            "ok": True,
+            "scrollX": 0,
+            "scrollY": 630,
+            "targetRect": {"x": 80, "y": 700, "width": 160, "height": 40},
+        },
+        screenshot_size=(320, 1000),
+    )
+    request = BrowserMotionCaptureRequest(
+        url="https://example.com/article",
+        frames_dir=tmp_path / "frames",
+        spec=CaptureSpec(text="exact evidence", motion=CaptureMotion()),
+        width=320,
+        height=180,
+        duration=1.0,
+        fps=6,
+        settle_ms=0,
+        browser=Path("browser.exe"),
+    )
+
+    response = _capture_motion_frames_with_cdp_session(session, request)
+
+    capture_calls = [
+        params
+        for method, params in session.calls
+        if method == "Page.captureScreenshot"
+    ]
+    assert len(capture_calls) == 6
+    assert capture_calls[0]["clip"] == {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 320.0,
+        "height": 180.0,
+        "scale": 1.0,
+    }
+    assert capture_calls[-1]["clip"] == {
+        "x": 40.0,
+        "y": 652.5,
+        "width": 240.0,
+        "height": 135.0,
+        "scale": pytest.approx(4 / 3),
+    }
+    assert response.framing == CaptureFraming(
+        mode="motion-target",
+        target=CaptureRectangle(x=80, y=700, width=160, height=40),
+        clip=CaptureRectangle(x=40, y=652.5, width=240, height=135),
+        content=CaptureRectangle(x=0, y=0, width=320, height=1000),
+        motion=CaptureMotionFraming(
+            frame_count=7,
+            fps=6,
+            duration_seconds=7 / 6,
+            authored_frame_count=6,
+            safe_trailing_frames=1,
+            establish_fraction=0.22,
+            move_fraction=0.5,
+            easing="smoothstep",
+            start_clip=CaptureRectangle(x=0, y=0, width=320, height=180),
+            end_clip=CaptureRectangle(x=40, y=652.5, width=240, height=135),
+        ),
+    )
+    frames = sorted(request.frames_dir.glob("frame-*.png"))
+    assert len(frames) == 7
+    assert Image.open(frames[-1]).size == (320, 180)
+    assert frames[-1].read_bytes() == frames[-2].read_bytes()
+    assert response.framing.motion.to_dict() == {
+        "frame_count": 7,
+        "fps": 6,
+        "duration_seconds": 7 / 6,
+        "authored_frame_count": 6,
+        "safe_trailing_frames": 1,
+        "establish_fraction": 0.22,
+        "move_fraction": 0.5,
+        "easing": "smoothstep",
+        "start_clip": {"x": 0, "y": 0, "width": 320, "height": 180},
+        "end_clip": {"x": 40, "y": 652.5, "width": 240, "height": 135},
+    }
+
+
+def test_half_frame_motion_keeps_88_authored_frames_plus_identical_handle(
+    tmp_path,
+):
+    session = _FakeCdp(
+        target_result={
+            "ok": True,
+            "scrollX": 0,
+            "scrollY": 215,
+            "targetRect": {"x": 20, "y": 250, "width": 80, "height": 20},
+        },
+        screenshot_size=(160, 400),
+    )
+    request = BrowserMotionCaptureRequest(
+        url="https://example.com/article",
+        frames_dir=tmp_path / "half-frame",
+        spec=CaptureSpec(text="exact evidence", motion=CaptureMotion()),
+        width=160,
+        height=90,
+        duration=2.95,
+        fps=30,
+        settle_ms=0,
+        browser=Path("browser.exe"),
+    )
+
+    response = _capture_motion_frames_with_cdp_session(session, request)
+
+    motion = response.framing.motion
+    assert motion.authored_frame_count == 88
+    assert motion.frame_count == 89
+    assert motion.duration_seconds == pytest.approx(89 / 30)
+    assert (
+        sum(method == "Page.captureScreenshot" for method, _ in session.calls)
+        == 88
+    )
+    frames = sorted(request.frames_dir.glob("frame-*.png"))
+    assert len(frames) == 89
+    assert frames[-2].name == "frame-000087.png"
+    assert frames[-1].name == "frame-000088.png"
+    assert frames[-1].read_bytes() == frames[-2].read_bytes()
+
+
+def test_authored_oldest_tab_click_runs_before_target_resolution(tmp_path):
+    session = _FakeCdp(
+        target_result={
+            "ok": True,
+            "scrollX": 0,
+            "scrollY": 0,
+            "targetRect": {"x": 20, "y": 20, "width": 200, "height": 50},
+        },
+        screenshot_size=(400, 300),
+    )
+    request = BrowserCaptureRequest(
+        url="https://www.youtube.com/@webdriver-torso/videos",
+        out_png=tmp_path / "oldest.png",
+        spec=CaptureSpec(
+            selector="ytd-rich-grid-renderer",
+            click_text="Oldest",
+        ),
+        width=400,
+        height=300,
+        settle_ms=0,
+        browser=Path("browser.exe"),
+    )
+
+    _capture_with_cdp_session(session, request)
+
+    evaluations = [
+        params["expression"]
+        for method, params in session.calls
+        if method == "Runtime.evaluate"
+    ]
+    click_index = next(
+        index
+        for index, expression in enumerate(evaluations)
+        if "const element = window.__rabbitholeAuthoredClickElement" in expression
+    )
+    target_index = next(
+        index
+        for index, expression in enumerate(evaluations)
+        if "__rabbitholeCaptureTarget" in expression
+    )
+    assert click_index < target_index
+
+
+def test_authored_click_refuses_a_resolved_consent_control(tmp_path):
+    class ConsentCdp(_FakeCdp):
+        def command(self, method, params=None):
+            params = params or {}
+            if (
+                method == "Runtime.evaluate"
+                and "__rabbitholeAuthoredClick = true" in params.get("expression", "")
+            ):
+                self.calls.append((method, params))
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"ok": True, "label": "Accept all cookies"},
+                    }
+                }
+            return super().command(method, params)
+
+    session = ConsentCdp(
+        target_result={"ok": True, "scrollX": 0, "scrollY": 0},
+        screenshot_size=(400, 300),
+    )
+    request = BrowserCaptureRequest(
+        url="https://example.com",
+        out_png=tmp_path / "refused.png",
+        spec=CaptureSpec(scroll_target=ScrollTarget(y=0), click_selector="#accept"),
+        width=400,
+        height=300,
+        settle_ms=0,
+        browser=Path("browser.exe"),
+    )
+
+    with pytest.raises(RuntimeError, match="consent control"):
+        _capture_with_cdp_session(session, request)
+
+    assert not any(
+        method == "Page.captureScreenshot" for method, _params in session.calls
+    )
 
 
 def test_cdp_capture_centers_a_bounded_document_clip_on_a_below_fold_target(
@@ -1013,6 +1323,48 @@ def test_shared_page_capture_navigates_once_but_captures_each_authored_target(
     assert all(request.out_png.read_bytes().startswith(b"\x89PNG") for request in requests)
 
 
+def test_shared_page_capture_navigates_once_for_repeated_motion_targets(
+    tmp_path, monkeypatch
+):
+    session = _SharedFakeCdp(target_result={})
+
+    @contextmanager
+    def fake_devtools(_browser, *, width, height):
+        assert (width, height) == (400, 300)
+        yield session
+
+    monkeypatch.setattr(capture_module, "_chrome_devtools", fake_devtools)
+    requests = [
+        BrowserMotionCaptureRequest(
+            url="https://web.archive.org/web/2026/https://example.com",
+            frames_dir=tmp_path / f"motion-{index}",
+            spec=CaptureSpec(text=text, motion=CaptureMotion()),
+            width=400,
+            height=300,
+            duration=0.5,
+            fps=6,
+            settle_ms=0,
+            browser=Path("browser.exe"),
+        )
+        for index, text in enumerate(("first evidence", "second evidence"), start=1)
+    ]
+
+    with shared_page_capture() as targeted:
+        motion = getattr(targeted, "_rabbithole_motion_capture")
+        responses = [motion(request) for request in requests]
+
+    assert sum(method == "Page.navigate" for method, _ in session.calls) == 1
+    assert (
+        sum(method == "Page.captureScreenshot" for method, _ in session.calls)
+        == 6
+    )
+    assert all(response.framing.mode == "motion-target" for response in responses)
+    assert all(
+        len(list(request.frames_dir.glob("frame-*.png"))) == 4
+        for request in requests
+    )
+
+
 def test_shared_page_capture_keeps_other_targets_after_one_fails_closed(
     tmp_path, monkeypatch
 ):
@@ -1226,6 +1578,193 @@ def test_capture_to_video_forwards_a_json_capture_spec(tmp_path):
         text="Google acknowledgement", scroll_target=ScrollTarget(y=700)
     )
     assert result.path == (tmp_path / "out.mp4").resolve()
+
+
+def _fake_motion_capture(request, *, page_source="<html><body>evidence</body></html>", blank=False):
+    authored_frame_count, frame_count = capture_module._motion_frame_counts(
+        request.duration, request.fps
+    )
+    for index in range(frame_count):
+        path = request.frames_dir / f"frame-{index:06d}.png"
+        if blank:
+            _png(path, size=(request.width, request.height), colour=(255, 255, 255))
+        else:
+            _busy_png(path, size=(request.width, request.height))
+    start = CaptureRectangle(
+        x=0,
+        y=0,
+        width=request.width,
+        height=request.height,
+    )
+    target = CaptureRectangle(x=40, y=500, width=200, height=60)
+    end = CaptureRectangle(x=0, y=450, width=request.width, height=request.height)
+    return BrowserCaptureResponse(
+        page_source=page_source,
+        framing=CaptureFraming(
+            mode="motion-target",
+            target=target,
+            clip=end,
+            content=CaptureRectangle(x=0, y=0, width=request.width, height=1200),
+            motion=CaptureMotionFraming(
+                frame_count=frame_count,
+                fps=request.fps,
+                duration_seconds=frame_count / request.fps,
+                authored_frame_count=authored_frame_count,
+                safe_trailing_frames=1,
+                establish_fraction=request.spec.motion.establish_fraction,
+                move_fraction=request.spec.motion.move_fraction,
+                easing="smoothstep",
+                start_clip=start,
+                end_clip=end,
+            ),
+        ),
+    )
+
+
+def test_capture_to_video_dispatches_motion_to_cdp_frames_and_cfr_ffmpeg(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        Path(argv[-1]).write_bytes(b"portable h264")
+        return 0, b"", b""
+
+    monkeypatch.setattr(
+        capture_module,
+        "video_args",
+        lambda _quality: ["-c:v", "libx264", "-crf", "20"],
+    )
+    result = capture_to_video(
+        "https://web.archive.org/web/2026/https://example.com/article",
+        tmp_path / "motion.mp4",
+        1.0,
+        tmp_path / "work",
+        width=320,
+        height=180,
+        fps=6,
+        runner=runner,
+        transport=lambda _url: (200, b"<html><body>evidence</body></html>"),
+        browser=Path("browser.exe"),
+        spec={"text": "evidence", "motion": True},
+        motion_capture=_fake_motion_capture,
+    )
+
+    assert result.kind == "page"
+    assert result.framing.motion.frame_count == 7
+    assert result.framing.motion.authored_frame_count == 6
+    assert result.framing.motion.safe_trailing_frames == 1
+    assert result.framing.motion.duration_seconds == pytest.approx(7 / 6)
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[:3] == ["ffmpeg", "-y", "-v"]
+    assert argv[argv.index("-framerate") + 1] == "6"
+    assert argv[argv.index("-frames:v") + 1] == "7"
+    assert argv[argv.index("-fps_mode") + 1] == "cfr"
+    assert argv[argv.index("-c:v") + 1] == "libx264"
+    assert "format=yuv420p" in argv[argv.index("-vf") + 1]
+
+
+def test_motion_capture_encodes_decodable_h264_at_the_authored_cfr(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        capture_module,
+        "video_args",
+        lambda _quality: ["-c:v", "libx264", "-crf", "20"],
+    )
+    result = capture_page_motion(
+        "https://web.archive.org/web/2026/https://example.com/article",
+        tmp_path / "motion.mp4",
+        1.0,
+        tmp_path / "work",
+        width=320,
+        height=180,
+        fps=6,
+        browser=Path("browser.exe"),
+        spec={"text": "evidence", "motion": True},
+        motion_capture=_fake_motion_capture,
+    )
+
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height,r_frame_rate,avg_frame_rate,pix_fmt,"
+            "nb_frames,duration",
+            "-of",
+            "json",
+            str(result.path),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    stream = json.loads(probe.stdout)["streams"][0]
+    assert stream["codec_name"] == "h264"
+    assert stream["width"] == 320
+    assert stream["height"] == 180
+    assert stream["pix_fmt"] == "yuv420p"
+    assert stream["r_frame_rate"] == "6/1"
+    assert stream["avg_frame_rate"] == "6/1"
+    assert int(stream["nb_frames"]) == 7
+    assert float(stream["duration"]) == pytest.approx(7 / 6, abs=1e-6)
+    assert result.framing.motion.frame_count == 7
+    assert result.framing.motion.duration_seconds == pytest.approx(7 / 6)
+
+
+@pytest.mark.parametrize(
+    ("page_source", "blank", "match"),
+    [
+        (
+            "<html><body><h1>It's your choice</h1>"
+            "<p>Decide how your data is used.</p>"
+            "<button>Manage cookies</button><button>Accept all</button>"
+            "</body></html>",
+            False,
+            "cookie-consent",
+        ),
+        ("<html><body>evidence</body></html>", True, "final evidence frame is blank"),
+    ],
+)
+def test_motion_capture_fails_closed_before_ffmpeg_on_blocked_or_blank_pages(
+    tmp_path, page_source, blank, match
+):
+    calls = []
+
+    def motion(request):
+        return _fake_motion_capture(
+            request,
+            page_source=page_source,
+            blank=blank,
+        )
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, b"", b""
+
+    out = tmp_path / "refused.mp4"
+    with pytest.raises(RuntimeError, match=match):
+        capture_page_motion(
+            "https://example.com/article",
+            out,
+            1.0,
+            tmp_path / "work",
+            width=320,
+            height=180,
+            fps=6,
+            runner=runner,
+            browser=Path("browser.exe"),
+            spec={"text": "evidence", "motion": True},
+            motion_capture=motion,
+        )
+
+    assert calls == []
+    assert not out.exists()
 
 
 def test_capture_to_video_carries_the_live_page_warning_through(tmp_path):
@@ -1511,6 +2050,27 @@ def test_browser_content_blockers_are_refused(tmp_path, page_source, expected):
 
     assert expected in str(raised.value)
     assert not out.exists()
+
+
+def test_hidden_semantic_dialog_does_not_block_an_unobstructed_page(tmp_path):
+    out = tmp_path / "shot.png"
+    page_source = (
+        "<html><body><main><h1>Webdriver Torso</h1><p>624K videos</p></main>"
+        '<div role="dialog" style="display: none;">'
+        "You're signed out. Sign in to YouTube on your computer."
+        "</div></body></html>"
+    )
+
+    result = capture_page(
+        "https://www.youtube.com/@realwebdrivertorso/videos",
+        out,
+        runner=_busy_runner(out),
+        browser=Path("b.exe"),
+        page_source=page_source,
+    )
+
+    assert result.path == out
+    assert out.exists()
 
 
 def test_final_capture_fails_closed_when_page_text_cannot_be_inspected(tmp_path):

@@ -70,9 +70,11 @@ module does not make.
 
 from __future__ import annotations
 
+import math
 import re
-import textwrap
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_EVEN
+from functools import lru_cache
 from pathlib import Path
 
 from rabbithole.graphics import pick_title_font
@@ -80,6 +82,7 @@ from rabbithole.slots import Slot
 from rabbithole.sources.plates import PlateSpec, build_plate
 from rabbithole.subtitles import (
     _escape_ass_text,
+    _font_directories,
     _wrap_override,
     ass_colour,
     burn,
@@ -100,15 +103,29 @@ CARD_KINDS = (
 )
 
 # The fraction of the frame every element stays inside. `detail` framing crops
-# to 1/1.30 = 76.9% of the frame (see render._DETAIL_ZOOM); this sits under
-# that so a card survives the tightest framing with margin, rather than being
-# clipped exactly on the cuts meant to emphasise it.
-TITLE_SAFE_FRACTION = 0.74
+# to 1/1.30 = 76.9% of the frame (see render._DETAIL_ZOOM). 0.68 leaves roughly
+# 4.5% of the original frame on each side between authored content and that
+# crop, enough for Resolve's resampling and libass outlines instead of relying
+# on the former 0.74 near-boundary tolerance.
+TITLE_SAFE_FRACTION = 0.68
+
+# Text receives another inset inside title-safe. Shapes may use the complete
+# title-safe box, but authored glyphs never touch it: clipping a subtitle-style
+# outline at the exact text anchor was enough to make a first character look
+# missing even when its mathematical position was technically in bounds.
+TEXT_SAFE_INSET_FRACTION = 0.05
+_TEXT_WIDTH_SAFETY_MULTIPLIER = 1.12
 
 # The background every card is drawn onto. 'grain' rather than 'black': a card
 # on pure black reads as a slide, a card on moving grain reads as part of the
 # same graded film as the footage around it.
 CARD_PLATE_KIND = "grain"
+
+# Resolve rounds absolute timeline endpoints independently from a card's local
+# duration. A half-frame boundary can therefore ask for one source frame past
+# the nearest-frame authored card. Keep exactly one repeated terminal frame as
+# a media handle; it is never included in the authored card timing.
+CARD_SAFE_TRAILING_FRAMES = 1
 
 _HEADING_SIZE_FRACTION = 0.062
 _DISCLOSURE_SIZE_FRACTION = 0.026
@@ -153,9 +170,9 @@ SIGNAL_COMPARISON_ITEM_COUNTS = {
 # silently overflowing off the safe area.
 MAX_ITEMS = 6
 
-# Ordered longest-first so 'split-screen' is matched before 'split', and
-# checked as substrings of the lowercased detail. Order between groups is
-# significant: a detail reading "timeline comparison" is a timeline first.
+# Ordered longest-first and matched as complete words or phrases in the
+# lowercased detail. Order between groups is significant: a detail reading
+# "timeline comparison" is a timeline first.
 _CLASSIFY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("timeline", ("timeline", "chronology", "calendar", "growth curve", " to ")),
     ("comparison", ("split-screen", "side-by-side", "versus", " vs ", "compared",
@@ -164,10 +181,45 @@ _CLASSIFY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
                  "three panels")),
     ("checklist", ("checklist", "criteria", "demands", "points", "list")),
     ("document", ("excerpt", "order", "overlay", "paper", "floor plan", "form")),
-    ("stat", ("percent", "crore", "lakh", "million", "thousand", "figure",
-              "number", "count", "statistic")),
-    ("callout", ("callout", "label", "quote", "manifesto text", "claims",
-                 "statement", "icon", "symbol")),
+    (
+        "stat",
+        (
+            "percent",
+            "percentage",
+            "percentages",
+            "crore",
+            "crores",
+            "lakh",
+            "lakhs",
+            "million",
+            "millions",
+            "thousand",
+            "thousands",
+            "figure",
+            "figures",
+            "number",
+            "numbered",
+            "numbers",
+            "count",
+            "counts",
+            "statistic",
+            "statistics",
+        ),
+    ),
+    (
+        "callout",
+        (
+            "callout",
+            "label",
+            "labels",
+            "quote",
+            "manifesto text",
+            "claims",
+            "statement",
+            "icon",
+            "symbol",
+        ),
+    ),
 )
 
 
@@ -200,17 +252,32 @@ class CardSpec:
             raise ValueError(f"Card duration must be positive, got {self.duration}")
 
 
+def _contains_classification_cue(detail: str, cue: str) -> bool:
+    """Whether *cue* appears as authored words rather than inside another word."""
+
+    normalized_cue = cue.strip()
+    return bool(
+        normalized_cue
+        and re.search(
+            rf"(?<!\w){re.escape(normalized_cue)}(?!\w)",
+            detail,
+        )
+    )
+
+
 def classify(detail: str) -> str:
     """The card archetype a slot detail asks for.
 
-    Substring matching on the lowercased detail, in `_CLASSIFY_RULES` order.
+    Word-boundary matching on the lowercased detail, in `_CLASSIFY_RULES`
+    order. This keeps a real ``label`` directive while preventing words such
+    as ``labelled`` from silently turning a motion direction into a callout.
     Falls back to `label` -- a designed card carrying the detail's own words --
     rather than raising, because an unrecognised detail should still put
     something intentional on screen.
     """
-    lowered = f" {detail.lower().strip()} "
+    lowered = re.sub(r"\s+", " ", detail.lower().strip())
     for kind, needles in _CLASSIFY_RULES:
-        if any(needle in lowered for needle in needles):
+        if any(_contains_classification_cue(lowered, needle) for needle in needles):
             return kind
     return "label"
 
@@ -473,29 +540,157 @@ def _rect(x: float, y: float, w: float, h: float) -> str:
     )
 
 
-def _wrapped_ass_text(text: str, max_width: float, font_size: float) -> str:
-    """Escape *text* and add deterministic hard wraps for a pixel-width budget.
+@lru_cache(maxsize=32)
+def _measurement_font(font_family: str, font_size: int):
+    """Resolve *font_family* to the same native face libass is likely to use.
 
-    libass's automatic wrapping uses the whole frame because these events are
-    positioned rather than margin-boxed. A comparison item could therefore
-    flow straight through its divider. The conservative average-glyph estimate
-    keeps short text byte-for-byte stable and wraps long text before it reaches
-    the edge; a rectangular ``\\clip`` remains the final containment guard in
-    column layouts.
+    Pillow and libass both measure through FreeType. Resolving the actual face
+    makes wrapping deterministic for condensed Latin headings and wide
+    Devanagari body glyphs instead of pretending every character is 0.62em.
+    The path/index walk is cached and sorted so Windows, macOS, and Linux each
+    make one stable choice per family and size.
     """
+    try:
+        from PIL import ImageFont
+    except ImportError:  # pragma: no cover - Pillow is a project dependency
+        return None
+
+    wanted = (font_family or "").strip().casefold()
+    if wanted:
+        for directory in _font_directories():
+            if not directory.is_dir():
+                continue
+            try:
+                paths = sorted(
+                    (
+                        path
+                        for path in directory.rglob("*")
+                        if path.is_file()
+                        and path.suffix.lower() in {".ttf", ".otf", ".ttc"}
+                    ),
+                    key=lambda path: str(path).casefold(),
+                )
+            except OSError:
+                continue
+            for path in paths:
+                max_faces = 16 if path.suffix.lower() == ".ttc" else 1
+                for index in range(max_faces):
+                    try:
+                        face = ImageFont.truetype(
+                            str(path), size=font_size, index=index
+                        )
+                        family, _style = face.getname()
+                    except (OSError, ValueError):
+                        break
+                    if str(family).strip().casefold() == wanted:
+                        return face
+
+    # DejaVu Sans ships with Pillow in supported environments. It is a stable,
+    # deliberately wider fallback for measurement only; libass still uses the
+    # selected production family when drawing.
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size=font_size)
+    except OSError:  # pragma: no cover - only a broken Pillow install
+        return None
+
+
+def _measured_line_width(
+    text: str,
+    font_size: float,
+    *,
+    font_family: str = "",
+    letter_spacing: float = 0.0,
+) -> float:
+    """Conservative rendered width for one unescaped line, in ASS pixels."""
+    normalized = str(text or "")
+    size = max(1, round(font_size))
+    font = _measurement_font(font_family, size)
+    if font is not None:
+        width = float(font.getlength(normalized))
+    else:
+        # Last-resort deterministic estimate. Wide glyphs deliberately cost
+        # more than 1em; the safety multiplier below absorbs shaping drift.
+        width = sum(
+            size * (1.0 if char in "MW@#%&" else 0.72 if ord(char) > 127 else 0.62)
+            for char in normalized
+        )
+    width += max(0, len(normalized) - 1) * max(0.0, letter_spacing)
+    return width * _TEXT_WIDTH_SAFETY_MULTIPLIER
+
+
+def _wrap_measured_lines(
+    text: str,
+    max_width: float,
+    font_size: float,
+    *,
+    font_family: str = "",
+    letter_spacing: float = 0.0,
+) -> list[str]:
+    """Wrap words, and overlong words, against measured rendered width."""
     normalized = re.sub(r"\s+", " ", text or "").strip()
     if not normalized:
-        return ""
-    average_glyph_width = max(1.0, font_size * 0.62)
-    max_chars = max(1, int(max_width / average_glyph_width))
-    lines = textwrap.wrap(
-        normalized,
-        width=max_chars,
-        break_long_words=True,
-        break_on_hyphens=False,
-        replace_whitespace=True,
-        drop_whitespace=True,
-    ) or [normalized]
+        return []
+    budget = max(1.0, float(max_width))
+
+    def fits(candidate: str) -> bool:
+        return _measured_line_width(
+            candidate,
+            font_size,
+            font_family=font_family,
+            letter_spacing=letter_spacing,
+        ) <= budget
+
+    def split_word(word: str) -> list[str]:
+        pieces: list[str] = []
+        current = ""
+        for char in word:
+            candidate = current + char
+            if current and not fits(candidate):
+                pieces.append(current)
+                current = char
+            else:
+                current = candidate
+        if current:
+            pieces.append(current)
+        return pieces or [word]
+
+    lines: list[str] = []
+    current = ""
+    for word in normalized.split(" "):
+        pieces = [word] if fits(word) else split_word(word)
+        for piece_index, piece in enumerate(pieces):
+            candidate = f"{current} {piece}".strip()
+            if current and not fits(candidate):
+                lines.append(current)
+                current = piece
+            else:
+                current = candidate
+            # A split word has no semantic whitespace between its pieces, but
+            # each full-budget piece must become a deterministic hard line.
+            if piece_index < len(pieces) - 1:
+                lines.append(current)
+                current = ""
+    if current:
+        lines.append(current)
+    return lines or [normalized]
+
+
+def _wrapped_ass_text(
+    text: str,
+    max_width: float,
+    font_size: float,
+    *,
+    font_family: str = "",
+    letter_spacing: float = 0.0,
+) -> str:
+    """Escape *text* and hard-wrap it by measured rendered width."""
+    lines = _wrap_measured_lines(
+        text,
+        max_width,
+        font_size,
+        font_family=font_family,
+        letter_spacing=letter_spacing,
+    )
     return r"\N".join(_escape_ass_text(line) for line in lines)
 
 
@@ -529,6 +724,18 @@ class _Layout:
     @property
     def centre_y(self) -> float:
         return self.height / 2
+
+    @property
+    def text_left(self) -> float:
+        return self.left + self.safe_w * TEXT_SAFE_INSET_FRACTION
+
+    @property
+    def text_right(self) -> float:
+        return self.left + self.safe_w * (1 - TEXT_SAFE_INSET_FRACTION)
+
+    @property
+    def text_w(self) -> float:
+        return self.text_right - self.text_left
 
 
 def _styles(typography: dict, palette: dict, width: int, height: int) -> list[str]:
@@ -587,10 +794,16 @@ def _heading_events(spec: CardSpec, layout: _Layout, palette: dict, typography: 
     rule_y = y + layout.height * 0.055
     if spec.heading.strip():
         heading_size = max(1, round(layout.height * _HEADING_SIZE_FRACTION))
+        heading_font, _findings = pick_title_font(typography)
+        tracking = float(
+            typography.get("title_card", {}).get("tracking", 0.0) or 0.0
+        )
         heading = _wrapped_ass_text(
             _transform(spec.heading, typography),
-            layout.safe_w * 0.90,
+            layout.text_w * 0.90,
             heading_size,
+            font_family=heading_font,
+            letter_spacing=heading_size * tracking,
         )
         line_count = heading.count(r"\N") + 1
         heading_bottom = (
@@ -609,6 +822,8 @@ def _heading_events(spec: CardSpec, layout: _Layout, palette: dict, typography: 
         events.append(_dialogue(
             "CardHead", spec.duration,
             f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({layout.centre_x:.0f},{y:.0f})"
+            f"\\clip({layout.text_left:.0f},{layout.top:.0f},"
+            f"{layout.text_right:.0f},{layout.top + layout.safe_h:.0f})"
             f"\\c{_wrap_override(fill)}}}{heading}"))
 
     # The rule is drawn either way: with a heading it underlines it, without one
@@ -625,15 +840,23 @@ def _heading_events(spec: CardSpec, layout: _Layout, palette: dict, typography: 
 def _callout_events(spec, layout, palette, typography):
     events = _heading_events(spec, layout, palette, typography, layout.centre_y)
     if spec.items:
+        body_size = max(1, round(layout.height * _BODY_SIZE_FRACTION))
+        body_font, _findings = pick_font(typography)
         body = _wrapped_ass_text(
             " / ".join(spec.items),
-            layout.safe_w * 0.78,
-            max(1, round(layout.height * _BODY_SIZE_FRACTION)),
+            layout.text_w * 0.78,
+            body_size,
+            font_family=body_font,
         )
+        clip_w = layout.text_w * 0.82
+        clip_left = layout.centre_x - clip_w / 2
+        clip_right = layout.centre_x + clip_w / 2
         events.append(_dialogue(
             "CardBody", spec.duration,
             f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({layout.centre_x:.0f},"
-            f"{layout.centre_y + layout.height * 0.13:.0f})}}{body}"))
+            f"{layout.centre_y + layout.height * 0.13:.0f})"
+            f"\\clip({clip_left:.0f},{layout.top:.0f},{clip_right:.0f},"
+            f"{layout.top + layout.safe_h:.0f})}}{body}"))
     return events
 
 
@@ -650,6 +873,8 @@ def _checklist_events(spec, layout, palette, typography):
     light = palette.get("text_light", "#E0E0E0")
     thickness = max(2.0, layout.height * _RULE_THICKNESS_FRACTION)
     marker = layout.height * 0.018
+    body_size = max(1, round(layout.height * _BODY_SIZE_FRACTION))
+    body_font, _findings = pick_font(typography)
 
     # Centre the item block in the space below the heading rather than hanging
     # it from a fixed offset: with two items a fixed start leaves the card
@@ -659,7 +884,9 @@ def _checklist_events(spec, layout, palette, typography):
     area_top = layout.top + layout.safe_h * 0.30
     area_bottom = layout.top + layout.safe_h * 0.94
     first = max(area_top, (area_top + area_bottom - block_h) / 2)
-    text_x = layout.left + layout.safe_w * 0.16
+    text_x = layout.text_left + layout.safe_w * 0.11
+    clip_right = layout.text_right
+    body_width = max(1.0, clip_right - text_x - layout.safe_w * 0.025)
 
     for index, item in enumerate(spec.items):
         y = first + index * step
@@ -670,7 +897,10 @@ def _checklist_events(spec, layout, palette, typography):
         events.append(_dialogue(
             "CardBody", spec.duration,
             f"{{\\an{_ASS_TOP_LEFT}\\pos({text_x:.0f},{y - layout.height * 0.020:.0f})"
-            f"\\c{_wrap_override(light)}}}{_escape_ass_text(item)}"))
+            f"\\clip({text_x - layout.safe_w * 0.01:.0f},{layout.top:.0f},"
+            f"{clip_right:.0f},{layout.top + layout.safe_h:.0f})"
+            f"\\c{_wrap_override(light)}}}"
+            f"{_wrapped_ass_text(item, body_width, body_size, font_family=body_font)}"))
     return events
 
 
@@ -734,6 +964,10 @@ def _signal_comparison_events(spec, layout, palette, typography, variant):
     shifted_red = "#D66A45"
     shifted_blue = "#5C43D7"
     panel_fill = "#D8D8D8"
+    disclosure_size = max(
+        1, round(layout.height * _DISCLOSURE_SIZE_FRACTION)
+    )
+    disclosure_font, _findings = pick_font(typography)
 
     viewer_spec = CardSpec(
         kind="comparison",
@@ -799,6 +1033,8 @@ def _signal_comparison_events(spec, layout, palette, typography, variant):
             "CardDisclosure",
             spec.duration,
             f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({x:.0f},{label_y:.0f})"
+            f"\\clip({layout.text_left:.0f},{layout.top:.0f},"
+            f"{layout.text_right:.0f},{layout.top + layout.safe_h:.0f})"
             f"\\c{_wrap_override(light)}}}{label}",
         ))
 
@@ -926,8 +1162,11 @@ def _signal_comparison_events(spec, layout, palette, typography, variant):
                 "CardDisclosure",
                 spec.duration,
                 f"{{\\an{_ASS_MIDDLE_LEFT}\\pos({chip_x + chip_w * 0.06:.0f},"
-                f"{chip_y + chip_h / 2:.0f})\\c{_wrap_override(light)}}}"
-                f"{_escape_ass_text(item)}",
+                f"{chip_y + chip_h / 2:.0f})"
+                f"\\clip({chip_x + chip_w * 0.035:.0f},{chip_y:.0f},"
+                f"{chip_x + chip_w * 0.965:.0f},{chip_y + chip_h:.0f})"
+                f"\\c{_wrap_override(light)}}}"
+                f"{_wrapped_ass_text(item, chip_w * 0.84, disclosure_size, font_family=disclosure_font)}",
             ))
 
     # For the two-panel variants, retain the author's exact labels beneath
@@ -935,15 +1174,23 @@ def _signal_comparison_events(spec, layout, palette, typography, variant):
     # its status chips instead.
     if variant != "automated flag":
         item_y = panel_y + panel_h + layout.safe_h * 0.055
-        item_size = max(1, round(layout.height * _DISCLOSURE_SIZE_FRACTION))
+        item_size = disclosure_size
         for index, item in enumerate(spec.items[:2]):
             panel_x = left_x if index == 0 else right_x
-            body = _wrapped_ass_text(item, panel_w * 0.92, item_size)
+            body = _wrapped_ass_text(
+                item,
+                panel_w * 0.84,
+                item_size,
+                font_family=disclosure_font,
+            )
             events.append(_dialogue(
                 "CardDisclosure",
                 spec.duration,
                 f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({panel_x + panel_w / 2:.0f},"
-                f"{item_y:.0f})\\c{_wrap_override(light)}}}{body}",
+                f"{item_y:.0f})"
+                f"\\clip({panel_x + panel_w * 0.05:.0f},{layout.top:.0f},"
+                f"{panel_x + panel_w * 0.95:.0f},{layout.top + layout.safe_h:.0f})"
+                f"\\c{_wrap_override(light)}}}{body}",
             ))
 
     disclosure_y = layout.top + layout.safe_h * 0.875
@@ -956,7 +1203,10 @@ def _signal_comparison_events(spec, layout, palette, typography, variant):
             "CardDisclosure",
             spec.duration,
             f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({layout.centre_x:.0f},{y:.0f})"
-            f"\\c{_wrap_override(colour)}}}{_escape_ass_text(text)}",
+            f"\\clip({layout.text_left:.0f},{layout.top:.0f},"
+            f"{layout.text_right:.0f},{layout.top + layout.safe_h:.0f})"
+            f"\\c{_wrap_override(colour)}}}"
+            f"{_wrapped_ass_text(text, layout.text_w, disclosure_size, font_family=disclosure_font)}",
         ))
     return events
 
@@ -981,6 +1231,8 @@ def _comparison_events(spec, layout, palette, typography):
     divider_h = layout.safe_h * 0.42
     divider_y = layout.centre_y - divider_h / 2 + layout.height * 0.04
     thickness = max(2.0, layout.height * _RULE_THICKNESS_FRACTION * 0.8)
+    body_size = max(1, round(layout.height * _BODY_SIZE_FRACTION))
+    body_font, _findings = pick_font(typography)
 
     # A vertical rule only reads as "these two things are opposed" when there
     # are exactly two sides; three or more lay out as evenly spaced columns.
@@ -991,16 +1243,17 @@ def _comparison_events(spec, layout, palette, typography):
             f"\\c{_wrap_override(accent)}}}{_rect(0, 0, thickness, divider_h)}"))
 
     count = len(spec.items)
-    column = layout.safe_w / count
+    column = layout.text_w / count
     for index, item in enumerate(spec.items):
-        x = layout.left + column * (index + 0.5)
+        x = layout.text_left + column * (index + 0.5)
         padding = min(column * 0.10, layout.width * 0.025)
-        clip_left = layout.left + column * index + padding
-        clip_right = layout.left + column * (index + 1) - padding
+        clip_left = layout.text_left + column * index + padding
+        clip_right = layout.text_left + column * (index + 1) - padding
         body = _wrapped_ass_text(
             item,
-            max(1.0, clip_right - clip_left),
-            max(1, round(layout.height * _BODY_SIZE_FRACTION)),
+            max(1.0, clip_right - clip_left - padding * 0.5),
+            body_size,
+            font_family=body_font,
         )
         events.append(_dialogue(
             "CardBody", spec.duration,
@@ -1020,9 +1273,11 @@ def _timeline_events(spec, layout, palette, typography):
     light = palette.get("text_light", "#E0E0E0")
     thickness = max(2.0, layout.height * _RULE_THICKNESS_FRACTION)
     axis_y = layout.centre_y + layout.height * 0.03
-    axis_w = layout.safe_w * 0.86
+    axis_w = layout.text_w * 0.86
     axis_x = layout.centre_x - axis_w / 2
     tick_h = layout.height * 0.030
+    body_size = max(1, round(layout.height * _BODY_SIZE_FRACTION))
+    body_font, _findings = pick_font(typography)
 
     events.append(_dialogue(
         "CardShape", spec.duration,
@@ -1045,31 +1300,48 @@ def _timeline_events(spec, layout, palette, typography):
         # safe area or collide with the opposite endpoint.
         if count == 1:
             alignment = _ASS_MIDDLE_CENTER
-            clip_left = axis_x
-            clip_right = axis_x + axis_w
+            clip_left = layout.text_left
+            clip_right = layout.text_right
+            text_x = layout.centre_x
         else:
             interval = axis_w / (count - 1)
             label_w = interval * 0.86
+            edge_inset = max(layout.width * 0.012, label_w * 0.04)
             if index == 0:
                 alignment = _ASS_MIDDLE_LEFT
                 clip_left = x
                 clip_right = min(x + label_w, layout.left + layout.safe_w)
+                text_x = clip_left + edge_inset
             elif index == count - 1:
                 alignment = _ASS_MIDDLE_RIGHT
                 clip_left = max(x - label_w, layout.left)
                 clip_right = x
+                text_x = clip_right - edge_inset
             else:
                 alignment = _ASS_MIDDLE_CENTER
                 clip_left = max(x - label_w / 2, layout.left)
                 clip_right = min(x + label_w / 2, layout.left + layout.safe_w)
+                text_x = x
+        horizontal_inset = max(layout.width * 0.008, (clip_right - clip_left) * 0.025)
+        if alignment == _ASS_MIDDLE_LEFT:
+            available_width = clip_right - text_x - horizontal_inset
+        elif alignment == _ASS_MIDDLE_RIGHT:
+            available_width = text_x - clip_left - horizontal_inset
+        else:
+            available_width = (
+                2
+                * min(text_x - clip_left, clip_right - text_x)
+                - horizontal_inset * 2
+            )
         body = _wrapped_ass_text(
             item,
-            max(1.0, clip_right - clip_left),
-            max(1, round(layout.height * _BODY_SIZE_FRACTION)),
+            max(1.0, available_width),
+            body_size,
+            font_family=body_font,
         )
         events.append(_dialogue(
             "CardBody", spec.duration,
-            f"{{\\an{alignment}\\pos({x:.0f},{axis_y + layout.height * 0.06:.0f})"
+            f"{{\\an{alignment}\\pos({text_x:.0f},{axis_y + layout.height * 0.06:.0f})"
             f"\\clip({clip_left:.0f},{layout.top:.0f},{clip_right:.0f},"
             f"{layout.top + layout.safe_h:.0f})"
             f"\\c{_wrap_override(light)}}}{body}"))
@@ -1109,12 +1381,15 @@ def _long_nonnumeric_stat_events(spec, figure, layout, palette, typography):
     )
     if body:
         light = palette.get("text_light", "#E0E0E0")
-        clip_left = layout.left + layout.safe_w * 0.08
-        clip_right = layout.left + layout.safe_w * 0.92
+        body_size = max(1, round(layout.height * _BODY_SIZE_FRACTION))
+        body_font, _findings = pick_font(typography)
+        clip_left = layout.text_left + layout.text_w * 0.04
+        clip_right = layout.text_right - layout.text_w * 0.04
         wrapped = _wrapped_ass_text(
             body,
-            clip_right - clip_left,
-            max(1, round(layout.height * _BODY_SIZE_FRACTION)),
+            (clip_right - clip_left) * 0.94,
+            body_size,
+            font_family=body_font,
         )
         events.append(_dialogue(
             "CardBody",
@@ -1146,17 +1421,34 @@ def _stat_events(spec, layout, palette, typography):
     # here through words like "numbered"; only long, nonnumeric figures take
     # this fallback, leaving established numeric/short layouts unchanged.
     stat_size = max(1, round(layout.height * _STAT_SIZE_FRACTION))
-    stat_capacity = max(1, int((layout.safe_w * 0.84) / (stat_size * 0.62)))
-    if not _first_number(figure) and len(re.sub(r"\s+", " ", figure).strip()) > stat_capacity:
+    title_font, _findings = pick_title_font(typography)
+    figure_text = _transform(figure, typography)
+    if (
+        not _first_number(figure)
+        and _measured_line_width(
+            figure_text,
+            stat_size,
+            font_family=title_font,
+        ) > layout.text_w * 0.84
+    ):
         return _long_nonnumeric_stat_events(
             spec, figure, layout, palette, typography
         )
+
+    figure_wrapped = _wrapped_ass_text(
+        figure_text,
+        layout.text_w * 0.84,
+        stat_size,
+        font_family=title_font,
+    )
 
     events = [_dialogue(
         "CardStat", spec.duration,
         f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({layout.centre_x:.0f},"
         f"{layout.centre_y - layout.height * 0.04:.0f})"
-        f"\\c{_wrap_override(light)}}}{_escape_ass_text(_transform(figure, typography))}")]
+        f"\\clip({layout.text_left:.0f},{layout.top:.0f},"
+        f"{layout.text_right:.0f},{layout.top + layout.safe_h:.0f})"
+        f"\\c{_wrap_override(light)}}}{figure_wrapped}")]
 
     thickness = max(2.0, layout.height * _RULE_THICKNESS_FRACTION)
     rule_w = layout.safe_w * 0.16
@@ -1167,11 +1459,16 @@ def _stat_events(spec, layout, palette, typography):
         f"{_rect(0, 0, rule_w, thickness)}"))
 
     if caption:
+        body_size = max(1, round(layout.height * _BODY_SIZE_FRACTION))
+        body_font, _findings = pick_font(typography)
         events.append(_dialogue(
             "CardBody", spec.duration,
             f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({layout.centre_x:.0f},"
             f"{layout.centre_y + layout.height * 0.13:.0f})"
-            f"\\c{_wrap_override(light)}}}{_escape_ass_text(caption)}"))
+            f"\\clip({layout.text_left:.0f},{layout.top:.0f},"
+            f"{layout.text_right:.0f},{layout.top + layout.safe_h:.0f})"
+            f"\\c{_wrap_override(light)}}}"
+            f"{_wrapped_ass_text(caption, layout.text_w * 0.88, body_size, font_family=body_font)}"))
     return events
 
 
@@ -1204,22 +1501,31 @@ def _document_events(spec, layout, palette, typography):
         )
         disclosure = _wrapped_ass_text(
             _transform(spec.disclosure, typography),
-            frame_w * 0.90,
+            frame_w * 0.84,
             disclosure_size,
+            font_family=pick_font(typography)[0],
         )
         events.append(_dialogue(
             "CardDisclosure", spec.duration,
             f"{{\\an{_ASS_TOP_LEFT}\\pos({frame_x + frame_w * 0.05:.0f},"
-            f"{frame_y + frame_h * 0.06:.0f})}}{disclosure}"))
+            f"{frame_y + frame_h * 0.06:.0f})"
+            f"\\clip({frame_x + frame_w * 0.035:.0f},{frame_y:.0f},"
+            f"{frame_x + frame_w * 0.965:.0f},{frame_y + frame_h:.0f})}}"
+            f"{disclosure}"))
 
     # Only fill the frame when there is something to put in it. Echoing the
     # heading inside its own frame reads as a rendering mistake, not a design.
     if spec.items:
         body = " / ".join(spec.items)
+        body_size = max(1, round(layout.height * _BODY_SIZE_FRACTION))
+        body_font, _findings = pick_font(typography)
         events.append(_dialogue(
             "CardBody", spec.duration,
             f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({layout.centre_x:.0f},{frame_y + frame_h / 2:.0f})"
-            f"\\c{_wrap_override(light)}}}{_escape_ass_text(body)}"))
+            f"\\clip({frame_x + frame_w * 0.05:.0f},{frame_y:.0f},"
+            f"{frame_x + frame_w * 0.95:.0f},{frame_y + frame_h:.0f})"
+            f"\\c{_wrap_override(light)}}}"
+            f"{_wrapped_ass_text(body, frame_w * 0.82, body_size, font_family=body_font)}"))
     return events
 
 
@@ -1232,6 +1538,8 @@ def _montage_events(spec, layout, palette, typography):
     mid = palette.get("text_mid", "#404040")
     light = palette.get("text_light", "#E0E0E0")
     thickness = max(2.0, layout.height * _RULE_THICKNESS_FRACTION * 0.7)
+    body_size = max(1, round(layout.height * _BODY_SIZE_FRACTION))
+    body_font, _findings = pick_font(typography)
 
     count = len(spec.items)
     gap = layout.safe_w * 0.02
@@ -1254,8 +1562,11 @@ def _montage_events(spec, layout, palette, typography):
         events.append(_dialogue(
             "CardBody", spec.duration,
             f"{{\\an{_ASS_MIDDLE_CENTER}\\pos({px + panel_w / 2:.0f},"
-            f"{panel_y + panel_h / 2:.0f})\\c{_wrap_override(light)}}}"
-            f"{_escape_ass_text(item)}"))
+            f"{panel_y + panel_h / 2:.0f})"
+            f"\\clip({px + panel_w * 0.06:.0f},{panel_y:.0f},"
+            f"{px + panel_w * 0.94:.0f},{panel_y + panel_h:.0f})"
+            f"\\c{_wrap_override(light)}}}"
+            f"{_wrapped_ass_text(item, panel_w * 0.78, body_size, font_family=body_font)}"))
     return events
 
 
@@ -1307,6 +1618,33 @@ def card_ass(
     return "\n".join(lines) + "\n"
 
 
+def _card_frame_counts(duration: float, fps: int) -> tuple[int, int]:
+    """Return ``(authored, encoded)`` frames for one generated card."""
+
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+        raise TypeError("Card duration must be a number")
+    if not math.isfinite(float(duration)) or duration <= 0:
+        raise ValueError("Card duration must be positive and finite")
+    if isinstance(fps, bool) or not isinstance(fps, int) or fps <= 0:
+        raise ValueError("Card fps must be a positive integer")
+
+    # Keep the established nearest-frame (half-even) authored timing. The
+    # independently rounded Resolve endpoint is covered by the duplicate
+    # terminal handle, not by extending what the card author asked to show.
+    authored_frame_count = max(
+        1,
+        int(
+            (Decimal(str(duration)) * Decimal(fps)).to_integral_value(
+                rounding=ROUND_HALF_EVEN
+            )
+        ),
+    )
+    return (
+        authored_frame_count,
+        authored_frame_count + CARD_SAFE_TRAILING_FRAMES,
+    )
+
+
 def build_card(
     spec: CardSpec,
     out_path: Path,
@@ -1319,17 +1657,22 @@ def build_card(
     height: int = 1080,
     fps: int = 30,
 ) -> Path:
-    """Render one card to an MP4 spanning `spec.duration`.
+    """Render one card plus one safe terminal media-handle frame to MP4.
 
     A graded `plates.build_plate` background with `card_ass` burned onto it by
     `subtitles.burn` -- so the card carries the same grain and grade as the
     footage it cuts against, and the ASS path never reaches an ffmpeg filter
-    argument as an absolute Windows path.
+    argument as an absolute Windows path. ``spec.duration`` still owns the ASS
+    event timing; the additional encoded frame is a clone of the final authored
+    frame solely for Resolve's independently rounded source endpoint.
     """
     out_path = Path(out_path)
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    authored_frame_count, _encoded_frame_count = _card_frame_counts(
+        spec.duration, fps
+    )
 
     background = work_dir / f"{out_path.stem}-bg.mp4"
     build_plate(
@@ -1343,7 +1686,14 @@ def build_card(
     ass_path.write_text(card_ass(spec, typography, palette, width, height), encoding="utf-8")
 
     try:
-        burn(background, ass_path, out_path)
+        burn(
+            background,
+            ass_path,
+            out_path,
+            authored_frame_count=authored_frame_count,
+            safe_trailing_frames=CARD_SAFE_TRAILING_FRAMES,
+            fps=fps,
+        )
     except RuntimeError:
         if out_path.exists():
             out_path.unlink()

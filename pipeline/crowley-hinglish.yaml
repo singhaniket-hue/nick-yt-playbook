@@ -17,7 +17,7 @@
 # the deviations section for exactly where and why this file departs from it.
 
 name: crowley-hinglish
-version: "2.0"
+version: "2.1"
 description: >
   30-40 minute faceless investigative documentaries about dark-internet and
   true-crime subjects, structured and paced after the @NickCrowley format,
@@ -255,9 +255,12 @@ stages:
       acquisition. Explicit --refresh requires the complete repeated --slot
       set, quarantines replaced media, and preserves retired audit provenance.
       Target-aware browser capture fails closed on consent/challenge/blank
-      pages; retained source-video frames and portable H.264 yt-dlp downloads
-      provide deterministic alternatives. Read-only contact sheets are
-      generated with `python -m rabbithole.contactsheet` before asset approval.
+      pages. Article evidence defaults to a Chromium motion recording that
+      establishes the real page, scrolls/pushes once to the authored claim, and
+      holds it for reading; retained source-video frames and portable H.264
+      yt-dlp downloads provide deterministic alternatives. Read-only contact
+      sheets are generated with `python -m rabbithole.contactsheet` before asset
+      approval.
     required_artifacts_in:
       - timing_spine
       - slot_plan
@@ -270,6 +273,7 @@ stages:
       - ytdlp
       - archive_sources
       - target_browser_capture
+      - target_browser_recording
       - source_frame_derivation
       - contact_sheet_qa
       - plate_generator
@@ -281,6 +285,8 @@ stages:
       - Full licence string present on every archival-texture asset
       - Graphics and evidence contact sheets have no unresolved red error cards
       - Same-URL targets, source-frame timestamps/crops, and editorial caveats are visually correct
+      - Usable source pixels are retained with a small claim-specific qualifier, never replaced by a full-screen uncertainty placeholder
+      - Designed cards are sparse and do not form consecutive slide-like runs
 
   - name: edl
     cli: rabbithole edl <narration/timing.json>
@@ -289,7 +295,12 @@ stages:
       asl-fill cutaways to bring local average shot length into 2.95-3.35s,
       plus overlay instructions (rabbithole.overlays:build_overlays) for
       chapter cards, censor boxes, and keyword highlights derived from
-      [CHAPTER:]/[CENSOR:]/[KEY:] markers.
+      [CHAPTER:]/[CENSOR:]/[KEY:] markers. When authored, an approximately
+      eleven-second retained-source cold open uses source audio only when the
+      episode rights ledger explicitly permits it, otherwise a muted credited
+      excerpt and optional authored crackle precede narration. Presentation-
+      caption exclusion windows cover that cold open and every text-led visual
+      while the complete upload subtitle sidecar remains unchanged.
     required_artifacts_in:
       - timing_spine
       - slot_plan
@@ -304,6 +315,8 @@ stages:
       - No two adjacent cuts share subject AND scale
       - At most 4 distinct transition types
       - Every cut has a reason; every pinned (script-origin) cut still sits at its marker time
+      - Cold-open source audio is intact and narration/music/captions begin only after its hard cut
+      - Captions never compete with cards, quotes, documents, articles, or browser evidence
 
   - name: render
     cli: rabbithole resolve render <project-root>
@@ -339,16 +352,18 @@ stages:
         engine: davinci_resolve
         implementation: rabbithole.resolve_runner
         produces: >
-          editable V1-V4/A1-A5 track contract, subtitles, grouped provenance
-          markers, editable provenance-derived source captions, baseline grade
-          intent/application, an optional final render, and a source-inclusive
-          portable archive. Fusion/VHS placement and the complete Crowley
-          texture treatment remain human-review items.
+          editable V1-V4/A1-A5 track contract, selective
+          presentation-subtitles.srt timeline captions, complete subtitles.srt
+          upload sidecar, grouped provenance markers, editable
+          provenance-derived source captions, baseline grade intent/application,
+          an optional final render, and a source-inclusive portable archive.
+          Fusion/VHS placement and the complete Crowley texture treatment remain
+          human-review items.
     tools_available: []
     checkpoint_required: true
     human_approval_default: true
     review_focus:
       - Generated duration matches the EDL to within one frame
       - No protected EDITORIAL_vN timeline was changed
-      - Evidence, redactions, rights flags, subtitles, editable source captions, and source bites are reviewed
+      - Evidence, redactions, rights flags, presentation captions, complete subtitle sidecar, editable source captions, and source bites are reviewed
       - Output and restored archive match the target canvas and track map

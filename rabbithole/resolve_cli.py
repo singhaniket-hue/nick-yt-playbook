@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .resolve_service import (
+    approve_caption_style,
+    caption_style_approval_status,
     install_resolve_integration,
     portability_report,
     preflight_project,
@@ -132,6 +134,25 @@ def cmd_resolve_status(args: argparse.Namespace) -> int:
     return 1 if result.get("state") == "failed" else 0
 
 
+def cmd_resolve_caption_style_status(args: argparse.Namespace) -> int:
+    return _guard(
+        lambda: caption_style_approval_status(
+            args.project_root,
+            overrides_path=args.overrides,
+        )
+    )
+
+
+def cmd_resolve_approve_caption_style(args: argparse.Namespace) -> int:
+    return _guard(
+        lambda: approve_caption_style(
+            args.project_root,
+            overrides_path=args.overrides,
+            note=args.note,
+        )
+    )
+
+
 def cmd_resolve_doctor(args: argparse.Namespace) -> int:
     result = portability_report(mode=args.mode)
     _print(result)
@@ -234,6 +255,22 @@ def add_resolve_parser(subparsers: Any) -> argparse.ArgumentParser:
     status = actions.add_parser("status", help="Read durable Resolve queue/status state")
     status.add_argument("project_root")
     status.set_defaults(func=cmd_resolve_status)
+
+    caption_status = project_command(
+        "caption-style-status",
+        "Check the machine-local presentation-caption readability gate",
+    )
+    caption_status.set_defaults(func=cmd_resolve_caption_style_status)
+
+    approve_caption = project_command(
+        "approve-caption-style",
+        "Approve the built timeline's caption Track Style on this host",
+    )
+    approve_caption.add_argument(
+        "--note",
+        help="Optional visual-review note stored in the machine-local approval",
+    )
+    approve_caption.set_defaults(func=cmd_resolve_approve_caption_style)
 
     bundle = actions.add_parser(
         "bundle",

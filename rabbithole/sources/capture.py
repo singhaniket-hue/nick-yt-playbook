@@ -62,6 +62,8 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_EVEN
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
 from urllib.parse import urlsplit
@@ -157,6 +159,21 @@ BROWSER_NO_SANDBOX_ENV = "RABBITHOLE_BROWSER_NO_SANDBOX"
 # are checked against the same output budget.
 MAX_CAPTURE_DIMENSION = 16_384
 MAX_CAPTURE_PIXELS = 40_000_000
+MAX_MOTION_CAPTURE_FRAMES = 600
+# Resolve independently rounds marker endpoints to timeline frames.  A source
+# that ends exactly on the authored boundary can therefore be asked for the
+# next frame on import.  Retain one duplicate terminal frame as media handle;
+# it is not part of the authored move.
+MOTION_TRAILING_FRAMES = 1
+
+# Authored interaction may expose a tab or evidence panel, but it must never be
+# repurposed into a generic consent-wall bypass.  Selector clicks are inspected
+# by their resolved accessible label before the click is allowed.
+_FORBIDDEN_CLICK_LABEL = re.compile(
+    r"\b(?:accept(?: all)?|allow(?: all)?|agree|reject all|manage cookies?|"
+    r"cookie (?:settings|preferences)|consent)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -270,26 +287,102 @@ class ScrollTarget:
 
 
 @dataclass(frozen=True)
+class CaptureMotion:
+    """Deterministic timing for an evidence-page camera move.
+
+    The browser page itself is frozen; only the retained page-coordinate clip
+    moves.  Fractions make the same authored intent portable across slot
+    lengths and frame rates.  The remaining fraction after ``establish`` and
+    ``move`` is the final evidence hold.
+    """
+
+    establish_fraction: float = 0.22
+    move_fraction: float = 0.50
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("establish_fraction", self.establish_fraction),
+            ("move_fraction", self.move_fraction),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"Capture motion {name} must be a number")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"Capture motion {name} must be finite")
+        if not 0 <= self.establish_fraction < 1:
+            raise ValueError(
+                "Capture motion establish_fraction must be in [0, 1)"
+            )
+        if not 0 < self.move_fraction <= 1:
+            raise ValueError("Capture motion move_fraction must be in (0, 1]")
+        if self.establish_fraction + self.move_fraction > 1:
+            raise ValueError(
+                "Capture motion establish_fraction plus move_fraction cannot "
+                "exceed 1"
+            )
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "establish_fraction": float(self.establish_fraction),
+            "move_fraction": float(self.move_fraction),
+        }
+
+    @classmethod
+    def from_value(
+        cls, value: CaptureMotion | Mapping[str, Any] | bool
+    ) -> CaptureMotion:
+        if isinstance(value, cls):
+            return value
+        if value is True:
+            return cls()
+        if value is False:
+            raise ValueError("False disables motion; use no motion value instead")
+        if not isinstance(value, Mapping):
+            raise TypeError("capture motion must be true or a mapping")
+        allowed = {"establish_fraction", "move_fraction"}
+        unknown = set(value) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown capture motion field(s): {', '.join(sorted(unknown))}"
+            )
+        return cls(**value)
+
+
+@dataclass(frozen=True)
 class CaptureSpec:
-    """Serializable author intent for a browser screenshot.
+    """Serializable author intent for a browser capture.
 
     The default preserves the original one-shot viewport capture. Any
-    selector/text/scroll/full-page request switches to browser control so
-    below-fold evidence is located before pixels are retained.
+    selector/text/scroll/full-page/motion request switches to browser control
+    so below-fold evidence is located before pixels are retained. Motion is an
+    opt-in video mode and cannot be combined with a full-page raster or an
+    authored crop: its ending frame is the automatically resolved evidence
+    window.
     """
 
     full_page: bool = False
     selector: str | None = None
     text: str | None = None
+    click_selector: str | None = None
+    click_text: str | None = None
     scroll_target: ScrollTarget | None = None
     crop: CaptureCrop | None = None
+    motion: CaptureMotion | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.full_page, bool):
             raise TypeError("capture full_page must be a boolean")
-        for name, value in (("selector", self.selector), ("text", self.text)):
+        for name, value in (
+            ("selector", self.selector),
+            ("text", self.text),
+            ("click_selector", self.click_selector),
+            ("click_text", self.click_text),
+        ):
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(f"Capture {name} must be non-empty text")
+        if self.click_selector and self.click_text:
+            raise ValueError(
+                "Capture spec cannot contain both click_selector and click_text"
+            )
         if self.scroll_target is not None and not isinstance(
             self.scroll_target, ScrollTarget
         ):
@@ -298,11 +391,32 @@ class CaptureSpec:
             )
         if self.crop is not None and not isinstance(self.crop, CaptureCrop):
             object.__setattr__(self, "crop", CaptureCrop.from_value(self.crop))
+        if self.motion is False:
+            object.__setattr__(self, "motion", None)
+        elif self.motion is not None and not isinstance(self.motion, CaptureMotion):
+            object.__setattr__(
+                self, "motion", CaptureMotion.from_value(self.motion)
+            )
+        if self.motion is not None:
+            if self.full_page or self.crop is not None:
+                raise ValueError(
+                    "Capture motion cannot combine with full_page or crop"
+                )
+            if not (self.selector or self.text or self.scroll_target):
+                raise ValueError(
+                    "Capture motion requires selector, text, or scroll_target"
+                )
 
     @property
     def needs_browser_control(self) -> bool:
         return bool(
-            self.full_page or self.selector or self.text or self.scroll_target
+            self.full_page
+            or self.selector
+            or self.text
+            or self.click_selector
+            or self.click_text
+            or self.scroll_target
+            or self.motion
         )
 
     @property
@@ -336,8 +450,11 @@ class CaptureSpec:
                 "full_page": self.full_page,
                 "selector": self.selector,
                 "text": self.text,
+                "click_selector": self.click_selector,
+                "click_text": self.click_text,
                 "scroll_target": scroll,
                 "crop": crop,
+                "motion": self.motion.to_dict() if self.motion else None,
             }.items()
             if value is not None
         }
@@ -369,7 +486,16 @@ class CaptureSpec:
                     "capture spec cannot contain both crop and crop_rectangle"
                 )
             fields["crop"] = fields.pop("crop_rectangle")
-        allowed = {"full_page", "selector", "text", "scroll_target", "crop"}
+        allowed = {
+            "full_page",
+            "selector",
+            "text",
+            "click_selector",
+            "click_text",
+            "scroll_target",
+            "crop",
+            "motion",
+        }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(
@@ -379,6 +505,10 @@ class CaptureSpec:
             fields["scroll_target"] = ScrollTarget.from_value(fields["scroll_target"])
         if fields.get("crop") is not None:
             fields["crop"] = CaptureCrop.from_value(fields["crop"])
+        if fields.get("motion") is False:
+            fields["motion"] = None
+        elif fields.get("motion") is not None:
+            fields["motion"] = CaptureMotion.from_value(fields["motion"])
         return cls(**fields)
 
 
@@ -389,6 +519,21 @@ class BrowserCaptureRequest:
     spec: CaptureSpec
     width: int
     height: int
+    settle_ms: int
+    browser: Path
+
+
+@dataclass(frozen=True)
+class BrowserMotionCaptureRequest:
+    """One isolated CDP page recording into a numbered PNG sequence."""
+
+    url: str
+    frames_dir: Path
+    spec: CaptureSpec
+    width: int
+    height: int
+    duration: float
+    fps: int
     settle_ms: int
     browser: Path
 
@@ -429,6 +574,73 @@ class CaptureRectangle:
 
 
 @dataclass(frozen=True)
+class CaptureMotionFraming:
+    """Exact timing and page-coordinate trajectory retained in a recording."""
+
+    # ``frame_count`` and ``duration_seconds`` describe the physical encoded
+    # media, including its safe terminal handle. ``authored_frame_count`` is
+    # the establish/move/hold sequence requested by the slot.
+    frame_count: int
+    fps: int
+    duration_seconds: float
+    authored_frame_count: int
+    safe_trailing_frames: int
+    establish_fraction: float
+    move_fraction: float
+    easing: str
+    start_clip: CaptureRectangle
+    end_clip: CaptureRectangle
+
+    def __post_init__(self) -> None:
+        counts = {
+            "frame_count": self.frame_count,
+            "fps": self.fps,
+            "authored_frame_count": self.authored_frame_count,
+            "safe_trailing_frames": self.safe_trailing_frames,
+        }
+        for name, value in counts.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"Capture motion {name} must be a positive integer")
+        if self.safe_trailing_frames != MOTION_TRAILING_FRAMES:
+            raise ValueError(
+                f"Capture motion requires exactly {MOTION_TRAILING_FRAMES} "
+                "safe trailing frame"
+            )
+        if self.frame_count != (
+            self.authored_frame_count + self.safe_trailing_frames
+        ):
+            raise ValueError(
+                "Capture motion frame_count must include authored and safe "
+                "trailing frames"
+            )
+        expected_duration = self.frame_count / self.fps
+        if not math.isclose(
+            self.duration_seconds,
+            expected_duration,
+            rel_tol=0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "Capture motion duration_seconds must describe the complete "
+                "encoded frame sequence"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "frame_count": self.frame_count,
+            "fps": self.fps,
+            "duration_seconds": self.duration_seconds,
+            "authored_frame_count": self.authored_frame_count,
+            "safe_trailing_frames": self.safe_trailing_frames,
+            "establish_fraction": self.establish_fraction,
+            "move_fraction": self.move_fraction,
+            "easing": self.easing,
+            "start_clip": self.start_clip.to_dict(),
+            "end_clip": self.end_clip.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class CaptureFraming:
     """What browser pixels were retained and why.
 
@@ -444,10 +656,11 @@ class CaptureFraming:
     clip: CaptureRectangle | None = None
     content: CaptureRectangle | None = None
     authored_crop: CaptureCrop | None = None
+    motion: CaptureMotionFraming | None = None
 
     def to_dict(self) -> dict[str, Any]:
         crop = self.authored_crop
-        return {
+        value = {
             "mode": self.mode,
             "target": self.target.to_dict() if self.target else None,
             "clip": self.clip.to_dict() if self.clip else None,
@@ -463,6 +676,9 @@ class CaptureFraming:
                 else None
             ),
         }
+        if self.motion is not None:
+            value["motion"] = self.motion.to_dict()
+        return value
 
 
 @dataclass(frozen=True)
@@ -475,6 +691,8 @@ class BrowserCaptureResponse:
 
 TargetedCaptureOutput = str | bytes | BrowserCaptureResponse | None
 TargetedCapture = Callable[[BrowserCaptureRequest], TargetedCaptureOutput]
+MotionCaptureOutput = str | bytes | BrowserCaptureResponse | None
+MotionCapture = Callable[[BrowserMotionCaptureRequest], MotionCaptureOutput]
 
 
 def _default_runner(argv: list[str]) -> tuple[int, bytes, bytes]:
@@ -1007,6 +1225,128 @@ def _target_document_clip(
     )
 
 
+def _authored_click_expression(spec: CaptureSpec) -> str:
+    """Locate, but do not click, one explicitly authored page control."""
+
+    selector = json.dumps(spec.click_selector)
+    text = json.dumps(spec.click_text)
+    return f"""
+(() => {{
+  const __rabbitholeAuthoredClick = true;
+  const selector = {selector};
+  const textNeedle = {text};
+  const normalize = value => String(value || "").replace(/\\s+/g, " ").trim();
+  const visible = element => {{
+    if (!element || !element.getBoundingClientRect) return false;
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0 &&
+      style.visibility !== "hidden" && style.display !== "none";
+  }};
+  let found = null;
+  if (selector) {{
+    try {{
+      found = document.querySelector(selector);
+    }} catch (error) {{
+      return {{ok: false, error: `invalid click selector ${{selector}}: ${{error.message}}`}};
+    }}
+  }} else if (textNeedle) {{
+    const needle = normalize(textNeedle);
+    const candidates = [...document.querySelectorAll("button, a, [role='button'], [role='tab']")]
+      .filter(element => visible(element) &&
+        normalize(element.innerText || element.textContent ||
+          element.getAttribute("aria-label")).includes(needle));
+    candidates.sort((left, right) => {{
+      const leftExact = normalize(left.innerText || left.textContent ||
+        left.getAttribute("aria-label")) === needle ? 0 : 1;
+      const rightExact = normalize(right.innerText || right.textContent ||
+        right.getAttribute("aria-label")) === needle ? 0 : 1;
+      if (leftExact !== rightExact) return leftExact - rightExact;
+      const a = left.getBoundingClientRect();
+      const b = right.getBoundingClientRect();
+      return (a.width * a.height) - (b.width * b.height);
+    }});
+    found = candidates[0] || null;
+  }}
+  if (!found || !visible(found)) {{
+    return {{ok: false, error: "authored click target was not found or visible"}};
+  }}
+  const control = found.closest("button, a, [role='button'], [role='tab'], input") || found;
+  if (!visible(control)) {{
+    return {{ok: false, error: "authored click control was not visible"}};
+  }}
+  const label = normalize(control.getAttribute("aria-label") ||
+    control.innerText || control.textContent || control.getAttribute("title") ||
+    control.value);
+  window.__rabbitholeAuthoredClickElement = control;
+  return {{ok: true, label}};
+}})()
+""".strip()
+
+
+def _perform_authored_click(
+    session: _CdpCommands, request: BrowserCaptureRequest | BrowserMotionCaptureRequest
+) -> None:
+    """Perform one explicit interaction and fail closed on consent controls."""
+
+    spec = request.spec
+    if not (spec.click_selector or spec.click_text):
+        return
+    if spec.click_text and _FORBIDDEN_CLICK_LABEL.search(spec.click_text):
+        raise RuntimeError(
+            "Refusing authored browser interaction because it resembles a "
+            "consent control"
+        )
+    located = _evaluate(
+        session,
+        _authored_click_expression(spec),
+        purpose="authored pre-capture interaction",
+    )
+    if not isinstance(located, Mapping) or not located.get("ok"):
+        reason = (
+            located.get("error", "click target could not be resolved")
+            if isinstance(located, Mapping)
+            else "click target script returned no result"
+        )
+        raise RuntimeError(
+            f"Authored click target was not found for {request.url!r}: {reason}. "
+            "No capture retained."
+        )
+    label = str(located.get("label", "")).strip()
+    if _FORBIDDEN_CLICK_LABEL.search(label):
+        raise RuntimeError(
+            f"Refusing authored browser interaction with consent control "
+            f"{label!r}. No capture retained."
+        )
+    clicked = _evaluate(
+        session,
+        """
+(() => {
+  const element = window.__rabbitholeAuthoredClickElement;
+  if (!element || !element.isConnected || typeof element.click !== "function") {
+    return {ok: false, error: "resolved click control became unavailable"};
+  }
+  element.click();
+  delete window.__rabbitholeAuthoredClickElement;
+  return {ok: true};
+})()
+""".strip(),
+        purpose="authored pre-capture click",
+    )
+    if not isinstance(clicked, Mapping) or not clicked.get("ok"):
+        reason = (
+            clicked.get("error", "click failed")
+            if isinstance(clicked, Mapping)
+            else "click script returned no result"
+        )
+        raise RuntimeError(
+            f"Authored click failed for {request.url!r}: {reason}. "
+            "No capture retained."
+        )
+    if request.settle_ms:
+        time.sleep(request.settle_ms / 1000.0)
+
+
 def _targeting_expression(spec: CaptureSpec) -> str:
     selector = json.dumps(spec.selector)
     text = json.dumps(spec.text)
@@ -1164,6 +1504,7 @@ def _capture_loaded_page_with_cdp_session(
 ) -> BrowserCaptureResponse:
     """Resolve one authored target and retain its pixels from an open page."""
 
+    _perform_authored_click(session, request)
     targeting = _evaluate(
         session, _targeting_expression(request.spec), purpose="capture targeting"
     )
@@ -1320,6 +1661,367 @@ def _capture_page_targeted(request: BrowserCaptureRequest) -> BrowserCaptureResp
         return _capture_with_cdp_session(session, request)
 
 
+def _motion_frame_counts(duration: float, fps: int) -> tuple[int, int]:
+    """Return ``(authored, encoded)`` frame counts for one browser move."""
+
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+        raise TypeError("Browser motion duration must be a number")
+    if not math.isfinite(float(duration)) or duration <= 0:
+        raise ValueError("Browser motion duration must be positive and finite")
+    if isinstance(fps, bool) or not isinstance(fps, int) or not 1 <= fps <= 60:
+        raise ValueError("Browser motion fps must be an integer from 1 to 60")
+    # Preserve the planner's established nearest-frame contract.  In
+    # particular, an exact half frame uses Python's round-to-even semantics;
+    # growing the authored move with ceiling would leave its target frame just
+    # beyond a lower-rounded Resolve marker.  The duplicate terminal frame,
+    # rather than a longer trajectory, is the independent-rounding handle.
+    authored_frame_count = int(
+        (Decimal(str(duration)) * Decimal(fps)).to_integral_value(
+            rounding=ROUND_HALF_EVEN
+        )
+    )
+    if authored_frame_count < 3:
+        raise ValueError(
+            "Browser motion requires at least three output frames; increase "
+            "duration or fps"
+        )
+    frame_count = authored_frame_count + MOTION_TRAILING_FRAMES
+    if frame_count > MAX_MOTION_CAPTURE_FRAMES:
+        raise ValueError(
+            f"Browser motion would encode {frame_count} frames "
+            f"({authored_frame_count} authored plus "
+            f"{MOTION_TRAILING_FRAMES} safe trailing), exceeding the "
+            f"{MAX_MOTION_CAPTURE_FRAMES}-frame safety limit"
+        )
+    return authored_frame_count, frame_count
+
+
+def _viewport_document_clip(
+    content: CaptureRectangle,
+    *,
+    viewport_width: int,
+    viewport_height: int,
+    x: float,
+    y: float,
+) -> CaptureRectangle:
+    """Return one bounded viewport-aspect page clip at an authored origin."""
+
+    if viewport_width <= 0 or viewport_height <= 0:
+        raise RuntimeError(
+            f"Browser capture viewport is invalid: "
+            f"{viewport_width}x{viewport_height}"
+        )
+    aspect = viewport_width / viewport_height
+    clip_width = min(
+        float(viewport_width),
+        content.width,
+        content.height * aspect,
+    )
+    clip_height = clip_width / aspect
+    if clip_width <= 0 or clip_height <= 0:
+        raise RuntimeError("Browser returned no usable motion viewport")
+    maximum_x = content.right - clip_width
+    maximum_y = content.bottom - clip_height
+    return CaptureRectangle(
+        x=round(min(max(float(x), content.x), maximum_x), 6),
+        y=round(min(max(float(y), content.y), maximum_y), 6),
+        width=round(clip_width, 6),
+        height=round(clip_height, 6),
+    )
+
+
+def _interpolate_capture_rectangle(
+    start: CaptureRectangle,
+    end: CaptureRectangle,
+    progress: float,
+) -> CaptureRectangle:
+    return CaptureRectangle(
+        x=round(start.x + (end.x - start.x) * progress, 6),
+        y=round(start.y + (end.y - start.y) * progress, 6),
+        width=round(start.width + (end.width - start.width) * progress, 6),
+        height=round(start.height + (end.height - start.height) * progress, 6),
+    )
+
+
+def _motion_progress(
+    frame_index: int,
+    frame_count: int,
+    motion: CaptureMotion,
+) -> float:
+    position = frame_index / (frame_count - 1)
+    if position <= motion.establish_fraction:
+        return 0.0
+    move_end = motion.establish_fraction + motion.move_fraction
+    if position >= move_end:
+        return 1.0
+    linear = (position - motion.establish_fraction) / motion.move_fraction
+    # Smoothstep is deterministic and reaches zero velocity at both ends.
+    return linear * linear * (3 - 2 * linear)
+
+
+def _freeze_page_for_motion(session: _CdpCommands) -> None:
+    frozen = _evaluate(
+        session,
+        """
+(() => {
+  const __rabbitholeMotionFreeze = true;
+  let style = document.getElementById("__rabbithole-motion-freeze");
+  if (!style) {
+    style = document.createElement("style");
+    style.id = "__rabbithole-motion-freeze";
+    style.textContent = `
+      html { scroll-behavior: auto !important; }
+      #wm-ipp-base, #wm-ipp-print, #donato, .wm-ipp-base,
+      [class*="wayback-donation"], [id*="wayback-donation"] {
+        display: none !important;
+      }
+      *, *::before, *::after {
+        animation-play-state: paused !important;
+        transition-property: none !important;
+        caret-color: transparent !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+  // The archive occasionally injects a large fundraising block directly
+  // into the captured document without a stable selector.  Remove only the
+  // smallest element containing its unmistakable prompt, never article text.
+  const donationCandidates = [...document.querySelectorAll("body *")]
+    .filter((node) => {
+      const text = (node.innerText || "").replace(/\\s+/g, " ").trim();
+      return text.includes("Scroll Past This") &&
+        text.includes("The Wayback Machine is fighting");
+    })
+    .sort((a, b) => (a.innerText || "").length - (b.innerText || "").length);
+  if (donationCandidates.length) {
+    donationCandidates[0].style.setProperty("display", "none", "important");
+  }
+  for (const media of document.querySelectorAll("video, audio")) {
+    try { media.pause(); } catch (_) {}
+  }
+  return true;
+})()
+""".strip(),
+        purpose="freezing page motion",
+    )
+    if frozen is not True:
+        raise RuntimeError("Browser could not freeze page animation for recording")
+
+
+def _retain_motion_frame(
+    encoded: Any,
+    path: Path,
+    *,
+    width: int,
+    height: int,
+) -> None:
+    if not isinstance(encoded, str) or not encoded:
+        raise RuntimeError("Browser returned no PNG data for motion capture")
+    try:
+        png = base64.b64decode(encoded, validate=True)
+    except ValueError as exc:
+        raise RuntimeError("Browser returned invalid motion screenshot data") from exc
+    if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise RuntimeError("Browser motion screenshot data is not a PNG")
+
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with Image.open(BytesIO(png)) as image:
+            image.load()
+            if image.size != (width, height):
+                image = image.convert("RGB").resize(
+                    (width, height), Image.Resampling.LANCZOS
+                )
+                image.save(path, format="PNG")
+            else:
+                path.write_bytes(png)
+    except Exception as exc:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Browser returned an unreadable motion screenshot: {exc}"
+        ) from exc
+
+
+def _capture_motion_frames_with_cdp_session(
+    session: _CdpCommands,
+    request: BrowserMotionCaptureRequest,
+    *,
+    prepare_page: bool = True,
+) -> BrowserCaptureResponse:
+    """Record a frozen page along a deterministic establish-to-target move."""
+
+    motion = request.spec.motion
+    if motion is None:
+        raise ValueError("Browser motion capture requires CaptureSpec.motion")
+    authored_frame_count, frame_count = _motion_frame_counts(
+        request.duration, request.fps
+    )
+    if request.width <= 0 or request.height <= 0:
+        raise ValueError("Browser motion dimensions must be positive")
+    _validate_capture_budget(
+        CaptureRectangle(
+            x=0,
+            y=0,
+            width=float(request.width),
+            height=float(request.height),
+        ),
+        purpose="Browser motion output",
+    )
+
+    if prepare_page:
+        _prepare_cdp_page(session, request)
+    _perform_authored_click(session, request)
+    _freeze_page_for_motion(session)
+    targeting = _evaluate(
+        session,
+        _targeting_expression(request.spec),
+        purpose="motion capture targeting",
+    )
+    if not isinstance(targeting, Mapping) or not targeting.get("ok"):
+        reason = (
+            targeting.get("error", "target could not be resolved")
+            if isinstance(targeting, Mapping)
+            else "target script returned no result"
+        )
+        raise RuntimeError(
+            f"Capture target was not found for {request.url!r}: {reason}. "
+            "No recording retained."
+        )
+    if request.spec.selector or request.spec.text or request.spec.scroll_target:
+        time.sleep(0.1)
+
+    target: CaptureRectangle | None = None
+    if request.spec.selector or request.spec.text:
+        target = _capture_rectangle(
+            targeting.get("targetRect"),
+            purpose="resolved motion evidence target",
+        )
+    content = _layout_content_rectangle(session)
+    start_clip = _viewport_document_clip(
+        content,
+        viewport_width=request.width,
+        viewport_height=request.height,
+        x=content.x,
+        y=content.y,
+    )
+    if target is not None:
+        end_clip = _target_document_clip(
+            target,
+            content,
+            viewport_width=request.width,
+            viewport_height=request.height,
+        )
+    else:
+        try:
+            scroll_x = float(targeting.get("scrollX", 0))
+            scroll_y = float(targeting.get("scrollY", 0))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Browser returned invalid destination coordinates for motion "
+                "capture. No recording retained."
+            ) from exc
+        if (
+            not math.isfinite(scroll_x)
+            or not math.isfinite(scroll_y)
+            or scroll_x < 0
+            or scroll_y < 0
+        ):
+            raise RuntimeError(
+                "Browser returned invalid destination coordinates for motion "
+                "capture. No recording retained."
+            )
+        end_clip = _viewport_document_clip(
+            content,
+            viewport_width=request.width,
+            viewport_height=request.height,
+            x=scroll_x,
+            y=scroll_y,
+        )
+
+    request.frames_dir.mkdir(parents=True, exist_ok=True)
+    for frame_index in range(authored_frame_count):
+        progress = _motion_progress(
+            frame_index, authored_frame_count, motion
+        )
+        clip = _interpolate_capture_rectangle(start_clip, end_clip, progress)
+        _evaluate(
+            session,
+            (
+                "(() => { const __rabbitholeMotionFrame = true; "
+                f"window.scrollTo({clip.x:.6f}, {clip.y:.6f}); return true; }})()"
+            ),
+            purpose=f"motion frame {frame_index + 1} scroll",
+        )
+        scale = request.width / clip.width
+        screenshot = session.command(
+            "Page.captureScreenshot",
+            {
+                "format": "png",
+                "fromSurface": True,
+                "captureBeyondViewport": True,
+                "clip": {**clip.to_dict(), "scale": scale},
+            },
+        )
+        _retain_motion_frame(
+            screenshot.get("data"),
+            request.frames_dir / f"frame-{frame_index:06d}.png",
+            width=request.width,
+            height=request.height,
+        )
+
+    # Media-handle padding must be a bit-identical final hold, not another CDP
+    # sample that could capture a late-loading mutation. Resolve may request
+    # this frame when its independently rounded endpoint lands just past the
+    # authored slot boundary.
+    final_authored_frame = (
+        request.frames_dir / f"frame-{authored_frame_count - 1:06d}.png"
+    )
+    for trailing_index in range(MOTION_TRAILING_FRAMES):
+        shutil.copyfile(
+            final_authored_frame,
+            request.frames_dir
+            / f"frame-{authored_frame_count + trailing_index:06d}.png",
+        )
+
+    page_source = _evaluate(
+        session,
+        "document.documentElement ? document.documentElement.outerHTML : ''",
+        purpose="rendered DOM inspection",
+    )
+    return BrowserCaptureResponse(
+        page_source=page_source,
+        framing=CaptureFraming(
+            mode="motion-target" if target is not None else "motion-scroll",
+            target=target,
+            clip=end_clip,
+            content=content,
+            motion=CaptureMotionFraming(
+                frame_count=frame_count,
+                fps=request.fps,
+                duration_seconds=frame_count / request.fps,
+                authored_frame_count=authored_frame_count,
+                safe_trailing_frames=MOTION_TRAILING_FRAMES,
+                establish_fraction=float(motion.establish_fraction),
+                move_fraction=float(motion.move_fraction),
+                easing="smoothstep",
+                start_clip=start_clip,
+                end_clip=end_clip,
+            ),
+        ),
+    )
+
+
+def _capture_page_motion_targeted(
+    request: BrowserMotionCaptureRequest,
+) -> BrowserCaptureResponse:
+    with _chrome_devtools(
+        request.browser, width=request.width, height=request.height
+    ) as session:
+        return _capture_motion_frames_with_cdp_session(session, request)
+
+
 @contextmanager
 def shared_page_capture() -> Iterator[TargetedCapture]:
     """Yield a targeted capture callback that keeps one exact page loaded.
@@ -1341,7 +2043,9 @@ def shared_page_capture() -> Iterator[TargetedCapture]:
     loaded = False
     load_failure: Exception | None = None
 
-    def targeted(request: BrowserCaptureRequest) -> str | bytes | None:
+    def _loaded_session(
+        request: BrowserCaptureRequest | BrowserMotionCaptureRequest,
+    ) -> _CdpSession:
         nonlocal context, session, identity, loaded, load_failure
         request_identity = (
             request.url,
@@ -1375,7 +2079,25 @@ def shared_page_capture() -> Iterator[TargetedCapture]:
             # still succeeded, so keep the page for the remaining authored
             # targets rather than hitting the source again.
             loaded = True
-        return _capture_loaded_page_with_cdp_session(session, request)
+        return session
+
+    def targeted(request: BrowserCaptureRequest) -> TargetedCaptureOutput:
+        active_session = _loaded_session(request)
+        return _capture_loaded_page_with_cdp_session(active_session, request)
+
+    def motion(request: BrowserMotionCaptureRequest) -> MotionCaptureOutput:
+        active_session = _loaded_session(request)
+        return _capture_motion_frames_with_cdp_session(
+            active_session,
+            request,
+            prepare_page=False,
+        )
+
+    # ``capture_to_video`` detects this capability when the asset batch passes
+    # its ordinary targeted callback.  Existing call sites keep the same
+    # callable interface, while repeated motion targets on one article avoid
+    # relaunching and renavigating Chromium for every slot.
+    setattr(targeted, "_rabbithole_motion_capture", motion)
 
     try:
         yield targeted
@@ -1542,7 +2264,7 @@ def _target_pixel_region(
 
     target = framing.target
     clip = framing.clip
-    if framing.mode != "target" or target is None or clip is None:
+    if framing.mode not in {"target", "motion-target"} or target is None or clip is None:
         return None
 
     image_width, image_height = image_size
@@ -1862,6 +2584,20 @@ def obstruction_reason(page_source: str | bytes | None) -> str:
         raw,
         flags=re.IGNORECASE,
     ):
+        opening_tag = semantic_modal.group(0)
+        # Video platforms commonly ship dormant player dialogs in the DOM.
+        # Treating copy inside ``display: none`` panels as an active sign-in
+        # wall rejects an otherwise unobstructed channel page.  Page-level
+        # blockers above still fail closed, while explicitly hidden semantic
+        # dialogs are ignored here.
+        if re.search(
+            r"\b(?:hidden\b|aria-hidden\s*=\s*[\"']?true|"
+            r"style\s*=\s*[\"'][^\"']*(?:display\s*:\s*none|"
+            r"visibility\s*:\s*hidden))",
+            opening_tag,
+            flags=re.IGNORECASE,
+        ):
+            continue
         modal_window = raw[semantic_modal.start(): semantic_modal.end() + 2000]
         _modal_raw, modal_visible = _page_text(modal_window)
         blocking_copy = re.search(
@@ -1909,6 +2645,11 @@ def capture_page(
     out_png = Path(out_png).resolve()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     capture_spec = CaptureSpec.from_value(spec)
+    if capture_spec.motion is not None:
+        raise ValueError(
+            "capture_page cannot retain CaptureSpec.motion; use "
+            "capture_page_motion or capture_to_video"
+        )
 
     chosen = browser or find_browser()
     if chosen is None:
@@ -2209,6 +2950,222 @@ def still_to_video(
     return out_path
 
 
+def _encode_motion_frames(
+    frames_dir: Path,
+    out_path: Path,
+    *,
+    frame_count: int,
+    fps: int,
+    width: int,
+    height: int,
+    runner: Runner | None = None,
+) -> Path:
+    """Encode one exact PNG sequence as portable H.264 constant-frame-rate media."""
+
+    expected = [frames_dir / f"frame-{index:06d}.png" for index in range(frame_count)]
+    missing = [path.name for path in expected if not path.is_file() or path.stat().st_size == 0]
+    if missing:
+        preview = ", ".join(missing[:3])
+        raise RuntimeError(
+            f"Browser motion capture is missing {len(missing)} frame(s) "
+            f"({preview}). No video retained."
+        )
+    out_path = Path(out_path).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.unlink(missing_ok=True)
+    argv = [
+        "ffmpeg",
+        "-y",
+        "-v",
+        "error",
+        "-framerate",
+        str(fps),
+        "-start_number",
+        "0",
+        "-i",
+        str(frames_dir / "frame-%06d.png"),
+        "-frames:v",
+        str(frame_count),
+        "-an",
+        "-r",
+        str(fps),
+        "-fps_mode",
+        "cfr",
+        "-vf",
+        f"scale={width}:{height}:flags=lanczos,setsar=1,format=yuv420p",
+        *video_args(20),
+        "-movflags",
+        "+faststart",
+        str(out_path),
+    ]
+    active = runner or _default_runner
+    returncode, _stdout, stderr = active(argv)
+    if returncode != 0 or not out_path.is_file() or out_path.stat().st_size == 0:
+        out_path.unlink(missing_ok=True)
+        tail = (
+            stderr.decode("utf-8", errors="replace")[-600:]
+            if isinstance(stderr, bytes)
+            else str(stderr)[-600:]
+        )
+        raise RuntimeError(
+            f"ffmpeg failed encoding browser motion capture: {tail or 'no output written'}"
+        )
+    return out_path
+
+
+def capture_page_motion(
+    url: str,
+    out_path: Path,
+    duration: float,
+    work_dir: Path,
+    *,
+    width: int = CAPTURE_WIDTH,
+    height: int = CAPTURE_HEIGHT,
+    fps: int = 30,
+    settle_ms: int = DEFAULT_SETTLE_MS,
+    runner: Runner | None = None,
+    browser: Path | None = None,
+    check_blank: bool = True,
+    page_source: str | bytes | None = None,
+    check_obstructions: bool = True,
+    require_content_text: bool = False,
+    spec: CaptureSpec | Mapping[str, Any] | None = None,
+    motion_capture: MotionCapture | None = None,
+) -> CaptureResult:
+    """Record a real page establish/scroll/push using the installed browser."""
+
+    capture_spec = CaptureSpec.from_value(spec)
+    if capture_spec.motion is None:
+        raise ValueError("capture_page_motion requires CaptureSpec.motion")
+    _authored_frame_count, frame_count = _motion_frame_counts(duration, fps)
+    chosen = browser or find_browser()
+    if chosen is None:
+        raise RuntimeError(
+            "No headless-capable browser found. Install Chrome or Edge, or pass "
+            "`browser=` explicitly."
+        )
+    if runner is not None and motion_capture is None:
+        raise RuntimeError(
+            "A motion capture cannot use the injected command runner for CDP. "
+            "Pass motion_capture= for tests, or omit runner to use the installed "
+            "browser's DevTools endpoint."
+        )
+
+    out_path = Path(out_path).resolve()
+    work_dir = Path(work_dir).resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    warnings: list[str] = []
+    if not is_archived_url(url):
+        warnings.append(
+            f"{url} is a live page, not an archive snapshot. A documentary claiming "
+            f"what a page said on a date should capture the archived copy -- the live "
+            f"page may have changed since."
+        )
+
+    out_path.unlink(missing_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=f"{out_path.stem}-motion-",
+            dir=work_dir,
+            ignore_cleanup_errors=True,
+        ) as temporary:
+            frames_dir = Path(temporary)
+            request = BrowserMotionCaptureRequest(
+                url=url,
+                frames_dir=frames_dir,
+                spec=capture_spec,
+                width=width,
+                height=height,
+                duration=duration,
+                fps=fps,
+                settle_ms=settle_ms,
+                browser=chosen,
+            )
+            captured = (motion_capture or _capture_page_motion_targeted)(request)
+            if isinstance(captured, BrowserCaptureResponse):
+                browser_source = captured.page_source
+                framing = captured.framing
+            else:
+                browser_source = captured
+                framing = None
+
+            sources = [source for source in (page_source, browser_source) if source]
+            if any(isinstance(source, bytes) for source in sources):
+                combined_source: str | bytes | None = b"\n".join(
+                    source if isinstance(source, bytes) else source.encode("utf-8")
+                    for source in sources
+                )
+            else:
+                combined_source = (
+                    "\n".join(str(source) for source in sources)
+                    if sources
+                    else None
+                )
+
+            if check_obstructions:
+                reason = obstruction_reason(combined_source)
+                if reason:
+                    raise RuntimeError(
+                        f"Captured {url!r} but content QA found a {reason}. "
+                        "Not recorded; capture an unobstructed archived source instead."
+                    )
+                if require_content_text and not combined_source:
+                    raise RuntimeError(
+                        f"Captured {url!r} but final-quality content QA could not "
+                        "inspect page text or rendered DOM. Not recorded because "
+                        "frames cannot prove they are free of challenge and error pages."
+                    )
+
+            expected_frames = [
+                frames_dir / f"frame-{index:06d}.png"
+                for index in range(frame_count)
+            ]
+            missing = [
+                path.name
+                for path in expected_frames
+                if not path.is_file() or path.stat().st_size == 0
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"Browser motion capture wrote no complete frame sequence "
+                    f"({len(missing)} missing). No video retained."
+                )
+            inspection = inspect_frame(expected_frames[-1])
+            if check_blank and inspection.looks_blank:
+                targeted_text_structure = _has_targeted_text_structure(
+                    expected_frames[-1], capture_spec, framing
+                )
+                if not targeted_text_structure:
+                    raise RuntimeError(
+                        f"Captured {url!r} but the final evidence frame is blank -- "
+                        "most likely a login wall, an error page, or a render that "
+                        "never painted. No recording retained "
+                        f"(grey stddev {inspection.grey_stddev:.2f}, "
+                        f"{inspection.distinct_grey_levels} distinct levels)."
+                    )
+
+            _encode_motion_frames(
+                frames_dir,
+                out_path,
+                frame_count=frame_count,
+                fps=fps,
+                width=width,
+                height=height,
+                runner=runner,
+            )
+    except Exception:
+        out_path.unlink(missing_ok=True)
+        raise
+
+    return CaptureResult(
+        path=out_path,
+        kind="page",
+        warnings=tuple(warnings),
+        inspection=inspection,
+        framing=framing,
+    )
+
+
 def capture_to_video(
     url: str,
     out_path: Path,
@@ -2225,6 +3182,7 @@ def capture_to_video(
     quality: str = "animatic",
     spec: CaptureSpec | Mapping[str, Any] | None = None,
     targeted_capture: TargetedCapture | None = None,
+    motion_capture: MotionCapture | None = None,
 ) -> CaptureResult:
     """Capture `url` -- page or document -- as a slot-length video.
 
@@ -2283,6 +3241,32 @@ def capture_to_video(
                 inspection=result.inspection,
                 framing=result.framing,
             )
+    elif capture_spec.motion is not None:
+        # A click mutates page state and may be a toggle, so interaction shots
+        # receive an isolated page. Pure evidence targets can safely share the
+        # already loaded article through the batch callback.
+        shared_motion_capture = (
+            getattr(targeted_capture, "_rabbithole_motion_capture", None)
+            if targeted_capture is not None
+            and not (capture_spec.click_selector or capture_spec.click_text)
+            else None
+        )
+        return capture_page_motion(
+            url,
+            out_path,
+            duration,
+            work_dir,
+            width=width,
+            height=height,
+            fps=fps,
+            runner=runner,
+            browser=browser,
+            check_blank=check_blank,
+            page_source=body,
+            require_content_text=(quality == "final"),
+            spec=capture_spec,
+            motion_capture=motion_capture or shared_motion_capture,
+        )
     else:
         result = capture_page(
             url, still, width=width, height=height,

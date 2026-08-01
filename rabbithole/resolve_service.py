@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import math
 import os
+import platform
 from pathlib import Path
 import shutil
+import subprocess
 from typing import Any, Mapping
 
 from .encoding import require_filter
@@ -17,13 +21,19 @@ from .resolve_manifest import (
     write_resolve_bundle,
 )
 from .resolve_runner import (
+    _atomic_write_json,
     console_loader_command,
     enqueue_job,
     install_runner,
     read_status,
     run_pending_jobs,
 )
-from .resolve_safety import DEFAULT_LOCK_RELATIVE_PATH, is_path_within
+from .resolve_safety import (
+    DEFAULT_LOCK_RELATIVE_PATH,
+    is_path_within,
+    require_write_path,
+    utc_now,
+)
 from .resolve_platform import (
     find_resolve_application,
     host_report,
@@ -33,6 +43,13 @@ from .resolve_platform import (
 
 class ResolveServiceError(RuntimeError):
     """A high-level Resolve command is invalid or unsafe."""
+
+
+CAPTION_STYLE_APPROVAL_SCHEMA_VERSION = 1
+CAPTION_STYLE_APPROVAL_RELATIVE_DIRECTORY = (
+    Path("resolve") / "review-approvals" / "caption-style"
+)
+VIDEO_SOURCE_RANGE_TOLERANCE_SECONDS = 0.001
 
 
 def _root(path: os.PathLike[str] | str) -> Path:
@@ -59,6 +76,174 @@ def _mode(value: str | None) -> str:
     return mode
 
 
+def _caption_style_contract(plan: Mapping[str, Any]) -> dict[str, Any] | None:
+    policy = plan.get("subtitle_policy")
+    if not isinstance(policy, Mapping):
+        return None
+    style = policy.get("track_style")
+    if not isinstance(style, Mapping):
+        return None
+    return dict(style)
+
+
+def _caption_style_host() -> dict[str, str]:
+    """Return the local host identity that scopes a visual approval."""
+
+    return {
+        "system": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+        "node": platform.node(),
+    }
+
+
+def _caption_style_approval_path(root: Path, build_id: str) -> Path:
+    safe_build_id = str(build_id or "")
+    if (
+        not safe_build_id.startswith("b-")
+        or len(safe_build_id) > 80
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+            for character in safe_build_id
+        )
+    ):
+        raise ResolveServiceError(
+            f"invalid build ID for caption-style approval: {safe_build_id!r}"
+        )
+    destination = (
+        root
+        / CAPTION_STYLE_APPROVAL_RELATIVE_DIRECTORY
+        / f"{safe_build_id}.json"
+    )
+    return require_write_path(destination, (root / "resolve",))
+
+
+def _caption_style_approval_status_for_plan(
+    root: Path,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    style = _caption_style_contract(plan)
+    required = bool(style and style.get("render_approval_required"))
+    build_id = str(plan.get("build_id") or "")
+    timeline_name = str(plan.get("timeline_name") or "")
+    if not required:
+        return {
+            "required": False,
+            "approved": True,
+            "reason": "not_required",
+            "build_id": build_id or None,
+            "timeline_name": timeline_name or None,
+            "approval_path": None,
+        }
+
+    contract_sha256 = str((style or {}).get("contract_sha256") or "")
+    if len(contract_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in contract_sha256
+    ):
+        raise ResolveServiceError(
+            "compiled presentation-caption style has no valid contract checksum"
+        )
+    path = _caption_style_approval_path(root, build_id)
+    base = {
+        "required": True,
+        "approved": False,
+        "build_id": build_id,
+        "timeline_name": timeline_name,
+        "contract_sha256": contract_sha256,
+        "approval_path": os.fspath(path),
+    }
+    if not path.is_file():
+        return {**base, "reason": "approval_missing"}
+    try:
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return {**base, "reason": "approval_unreadable", "detail": str(exc)}
+    if not isinstance(document, Mapping):
+        return {**base, "reason": "approval_not_an_object"}
+    expected = {
+        "schema_version": CAPTION_STYLE_APPROVAL_SCHEMA_VERSION,
+        "build_id": build_id,
+        "timeline_name": timeline_name,
+        "contract_sha256": contract_sha256,
+        "host": _caption_style_host(),
+    }
+    mismatches = sorted(
+        key for key, value in expected.items() if document.get(key) != value
+    )
+    if mismatches:
+        return {
+            **base,
+            "reason": "approval_contract_mismatch",
+            "mismatched_fields": mismatches,
+        }
+    return {
+        **base,
+        "approved": True,
+        "reason": "approved_on_this_host",
+        "approved_at": document.get("approved_at"),
+        "note": document.get("note"),
+    }
+
+
+def caption_style_approval_status(
+    project_root: os.PathLike[str] | str,
+    *,
+    overrides_path: os.PathLike[str] | str | None = None,
+) -> dict[str, Any]:
+    """Read the machine-local readability approval for the current build."""
+
+    root = _root(project_root)
+    plan = compile_resolve_plan(
+        root,
+        overrides_path=Path(overrides_path) if overrides_path else None,
+    )
+    return _json_safe(_caption_style_approval_status_for_plan(root, plan))
+
+
+def approve_caption_style(
+    project_root: os.PathLike[str] | str,
+    *,
+    overrides_path: os.PathLike[str] | str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Record a visual Track Style check for one built timeline and host."""
+
+    root = _root(project_root)
+    plan = compile_resolve_plan(
+        root,
+        overrides_path=Path(overrides_path) if overrides_path else None,
+    )
+    approval = _caption_style_approval_status_for_plan(root, plan)
+    if not approval["required"]:
+        return _json_safe(approval)
+
+    status = read_status(root)
+    if (
+        status.get("state") != "succeeded"
+        or status.get("detail") != "build_succeeded"
+        or status.get("timeline_name") != plan.get("timeline_name")
+    ):
+        raise ResolveServiceError(
+            "caption style can be approved only after this exact AUTO_BUILD "
+            "timeline succeeds in Resolve"
+        )
+    style = _caption_style_contract(plan)
+    assert style is not None  # required=True above proves the contract exists.
+    path = _caption_style_approval_path(root, str(plan["build_id"]))
+    payload = {
+        "schema_version": CAPTION_STYLE_APPROVAL_SCHEMA_VERSION,
+        "build_id": str(plan["build_id"]),
+        "timeline_name": str(plan["timeline_name"]),
+        "contract_sha256": str(style["contract_sha256"]),
+        "host": _caption_style_host(),
+        "approved_at": utc_now(),
+        "approved_by_user": True,
+        "note": str(note).strip() if note else None,
+    }
+    _atomic_write_json(path, payload)
+    return _json_safe(_caption_style_approval_status_for_plan(root, plan))
+
+
 def _resolve_installation() -> dict[str, Any]:
     host = host_report()
     executable = find_resolve_application()
@@ -73,6 +258,181 @@ def _resolve_installation() -> dict[str, Any]:
         or host["resolve_script_library"],
         "script_module": host["resolve_script_module"],
     }
+
+
+def _audit_video_source_ranges(
+    root: Path,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify every requested source range fits inside its video file.
+
+    Resolve may accept a timeline whose final source frame is unavailable and
+    then expose the problem only during playback or render.  Probe each unique
+    video once and fail closed before a job reaches Resolve.  A one-millisecond
+    tolerance accommodates MP4 timescale rounding without masking a missing
+    authored frame.
+    """
+
+    try:
+        fps = int(plan.get("fps", 0))
+    except (TypeError, ValueError):
+        fps = 0
+    clips = [
+        clip
+        for clip in plan.get("clips", [])
+        if isinstance(clip, Mapping)
+        and clip.get("media_type") == "video"
+        and clip.get("media_path")
+    ]
+    base = {
+        "ok": True,
+        "clip_count": len(clips),
+        "unique_media_count": 0,
+        "tolerance_seconds": VIDEO_SOURCE_RANGE_TOLERANCE_SECONDS,
+        "probe_failures": [],
+        "shortages": [],
+    }
+    if not clips:
+        return base
+    if fps <= 0:
+        return {
+            **base,
+            "ok": False,
+            "probe_failures": [
+                {
+                    "media_path": None,
+                    "detail": "compiled plan has no positive fps",
+                }
+            ],
+        }
+
+    requirements: dict[str, dict[str, Any]] = {}
+    for clip in clips:
+        portable_path = os.fspath(clip["media_path"])
+        try:
+            source_end_frame = int(clip.get("source_end_frame", 0))
+        except (TypeError, ValueError):
+            source_end_frame = 0
+        current = requirements.setdefault(
+            portable_path,
+            {
+                "required_end_frame": 0,
+                "clip_ids": [],
+            },
+        )
+        current["required_end_frame"] = max(
+            int(current["required_end_frame"]), source_end_frame
+        )
+        current["clip_ids"].append(str(clip.get("id") or clip.get("slot_id") or ""))
+    base["unique_media_count"] = len(requirements)
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        base["ok"] = False
+        base["probe_failures"].append(
+            {"media_path": None, "detail": "ffprobe is not available on PATH"}
+        )
+        return base
+
+    durations: dict[str, float] = {}
+    for portable_path in sorted(requirements):
+        source = Path(portable_path).expanduser()
+        if not source.is_absolute():
+            source = root / source
+        source = source.resolve()
+        try:
+            completed = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=duration,nb_frames,avg_frame_rate",
+                    "-of",
+                    "json",
+                    os.fspath(source),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            base["probe_failures"].append(
+                {"media_path": portable_path, "detail": str(exc)}
+            )
+            continue
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or "ffprobe returned no duration"
+            base["probe_failures"].append(
+                {"media_path": portable_path, "detail": detail}
+            )
+            continue
+        try:
+            document = json.loads(completed.stdout)
+            stream = document["streams"][0]
+            if not isinstance(stream, Mapping):
+                raise TypeError("first video stream is not an object")
+            candidates: list[float] = []
+            raw_duration = stream.get("duration")
+            if raw_duration not in (None, "", "N/A"):
+                candidates.append(float(raw_duration))
+            raw_frames = stream.get("nb_frames")
+            raw_rate = str(stream.get("avg_frame_rate") or "")
+            if raw_frames not in (None, "", "N/A") and "/" in raw_rate:
+                numerator_text, denominator_text = raw_rate.split("/", 1)
+                numerator = int(numerator_text)
+                denominator = int(denominator_text)
+                if numerator > 0 and denominator > 0:
+                    candidates.append(
+                        int(raw_frames) * denominator / numerator
+                    )
+            if not candidates or any(
+                not math.isfinite(value) or value < 0 for value in candidates
+            ):
+                raise ValueError("video stream has no finite non-negative duration")
+            duration = min(candidates)
+        except (
+            IndexError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            base["probe_failures"].append(
+                {
+                    "media_path": portable_path,
+                    "detail": f"invalid ffprobe video-stream duration: {exc}",
+                }
+            )
+            continue
+        durations[portable_path] = duration
+
+    for portable_path, requirement in requirements.items():
+        if portable_path not in durations:
+            continue
+        required_end_frame = int(requirement["required_end_frame"])
+        required_seconds = required_end_frame / fps
+        duration = durations[portable_path]
+        shortage = required_seconds - duration
+        if shortage > VIDEO_SOURCE_RANGE_TOLERANCE_SECONDS:
+            base["shortages"].append(
+                {
+                    "media_path": portable_path,
+                    "required_end_frame": required_end_frame,
+                    "required_seconds": required_seconds,
+                    "available_seconds": duration,
+                    "shortage_seconds": shortage,
+                    "clip_ids": requirement["clip_ids"],
+                }
+            )
+
+    base["ok"] = not base["probe_failures"] and not base["shortages"]
+    return base
 
 
 def portability_report(*, mode: str = "free") -> dict[str, Any]:
@@ -313,6 +673,16 @@ def preflight_project(
             }
         )
         plan_summary = checks[-1]["detail"]
+        source_ranges = _audit_video_source_ranges(root, plan)
+        checks.append(
+            {
+                "name": "video_source_ranges",
+                "ok": bool(source_ranges["ok"]),
+                "severity": "error",
+                "detail": source_ranges,
+            }
+        )
+        plan_summary["source_range_audit"] = source_ranges
 
     return {
         "ok": all(item["ok"] or item["severity"] != "error" for item in checks),
@@ -350,6 +720,14 @@ def prepare_project(
     )
     response = dict(result)
     plan = response.pop("plan")
+    source_ranges = _audit_video_source_ranges(root, plan)
+    if not source_ranges["ok"]:
+        raise ResolveServiceError(
+            "Resolve bundle has unavailable video source frames; run "
+            "`rabbithole resolve preflight` and repair the reported media "
+            "before queuing a build."
+        )
+    caption_style = _caption_style_approval_status_for_plan(root, plan)
     response["summary"] = {
         "duration_frames": plan.get("duration_frames"),
         "cuts": len(plan.get("clips", [])),
@@ -362,6 +740,8 @@ def prepare_project(
             for flag in plan.get("review_flags", [])
             if flag.get("severity") == "error"
         ),
+        "source_range_audit": source_ranges,
+        "caption_style": caption_style,
     }
     if audio_stems is not None:
         stem_findings = list(audio_stems["manifest"].get("findings", []))
@@ -400,6 +780,21 @@ def queue_project_action(
             f"Resolve job not queued: the compiled plan has {blocking_reviews} "
             "blocking review flag(s). Run `rabbithole resolve preflight`, fix "
             "the reported media/evidence errors, and prepare again."
+        )
+    caption_style = (
+        summary.get("caption_style") if isinstance(summary, Mapping) else None
+    )
+    if (
+        action == "render"
+        and isinstance(caption_style, Mapping)
+        and caption_style.get("required")
+        and not caption_style.get("approved")
+    ):
+        raise ResolveServiceError(
+            "Resolve render not queued: verify PRESENTATION_SUBTITLES Track "
+            "Style uses white text on a black background at 65% or greater "
+            "opacity, then run `rabbithole resolve approve-caption-style` "
+            "for this project on this machine."
         )
     job_options = dict(options or {})
     job_options["mode"] = selected_mode
@@ -453,6 +848,8 @@ def install_resolve_integration(
 
 __all__ = [
     "ResolveServiceError",
+    "approve_caption_style",
+    "caption_style_approval_status",
     "install_resolve_integration",
     "preflight_project",
     "prepare_project",

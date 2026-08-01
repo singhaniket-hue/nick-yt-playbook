@@ -239,6 +239,45 @@ def test_burn_names_the_ass_filename_option_explicitly(tmp_path, monkeypatch):
     assert observed["cwd"] == tmp_path.resolve()
 
 
+def test_burn_exact_frame_contract_trims_then_clones_the_terminal_frame(
+    tmp_path, monkeypatch
+):
+    video = tmp_path / "card-background.mp4"
+    ass_path = tmp_path / "card.ass"
+    output = tmp_path / "card.mp4"
+    video.write_bytes(b"mock video")
+    ass_path.write_text("[Script Info]\n", encoding="utf-8")
+    observed = {}
+
+    monkeypatch.setattr(subtitles, "require_filter", lambda _name: "ffmpeg")
+
+    def fake_run(args, cwd=None):
+        observed["args"] = args
+        observed["cwd"] = cwd
+
+    monkeypatch.setattr(subtitles, "_run", fake_run)
+
+    assert burn(
+        video,
+        ass_path,
+        output,
+        authored_frame_count=88,
+        safe_trailing_frames=1,
+        fps=30,
+    ) == output.resolve()
+
+    args = observed["args"]
+    assert args[args.index("-vf") + 1] == (
+        "ass=filename=card.ass,trim=end_frame=88,"
+        "tpad=stop_mode=clone:stop=1"
+    )
+    assert args[args.index("-r") + 1] == "30"
+    assert args[args.index("-fps_mode") + 1] == "cfr"
+    assert args[args.index("-frames:v") + 1] == "89"
+    assert args[args.index("-pix_fmt") + 1] == "yuv420p"
+    assert observed["cwd"] == tmp_path.resolve()
+
+
 def test_burn_checks_for_libass_before_starting_encode(tmp_path, monkeypatch):
     video = tmp_path / "video.mp4"
     ass_path = tmp_path / "subs.ass"

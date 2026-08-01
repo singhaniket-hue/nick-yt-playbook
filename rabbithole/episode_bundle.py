@@ -1,8 +1,10 @@
 """Portable, deterministic episode bundles for pre-Resolve project transfer.
 
-This module deliberately performs no Resolve, network, or process operations.
-It packages only project-local inputs and rejects machine-specific metadata so
-that a restored episode has the same relative paths on Windows and macOS.
+This module deliberately performs no Resolve or network operations.  It
+packages only project-local inputs and rejects machine-specific metadata so
+that a restored episode has the same relative paths on Windows and macOS.  A
+small, non-interactive Git probe records the repository contract when the
+episode lives inside a checkout; it never mutates the repository.
 """
 
 from __future__ import annotations
@@ -16,13 +18,15 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 from typing import Any, Callable
 import unicodedata
 import zipfile
 
 
-BUNDLE_SCHEMA_VERSION = "rabbithole-episode-bundle.v1"
+BUNDLE_SCHEMA_VERSION = "rabbithole-episode-bundle.v2"
+REPOSITORY_CONTRACT_SCHEMA_VERSION = "rabbithole-repository-contract.v1"
 ARCHIVE_ROOT = "project"
 METADATA_DIRECTORY = ".rabbithole-bundle"
 MANIFEST_PATH = f"{METADATA_DIRECTORY}/manifest.json"
@@ -31,6 +35,7 @@ README_PATH = f"{METADATA_DIRECTORY}/README.txt"
 
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_OBJECT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _URI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _WINDOWS_FORBIDDEN_RE = re.compile(r'[<>:"\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED_NAMES = frozenset(
@@ -41,6 +46,8 @@ _WINDOWS_RESERVED_NAMES = frozenset(
 _EXCLUDED_DIRECTORY_NAMES = frozenset(
     {
         ".cache",
+        ".capturework",
+        ".cardwork",
         ".git",
         ".hg",
         ".mypy_cache",
@@ -75,6 +82,7 @@ _RESOLVE_GENERATED_DIRECTORIES = frozenset(
         "caches",
         "handoffs",
         "queue",
+        "review-approvals",
         "renders",
     }
 )
@@ -149,6 +157,235 @@ def _is_within(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _run_git(cwd: Path, *arguments: str) -> bytes | None:
+    """Run one read-only Git query without inheriting repository redirects.
+
+    Git worktree discovery is optional bundle metadata.  Missing Git, dubious
+    ownership, an invalid checkout, and a bounded timeout therefore return
+    ``None`` instead of making an otherwise portable episode unpackageable.
+    The environment cleanup prevents caller-provided ``GIT_DIR``/
+    ``GIT_WORK_TREE`` values from redirecting the probe to another checkout;
+    disabling fsmonitor also prevents ``git status`` from launching a
+    repository-configured monitor executable.
+    """
+
+    environment = os.environ.copy()
+    for name in (
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    ):
+        environment.pop(name, None)
+    for name in list(environment):
+        if name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            environment.pop(name, None)
+    environment.update(
+        {
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=",
+                "-C",
+                os.fspath(cwd),
+                *arguments,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _unavailable_repository_contract() -> dict[str, Any]:
+    return {
+        "available": False,
+        "head_commit": None,
+        "project_path": None,
+        "reproducible": False,
+        "reproducible_revision": None,
+        "schema_version": REPOSITORY_CONTRACT_SCHEMA_VERSION,
+        "vcs": None,
+        "worktree_state": "unavailable",
+    }
+
+
+def _discover_repository_contract(project_root: Path) -> dict[str, Any]:
+    """Describe the checkout containing ``project_root`` without mutating it.
+
+    A dirty checkout deliberately records its HEAD only as context.  The
+    ``reproducible_revision`` field remains null so downstream tools cannot
+    silently present that commit as the generator state that made the bundle.
+    """
+
+    top_level_output = _run_git(project_root, "rev-parse", "--show-toplevel")
+    if top_level_output is None:
+        return _unavailable_repository_contract()
+    try:
+        top_level_text = top_level_output.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return _unavailable_repository_contract()
+    if not top_level_text:
+        return _unavailable_repository_contract()
+    repository_root = Path(top_level_text).resolve(strict=False)
+    if not repository_root.is_dir() or not _is_within(project_root, repository_root):
+        return _unavailable_repository_contract()
+
+    relative_project = project_root.relative_to(repository_root).as_posix()
+    project_path = (
+        "."
+        if relative_project == "."
+        else _validate_portable_relative(
+            relative_project,
+            label="repository-relative project path",
+        )
+    )
+    head_output = _run_git(repository_root, "rev-parse", "--verify", "HEAD")
+    head_commit: str | None = None
+    if head_output is not None:
+        try:
+            candidate = head_output.decode("ascii").strip().casefold()
+        except UnicodeDecodeError:
+            candidate = ""
+        if _GIT_OBJECT_RE.fullmatch(candidate):
+            head_commit = candidate
+
+    status_output = _run_git(
+        repository_root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=normal",
+        "--ignore-submodules=none",
+    )
+    if head_commit is None:
+        worktree_state = "unborn"
+    elif status_output is None:
+        worktree_state = "unknown"
+    elif status_output:
+        worktree_state = "dirty"
+    else:
+        worktree_state = "clean"
+    reproducible = worktree_state == "clean"
+    return {
+        "available": True,
+        "head_commit": head_commit,
+        "project_path": project_path,
+        "reproducible": reproducible,
+        "reproducible_revision": head_commit if reproducible else None,
+        "schema_version": REPOSITORY_CONTRACT_SCHEMA_VERSION,
+        "vcs": "git",
+        "worktree_state": worktree_state,
+    }
+
+
+def _validate_repository_contract(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise EpisodeBundleValidationError(
+            "bundle manifest has no repository contract"
+        )
+    expected_keys = {
+        "available",
+        "head_commit",
+        "project_path",
+        "reproducible",
+        "reproducible_revision",
+        "schema_version",
+        "vcs",
+        "worktree_state",
+    }
+    if set(value) != expected_keys:
+        raise EpisodeBundleValidationError(
+            "bundle repository contract has unexpected or missing fields"
+        )
+    if value.get("schema_version") != REPOSITORY_CONTRACT_SCHEMA_VERSION:
+        raise EpisodeBundleValidationError(
+            "bundle repository contract has an unsupported schema_version"
+        )
+    available = value.get("available")
+    reproducible = value.get("reproducible")
+    if not isinstance(available, bool) or not isinstance(reproducible, bool):
+        raise EpisodeBundleValidationError(
+            "bundle repository contract flags must be booleans"
+        )
+    vcs = value.get("vcs")
+    state = value.get("worktree_state")
+    head = value.get("head_commit")
+    revision = value.get("reproducible_revision")
+    project_path = value.get("project_path")
+    if available:
+        if vcs != "git" or state not in {"clean", "dirty", "unknown", "unborn"}:
+            raise EpisodeBundleValidationError(
+                "bundle repository contract has invalid Git state"
+            )
+        if not isinstance(project_path, str):
+            raise EpisodeBundleValidationError(
+                "bundle repository contract has no project_path"
+            )
+        if project_path != ".":
+            _validate_portable_relative(
+                project_path,
+                label="bundle repository project_path",
+            )
+        if head is not None and (
+            not isinstance(head, str) or not _GIT_OBJECT_RE.fullmatch(head)
+        ):
+            raise EpisodeBundleValidationError(
+                "bundle repository contract has an invalid head_commit"
+            )
+        if state == "unborn" and head is not None:
+            raise EpisodeBundleValidationError(
+                "an unborn repository contract cannot have a head_commit"
+            )
+        if state != "unborn" and head is None:
+            raise EpisodeBundleValidationError(
+                "bundle repository contract Git state requires a head_commit"
+            )
+    else:
+        if (
+            vcs is not None
+            or state != "unavailable"
+            or head is not None
+            or project_path is not None
+        ):
+            raise EpisodeBundleValidationError(
+                "unavailable repository contract contains Git metadata"
+            )
+    if reproducible:
+        if not available or state != "clean" or revision != head:
+            raise EpisodeBundleValidationError(
+                "reproducible repository contract must name its clean HEAD"
+            )
+    elif revision is not None:
+        raise EpisodeBundleValidationError(
+            "non-reproducible repository contract must not claim a revision"
+        )
+    elif available and state == "clean":
+        raise EpisodeBundleValidationError(
+            "clean repository contract must claim its reproducible revision"
+        )
+    return dict(value)
 
 
 def _sha256_file(path: Path) -> str:
@@ -889,7 +1126,27 @@ def _collect_sources(root: Path) -> tuple[list[_SourceFile], list[str]]:
     return sources, directories
 
 
-def _readme_bytes() -> bytes:
+def _readme_bytes(repository_contract: dict[str, Any]) -> bytes:
+    if repository_contract["reproducible"]:
+        repository_note = (
+            "Repository contract: clean Git revision\n"
+            f"{repository_contract['reproducible_revision']}. Check out that exact\n"
+            "revision on the destination computer before running prepare.\n"
+        )
+    elif repository_contract["available"]:
+        head = repository_contract["head_commit"] or "no committed HEAD"
+        repository_note = (
+            "WARNING: the source Git worktree was not clean and reproducible.\n"
+            f"Recorded HEAD {head} is context only; it does NOT reproduce the\n"
+            "repository code that created this bundle. Commit or stash repository\n"
+            "changes and create a new bundle for a reproducible editor transfer.\n"
+        )
+    else:
+        repository_note = (
+            "WARNING: no containing Git checkout was available. This bundle has no\n"
+            "reproducible repository revision; supply and verify the matching\n"
+            "RabbitHole repository separately before running prepare.\n"
+        )
     return (
         "RabbitHole portable pre-Resolve episode bundle\n"
         "\n"
@@ -898,8 +1155,12 @@ def _readme_bytes() -> bytes:
         "non-existent project directory; never merge it over another project.\n"
         "\n"
         "Intentionally excluded: .env secrets, renders, handoffs, caches, and\n"
-        "generated Resolve build/queue/lock state. Recreate machine-local secrets\n"
-        "and Resolve state on the destination computer.\n"
+        "generated Resolve build/queue/lock/review state. Transient .cardwork and\n"
+        ".capturework directories are also excluded; packaging fails if included\n"
+        "metadata references an input there. Recreate machine-local secrets and\n"
+        "Resolve state on the destination computer.\n"
+        "\n"
+        + repository_note
     ).encode("utf-8")
 
 
@@ -907,6 +1168,7 @@ def _manifest_bytes(
     project_name: str,
     sources: list[_SourceFile],
     directories: list[str],
+    repository_contract: dict[str, Any],
 ) -> bytes:
     manifest = {
         "archive_root": ARCHIVE_ROOT,
@@ -917,6 +1179,7 @@ def _manifest_bytes(
             "handoffs": True,
             "renders": True,
             "resolve_generated_state": True,
+            "transient_asset_workdirs": True,
         },
         "files": [
             {
@@ -927,6 +1190,7 @@ def _manifest_bytes(
             for source in sources
         ],
         "project_name": project_name,
+        "repository_contract": repository_contract,
         "schema_version": BUNDLE_SCHEMA_VERSION,
     }
     return (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -1006,9 +1270,21 @@ def package_episode(
             f"episode bundle parent is not a directory: {output.parent}"
         )
 
+    repository_contract = _discover_repository_contract(root)
     sources, directories = _collect_sources(root)
-    manifest_bytes = _manifest_bytes(root.name, sources, directories)
-    readme_bytes = _readme_bytes()
+    confirmed_contract = _discover_repository_contract(root)
+    if repository_contract != confirmed_contract:
+        raise EpisodeBundleValidationError(
+            "repository HEAD or worktree state changed while the episode was "
+            "being packaged"
+        )
+    manifest_bytes = _manifest_bytes(
+        root.name,
+        sources,
+        directories,
+        repository_contract,
+    )
+    readme_bytes = _readme_bytes(repository_contract)
     checksums_bytes = _checksum_bytes(sources, manifest_bytes, readme_bytes)
 
     directory_members = {
@@ -1171,6 +1447,7 @@ def _manifest_records(
         raise EpisodeBundleValidationError(
             "bundle manifest has an invalid project name"
         )
+    _validate_repository_contract(manifest.get("repository_contract"))
     files = manifest.get("files")
     directories = manifest.get("directories")
     if not isinstance(files, list) or not isinstance(directories, list):
@@ -1397,6 +1674,18 @@ def validate_episode_bundle(
                 f"bundle manifest is invalid JSON: {exc}"
             ) from exc
         project_name, file_records, directories = _manifest_records(manifest)
+        repository_contract = _validate_repository_contract(
+            manifest.get("repository_contract")
+        )
+        readme = _read_small_member(
+            archive,
+            infos[readme_member],
+            label="bundle README",
+        )
+        if readme != _readme_bytes(repository_contract):
+            raise EpisodeBundleValidationError(
+                "bundle README does not match its repository contract"
+            )
         checksums = _parse_checksums(
             _read_small_member(
                 archive, infos[checksums_member], label="bundle checksums"
@@ -1470,6 +1759,7 @@ def validate_episode_bundle(
         "valid": True,
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "project_name": project_name,
+        "repository_contract": repository_contract,
         "file_count": len(file_records),
         "directory_count": len(directories),
         "source_bytes": total_bytes,
@@ -1498,6 +1788,63 @@ def _validate_restore_destination(
             f"restore parent is not a directory: {target.parent}"
         )
     return target
+
+
+def _verify_restore_repository_contract(
+    expected: dict[str, Any],
+    target: Path,
+) -> dict[str, Any]:
+    """Verify an exact clean revision when restore occurs inside a checkout.
+
+    A bundle can be restored next to, rather than inside, a Git checkout, so an
+    unavailable destination repository is reported instead of rejected.  When
+    a destination checkout *is* discoverable, however, accepting a mismatched
+    or dirty tree would falsely imply that the recorded contract was honored;
+    those cases fail before any archive member is extracted.
+    """
+
+    expected = _validate_repository_contract(expected)
+    expected_revision = expected["reproducible_revision"]
+    if not expected["available"]:
+        return {
+            "expected_revision": None,
+            "observed_revision": None,
+            "reproducible": False,
+            "status": "source_repository_unavailable",
+        }
+    if not expected["reproducible"]:
+        return {
+            "expected_revision": None,
+            "observed_revision": None,
+            "reproducible": False,
+            "status": "source_worktree_not_reproducible",
+        }
+
+    observed = _discover_repository_contract(target.parent)
+    if not observed["available"]:
+        return {
+            "expected_revision": expected_revision,
+            "observed_revision": None,
+            "reproducible": False,
+            "status": "destination_repository_unavailable",
+        }
+    if not observed["reproducible"]:
+        raise EpisodeBundleValidationError(
+            "destination Git worktree is not clean; cannot verify the bundle's "
+            "repository revision"
+        )
+    if observed["reproducible_revision"] != expected_revision:
+        raise EpisodeBundleValidationError(
+            "destination Git revision does not match the bundle repository "
+            f"contract: expected {expected_revision}, observed "
+            f"{observed['reproducible_revision']}"
+        )
+    return {
+        "expected_revision": expected_revision,
+        "observed_revision": observed["reproducible_revision"],
+        "reproducible": True,
+        "status": "verified",
+    }
 
 
 def _extract_member(
@@ -1540,6 +1887,10 @@ def restore_episode_bundle(
     validation = validate_episode_bundle(bundle)
     source = _canonical(bundle)
     target = _validate_restore_destination(destination)
+    repository_verification = _verify_restore_repository_contract(
+        validation["repository_contract"],
+        target,
+    )
     staging = Path(
         tempfile.mkdtemp(prefix=f".{target.name}.restore-", dir=target.parent)
     )
@@ -1613,6 +1964,7 @@ def restore_episode_bundle(
     return {
         **validation,
         "action": "restore_episode_bundle",
+        "repository_verification": repository_verification,
         "restored_path": os.fspath(target),
     }
 
@@ -1626,6 +1978,7 @@ __all__ = [
     "MANIFEST_PATH",
     "METADATA_DIRECTORY",
     "README_PATH",
+    "REPOSITORY_CONTRACT_SCHEMA_VERSION",
     "UnsafeEpisodeDestinationError",
     "package_episode",
     "restore_episode_bundle",

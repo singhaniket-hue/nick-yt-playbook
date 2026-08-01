@@ -921,19 +921,29 @@ def timeline_import_path(
 def subtitle_import_path(
     plan: Mapping[str, Any], plan_path: Path, project_root: Path
 ) -> Path:
-    """Resolve the compiler's deterministic SRT sidecar inside the project."""
+    """Resolve the deterministic presentation SRT inside the project.
+
+    New compiler plans keep ``subtitles.srt`` complete for upload and point
+    Resolve at a selective ``presentation_subtitles`` artifact.  Older plans
+    expose only ``subtitles`` and retain their original behavior.
+    """
 
     output_paths = plan.get("output_paths")
     if not isinstance(output_paths, Mapping):
         raise ResolveExecutionError("Resolve plan has no output_paths object")
-    raw = output_paths.get("subtitles")
+    field = (
+        "presentation_subtitles"
+        if output_paths.get("presentation_subtitles")
+        else "subtitles"
+    )
+    raw = output_paths.get(field)
     if not isinstance(raw, str) or not raw:
         raise ResolveExecutionError(
             "Resolve plan has no subtitle SRT fallback path"
         )
     value = Path(raw).expanduser()
     if not value.is_absolute():
-        path_kind = output_paths.get("subtitles_path_kind")
+        path_kind = output_paths.get(f"{field}_path_kind")
         plan_relative = (plan_path.parent / value).resolve(strict=False)
         project_relative = (project_root / value).resolve(strict=False)
         if path_kind == "project-relative" or project_relative.exists():
@@ -1002,9 +1012,14 @@ def _plan_subtitles_sha256(plan: Mapping[str, Any]) -> str:
     output_paths = plan.get("output_paths")
     if not isinstance(output_paths, Mapping):
         raise QueueError("Resolve plan has no output_paths object")
+    field = (
+        "presentation_subtitles_sha256"
+        if output_paths.get("presentation_subtitles")
+        else "subtitles_sha256"
+    )
     return _validated_sha256(
-        output_paths.get("subtitles_sha256"),
-        label="Resolve plan output_paths.subtitles_sha256",
+        output_paths.get(field),
+        label=f"Resolve plan output_paths.{field}",
     )
 
 
@@ -1207,7 +1222,10 @@ def _validate_queued_inputs(
         )
 
     output_paths = plan.get("output_paths")
-    if isinstance(output_paths, Mapping) and output_paths.get("subtitles"):
+    if isinstance(output_paths, Mapping) and (
+        output_paths.get("presentation_subtitles")
+        or output_paths.get("subtitles")
+    ):
         try:
             subtitles = subtitle_import_path(plan, plan_path, project_root)
         except ResolveExecutionError as exc:
@@ -1947,10 +1965,18 @@ def _ensure_and_name_tracks(timeline: Any, plan: Mapping[str, Any]) -> None:
         added = _call_required(timeline, "AddTrack", "subtitle")
         if added is not True:
             raise ResolveExecutionError("AddTrack('subtitle') did not succeed")
-    named = _call_required(timeline, "SetTrackName", "subtitle", 1, "SUBTITLES")
+    subtitle_policy = plan.get("subtitle_policy")
+    track_name = (
+        subtitle_policy.get("timeline_track_name")
+        if isinstance(subtitle_policy, Mapping)
+        else None
+    )
+    if not isinstance(track_name, str) or not track_name.strip():
+        track_name = "SUBTITLES"
+    named = _call_required(timeline, "SetTrackName", "subtitle", 1, track_name)
     if named is not True:
         raise ResolveExecutionError(
-            "SetTrackName('subtitle', 1, 'SUBTITLES') did not succeed"
+            f"SetTrackName('subtitle', 1, {track_name!r}) did not succeed"
         )
 
 

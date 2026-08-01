@@ -46,12 +46,21 @@ Use `scripts/bootstrap.ps1` on Windows or `scripts/bootstrap.sh` on macOS.
 render queue. Set `RABBITHOLE_RESOLVE_PATH` or `RABBITHOLE_BROWSER_PATH` only
 for a nonstandard application location.
 
+Both scripts prefer `uv`. When it is unavailable, they build a complete pip
+`.venv` and print a direct command prefix that also exposes the environment's
+console scripts to child processes. Use that printed prefix in place of
+`uv run rabbithole` throughout this guide (and its PATH prefix plus the same
+Python executable in place of `uv run python`); the fallback does not pretend
+that it installed a machine-global `uv`.
+
 On macOS, Homebrew's regular FFmpeg 8 formula omits libass. Install and select
 the full keg before running the pipeline:
 
 ```bash
 brew install ffmpeg-full poppler
 export PATH="$(brew --prefix ffmpeg-full)/bin:$PATH"
+# End-to-end acquisition only; skip if Chrome or Edge is already installed.
+brew install --cask google-chrome
 ```
 
 ## Project contract
@@ -170,7 +179,8 @@ The build contains:
 - A4 a full-length SFX stem with cue timing, category levels, and
   silence-drop ramps already baked
 - A5 room tone and utility audio
-- editable subtitle and source-caption intent
+- selective editable presentation captions and source-caption intent
+- a complete `subtitles.srt` upload sidecar outside the presentation track
 - provenance and review markers with machine-readable custom data
 
 FCPXML carries deterministic cuts, simple framing transforms, supported
@@ -193,10 +203,31 @@ at their intended positions, and then names and validates A1-A5. Unexpected
 audio layouts still fail closed before save or render.
 
 Resolve 21 can ignore valid FCPXML `caption` elements. `resolve prepare`
-therefore emits a checksum-pinned `subtitles.srt` beside the FCPXML. The runner
-keeps a complete native caption import, appends the SRT only when the imported
-subtitle count is exactly zero, and refuses a partial count to prevent
-duplicates. The resulting cues remain editable on the subtitle track.
+therefore emits two checksum-pinned artifacts beside the FCPXML:
+`subtitles.srt` is the complete upload/accessibility sidecar, while
+`presentation-subtitles.srt` removes every cue overlapping the source-led cold
+open or a text-led visual such as a card, quote, document, article, or browser
+recording. The runner imports only the presentation artifact, appends
+`presentation-subtitles.srt` only when the imported subtitle count is exactly
+zero, and refuses a partial count to prevent duplicates. The resulting
+presentation cues remain editable on the subtitle track; the complete sidecar
+is preserved in the portable handoff.
+
+SRT has no style information, so an SRT fallback cannot guarantee contrast.
+Before any final render, select the `PRESENTATION_SUBTITLES` track in Resolve,
+open Inspector > Track Style, and verify white text on a black background at
+65% or greater opacity inside lower title-safe. Check at least one bright frame
+and one dark frame, then record the machine-local approval:
+
+```text
+uv run rabbithole resolve approve-caption-style projects/<slug> --overrides resolve-overrides.json --note "bright and dark frames checked"
+uv run rabbithole resolve caption-style-status projects/<slug> --overrides resolve-overrides.json
+```
+
+The approval is bound to the exact build, timeline, style contract, and host.
+It is intentionally excluded from transfer bundles, so a restored Mac or
+Windows host must repeat the visual check. `resolve render` fails closed while
+the approval is missing or stale.
 Review-warning and human-review markers use Resolve-supported Yellow; Resolve
 rejects `Orange` as a marker color. The runner creates each marker first and
 then attaches its machine-readable JSON with `UpdateMarkerCustomData`, avoiding
@@ -240,6 +271,20 @@ EDITORIAL_v2
 ```
 
 Automation never mutates a timeline whose name starts with `EDITORIAL_`.
+
+When authored, the timeline begins with an approximately eleven-second
+source-led cold open: retained primary-source video and an optional authored
+crackle at entry. Source audio is muted by default and may be enabled only when
+the episode rights ledger explicitly permits that exact use. Because the prefix
+contains no overlays, derived excerpts that require credit must burn a small
+source label into the pixels. Narration, music, and presentation captions begin
+only after the hard cut into the documentary. Do not loop or synthesize source
+action merely to force the target length.
+
+Keep text-led graphics editorially sparse. Prefer source motion and Chromium
+evidence, avoid consecutive slide-like cards, and place a small claim-specific
+qualifier over usable source pixels instead of a full-screen uncertainty
+placeholder.
 
 ## Primary render and fallback
 
@@ -325,14 +370,25 @@ The bundle preserves the project-relative tree and verifies every file with
 SHA-256. It refuses absolute/escaping media paths, symlinks, missing referenced
 media, case-colliding names, unsafe ZIP members, and overwrites. It excludes
 `.env` files, credentials, caches, prior renders/handoffs, stale locks/queues,
-and generated Resolve builds. The content-addressed A3/A4 stems are media
-inputs, not queue/build state, so the set selected by `current.json` is
-included and checksum-verified; historical stem directories are omitted.
+generated Resolve builds, machine-local `resolve/review-approvals`, and transient
+`.cardwork`/`.capturework` directories. A metadata reference to an input in an
+excluded directory fails bundle creation instead of silently producing an
+incomplete archive. The content-addressed A3/A4 stems are media inputs, not
+queue/build state, so the set selected by `current.json` is included and
+checksum-verified; historical stem directories are omitted.
 Bundle creation and verification also follow `audio-stems/current.json` into
 the selected immutable manifest, verify its fingerprint, both exact stem files,
 and every project-local source-input checksum. Repository implementation/style
 hashes remain part of the contract but are not copied into the episode ZIP;
-clone the same Git revision on the receiving host, then run `prepare`.
+the bundle manifest and README record the containing Git checkout's exact clean
+revision when one is available. If the source worktree is dirty, HEAD is marked
+as context only and `reproducible_revision` is deliberately left empty; commit
+or stash the repository changes and bundle again for a reproducible transfer.
+When restoring inside a Git checkout, a recorded clean revision is checked
+before extraction and a dirty or mismatched destination checkout is rejected.
+If no destination checkout is discoverable, restore succeeds with an explicit
+unverified-repository status. Clone the recorded revision on the receiving host,
+then run `prepare`.
 Recoverably quarantined media remains project-relative and travels with its
 retired provenance record.
 
@@ -424,3 +480,56 @@ review:
 Optional per-episode adjustments belong in `resolve-overrides.json`. They augment
 the existing RabbitHole marker grammar; they do not replace `timing.json` or
 `edit/edl.json`.
+
+### Source-led cold-open override
+
+Reference retained video by its `provenance.json` `asset_id`, and keep SFX paths
+project-relative so the handoff remains portable. V1 clips must cover the prefix
+exactly, without gaps or overlaps. Set `source_audio` to `false` unless the
+rights ledger explicitly clears original audio; `true` places matched audio on
+A2. SFX is placed on A4. When credit is required, point the cold open at a
+muted, transformed derived-source asset with attribution already burned in. For
+example:
+
+```json
+{
+  "cold_open": {
+    "duration_seconds": 11,
+    "video": [
+      {
+        "asset_id": "source-opening-a",
+        "timeline_start": 0,
+        "source_start": 0,
+        "duration": 10,
+        "source_audio": false
+      },
+      {
+        "asset_id": "source-opening-b",
+        "timeline_start": 10,
+        "source_start": 0,
+        "duration": 1,
+        "source_audio": false
+      }
+    ],
+    "sfx": {
+      "local_path": "assets/soundlib/sfx/static-crackle.wav",
+      "timeline_start": 0,
+      "source_start": 0,
+      "duration": 0.6,
+      "gain_db": -2
+    }
+  }
+}
+```
+
+Pass the same override to preparation and build so both commands address the
+same immutable build identity:
+
+```text
+uv run rabbithole resolve prepare projects/<slug> --overrides resolve-overrides.json
+uv run rabbithole resolve build projects/<slug> --mode <free|studio> --overrides resolve-overrides.json
+```
+
+The compiler checksum-pins every prefix input, shifts narration-era edits by the
+exact prefix duration, and creates a new build ID/timeline instead of modifying
+an existing generated timeline.

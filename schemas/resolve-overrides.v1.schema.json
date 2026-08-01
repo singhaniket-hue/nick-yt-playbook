@@ -2,6 +2,80 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rabbithole.local/schemas/resolve-overrides.v1.schema.json",
   "title": "Resolve compiler overrides",
+  "$defs": {
+    "coldOpenVideo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset_id"],
+      "properties": {
+        "asset_id": {"type": "string", "minLength": 1},
+        "slot_id": {"type": "string", "minLength": 1},
+        "timeline_start_frame": {"type": "integer", "minimum": 0},
+        "timeline_start_frames": {"type": "integer", "minimum": 0},
+        "start_frame": {"type": "integer", "minimum": 0},
+        "timeline_start": {"type": "number", "minimum": 0},
+        "timeline_start_seconds": {"type": "number", "minimum": 0},
+        "start": {"type": "number", "minimum": 0},
+        "source_start_frame": {"type": "integer", "minimum": 0},
+        "source_start_frames": {"type": "integer", "minimum": 0},
+        "source_start": {"type": "number", "minimum": 0},
+        "source_start_seconds": {"type": "number", "minimum": 0},
+        "in": {"type": "number", "minimum": 0},
+        "duration_frames": {"type": "integer", "minimum": 1},
+        "duration": {"type": "number", "exclusiveMinimum": 0},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "source_audio": {"type": "boolean"},
+        "gain_db": {"type": "number"},
+        "reason": {"type": "string"}
+      },
+      "anyOf": [
+        {"required": ["duration_frames"]},
+        {"required": ["duration"]},
+        {"required": ["duration_seconds"]}
+      ]
+    },
+    "coldOpenSfx": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "asset_id": {"type": "string", "minLength": 1},
+        "local_path": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "file": {"type": "string", "minLength": 1},
+        "timeline_start_frame": {"type": "integer", "minimum": 0},
+        "timeline_start_frames": {"type": "integer", "minimum": 0},
+        "start_frame": {"type": "integer", "minimum": 0},
+        "timeline_start": {"type": "number", "minimum": 0},
+        "timeline_start_seconds": {"type": "number", "minimum": 0},
+        "start": {"type": "number", "minimum": 0},
+        "source_start_frame": {"type": "integer", "minimum": 0},
+        "source_start_frames": {"type": "integer", "minimum": 0},
+        "source_start": {"type": "number", "minimum": 0},
+        "source_start_seconds": {"type": "number", "minimum": 0},
+        "in": {"type": "number", "minimum": 0},
+        "duration_frames": {"type": "integer", "minimum": 1},
+        "duration": {"type": "number", "exclusiveMinimum": 0},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "gain_db": {"type": "number"}
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            {"required": ["local_path"]},
+            {"required": ["path"]},
+            {"required": ["file"]}
+          ]
+        },
+        {
+          "anyOf": [
+            {"required": ["duration_frames"]},
+            {"required": ["duration"]},
+            {"required": ["duration_seconds"]}
+          ]
+        }
+      ]
+    }
+  },
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -13,6 +87,47 @@
     "clip_tracks": {
       "type": "object",
       "additionalProperties": {"enum": ["V1", "V2"]}
+    },
+    "cold_open": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"type": "string"},
+        "enabled": {"type": "boolean"},
+        "name": {"type": "string"},
+        "label": {"type": "string"},
+        "description": {"type": "string"},
+        "prefix_frames": {"type": "integer", "minimum": 1},
+        "duration_frames": {"type": "integer", "minimum": 1},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "duration": {"type": "number", "exclusiveMinimum": 0},
+        "video": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/coldOpenVideo"}
+        },
+        "clips": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/coldOpenVideo"}
+        },
+        "sfx": {
+          "oneOf": [
+            {"$ref": "#/$defs/coldOpenSfx"},
+            {
+              "type": "array",
+              "items": {"$ref": "#/$defs/coldOpenSfx"}
+            }
+          ]
+        },
+        "sound_effects": {
+          "oneOf": [
+            {"$ref": "#/$defs/coldOpenSfx"},
+            {
+              "type": "array",
+              "items": {"$ref": "#/$defs/coldOpenSfx"}
+            }
+          ]
+        }
+      }
     },
     "transforms": {
       "type": "object",

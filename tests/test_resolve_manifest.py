@@ -6,8 +6,11 @@ import wave
 from pathlib import Path
 
 import pytest
+from jsonschema.validators import validator_for
 
+import rabbithole.resolve_manifest as resolve_manifest
 from rabbithole.resolve_manifest import (
+    ResolveManifestError,
     _assign_non_overlapping_title_tracks,
     build_resolve_srt,
     compile_resolve_plan,
@@ -167,7 +170,7 @@ def _project(tmp_path: Path) -> Path:
                 "retrieved_at": "2026-07-28T00:00:00Z",
                 "local_path": "projects/episode/assets/capture.png",
                 "used_in_slots": [],
-                "notes": "screenshot evidence capture",
+                "notes": "page capture of screenshot evidence",
             },
         ],
     )
@@ -208,6 +211,84 @@ def _make_primary_video_source(
     source["retrieved_at"] = retrieved_at
     source["notes"] = notes
     _write_json(provenance_path, provenance)
+
+
+def _add_cold_open_override(root: Path) -> Path:
+    crackle = root / "assets" / "crackle.wav"
+    _write_wave(crackle, channels=2, sample_rate=48_000, seconds=0.25)
+    override_path = root / "resolve-overrides.json"
+    _write_json(
+        override_path,
+        {
+            "cold_open": {
+                "duration_seconds": 1,
+                "video": [
+                    {
+                        "asset_id": "plate-s001",
+                        "timeline_start": 0,
+                        "source_start": 0,
+                        "duration": 1,
+                        "source_audio": True,
+                    }
+                ],
+                "sfx": {
+                    "local_path": "assets/crackle.wav",
+                    "timeline_start": 0,
+                    "source_start": 0,
+                    "duration": 0.25,
+                    "gain_db": -2,
+                },
+            }
+        },
+    )
+    return override_path
+
+
+def _configure_visual_subtitle_case(
+    root: Path,
+    *,
+    slot_kind: str,
+    provider: str,
+    notes: str,
+) -> str:
+    timing_path = root / "narration" / "timing.json"
+    timing = json.loads(timing_path.read_text(encoding="utf-8"))
+    second_shot = next(
+        marker
+        for marker in timing["markers"]
+        if marker["kind"] == "SHOT" and marker["seconds"] == 2.0
+    )
+    second_shot["arg"] = f"{slot_kind} retained visual"
+    _write_json(timing_path, timing)
+
+    visual_path = root / "assets" / "retained-visual.mp4"
+    visual_path.write_bytes(b"retained-visual-v1")
+    provenance_path = root / "provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance[1].update(
+        {
+            "provider": provider,
+            "local_path": "assets/retained-visual.mp4",
+            "used_in_slots": ["s002"],
+            "notes": notes,
+        }
+    )
+    _write_json(provenance_path, provenance)
+
+    cue_text = "Evidence remains readable"
+    edl_path = root / "edit" / "edl.json"
+    edl = json.loads(edl_path.read_text(encoding="utf-8"))
+    edl["overlays"].append(
+        {
+            "kind": "subtitle",
+            "start": 2.1,
+            "end": 3.0,
+            "text": cue_text,
+            "detail": {},
+        }
+    )
+    _write_json(edl_path, edl)
+    return cue_text
 
 
 def _add_generated_sound_library(
@@ -382,7 +463,8 @@ def test_compile_is_deterministic_and_preserves_render_offsets(tmp_path):
     assert first["timeline_name"].startswith("AUTO_BUILD_")
     assert first["project_root"] == "."
     assert first["fps"] == 30
-    assert first["compiler_version"] == "resolve-compiler.v10"
+    assert first["compiler_version"] == "resolve-compiler.v13"
+    assert "cold_open" not in first
     assert first["render"]["format"] == "mp4"
     assert first["render"]["codec"] == "H264"
     assert first["render"]["mode"] == "single_clip"
@@ -402,6 +484,43 @@ def test_compile_is_deterministic_and_preserves_render_offsets(tmp_path):
         "audio_clip_count": 2,
         "subtitle_count": len(first["subtitles"]),
     }
+    assert first["upload_subtitles"] == first["subtitles"]
+    assert first["subtitle_policy"]["policy_version"] == (
+        "presentation-subtitles.v1"
+    )
+    assert first["subtitle_policy"]["timeline_track_name"] == (
+        "PRESENTATION_SUBTITLES"
+    )
+    assert first["subtitle_policy"]["upload_cue_count"] == 1
+    assert first["subtitle_policy"]["presentation_cue_count"] == 1
+    assert first["subtitle_policy"]["track_style"] == {
+        "schema_version": "presentation-subtitle-style.v1",
+        "track_name": "PRESENTATION_SUBTITLES",
+        "font_color": "#FFFFFF",
+        "background_color": "#000000",
+        "minimum_background_opacity": 0.65,
+        "position": "lower-center-title-safe",
+        "application": "manual-resolve-track-style",
+        "render_approval_required": True,
+        "contract_sha256": first["subtitle_policy"]["track_style"][
+            "contract_sha256"
+        ],
+    }
+    assert len(
+        first["subtitle_policy"]["track_style"]["contract_sha256"]
+    ) == 64
+    assert any(
+        flag["kind"] == "presentation_caption_readability"
+        and flag["severity"] == "human"
+        and flag["resolved"] is False
+        for flag in first["review_flags"]
+    )
+    [screenshot_exclusion] = first["subtitle_policy"]["exclusion_intervals"]
+    assert (
+        screenshot_exclusion["start_frame"],
+        screenshot_exclusion["end_frame"],
+        screenshot_exclusion["reasons"],
+    ) == (60, 120, ["text_led_visual"])
     assert first["clips"][0]["source_start_frame"] == 0
     assert first["clips"][1]["source_start_frame"] == 30
     assert first["clips"][1]["source_end_frame"] == 60
@@ -418,6 +537,282 @@ def test_compile_is_deterministic_and_preserves_render_offsets(tmp_path):
     assert [clip["track"] for clip in first["audio"]] == ["A1", "A2"]
     assert first["highlights"][0]["start_frame"] == 63
     assert not first["missing_media"]
+
+
+@pytest.mark.parametrize("with_cold_open", [False, True])
+def test_written_v12_plan_conforms_to_repository_schema(
+    tmp_path,
+    monkeypatch,
+    with_cold_open,
+):
+    root = _project(tmp_path)
+    overrides_path = None
+    if with_cold_open:
+        overrides_path = _add_cold_open_override(root)
+        monkeypatch.setattr(
+            resolve_manifest,
+            "_probe_audio_metadata",
+            lambda _path: {"channels": 2, "sample_rate": 48_000},
+        )
+
+    result = write_resolve_bundle(
+        root,
+        overrides_path=overrides_path,
+        update_current=False,
+    )
+    schema_path = (
+        Path(__file__).resolve().parents[1]
+        / "schemas"
+        / "resolve-plan.v1.schema.json"
+    )
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    validator_class = validator_for(schema)
+    validator_class.check_schema(schema)
+    validator_class(schema).validate(result["plan"])
+
+
+def test_cold_open_override_prefixes_plan_and_owns_build_identity(
+    tmp_path, monkeypatch
+):
+    root = _project(tmp_path)
+    override_path = _add_cold_open_override(root)
+    monkeypatch.setattr(
+        resolve_manifest,
+        "_probe_audio_metadata",
+        lambda _path: {"channels": 2, "sample_rate": 48_000},
+    )
+
+    baseline = compile_resolve_plan(root)
+    first = compile_resolve_plan(root, overrides_path=override_path)
+    second = compile_resolve_plan(root, overrides_path=override_path)
+
+    assert first == second
+    assert first["build_id"] != baseline["build_id"]
+    assert first["timeline_name"] == (
+        f"AUTO_BUILD_{first['checksums']['build_fingerprint_sha256'][:12].upper()}"
+    )
+    assert first["output_paths"]["plan"] == (
+        f"resolve/builds/{first['build_id']}/resolve-plan.v1.json"
+    )
+    assert first["output_paths"]["fcpxml"] == (
+        f"resolve/builds/{first['build_id']}/timeline.fcpxml"
+    )
+    assert first["output_paths"]["subtitles"] == (
+        f"resolve/builds/{first['build_id']}/subtitles.srt"
+    )
+    assert first["output_paths"]["presentation_subtitles"] == (
+        f"resolve/builds/{first['build_id']}/presentation-subtitles.srt"
+    )
+
+    prefix = first["cold_open"]
+    assert prefix["prefix_frames"] == 30
+    assert len(prefix["clips"]) == 1
+    assert {item["role"] for item in prefix["media_inputs"]} == {
+        "video",
+        "source_audio",
+        "sfx",
+    }
+    assert first["checksums"]["cold_open_contract_sha256"] == prefix[
+        "contract_sha256"
+    ]
+    assert first["duration_frames"] == baseline["duration_frames"] + 30
+    assert first["timing"]["duration_frames"] == (
+        baseline["timing"]["duration_frames"] + 30
+    )
+
+    narrative_clips = [
+        item for item in first["clips"] if item.get("origin") != "cold_open"
+    ]
+    assert min(item["start_frame"] for item in narrative_clips) == 30
+    assert narrative_clips[0]["source_start_frame"] == 0
+    assert all(item["frame"] >= 30 for item in first["markers"])
+    assert all(item["start_frame"] >= 30 for item in first["subtitles"])
+    assert all(item["start_frame"] >= 30 for item in first["upload_subtitles"])
+    assert all(item["start_frame"] >= 30 for item in first["overlays"])
+    assert all(
+        item["track"] in {"A2", "A4"}
+        for item in first["audio"]
+        if item["start_frame"] < 30
+    )
+    assert first["timeline_validation"]["end_frame"] == first["duration_frames"]
+    assert first["timeline_validation"]["video_clip_count"] == (
+        baseline["timeline_validation"]["video_clip_count"] + 1
+    )
+    assert first["timeline_validation"]["audio_clip_count"] == (
+        baseline["timeline_validation"]["audio_clip_count"] + 2
+    )
+
+    bundle = write_resolve_bundle(
+        root,
+        overrides_path=override_path,
+        update_current=False,
+    )
+    assert bundle["build_id"] == first["build_id"]
+    assert bundle["plan_path"].parent.name == first["build_id"]
+    assert "cold-open-001" in bundle["fcpxml_path"].read_text(encoding="utf-8")
+
+
+def test_cold_open_sfx_bytes_change_build_identity(tmp_path, monkeypatch):
+    root = _project(tmp_path)
+    override_path = _add_cold_open_override(root)
+    monkeypatch.setattr(
+        resolve_manifest,
+        "_probe_audio_metadata",
+        lambda _path: {"channels": 2, "sample_rate": 48_000},
+    )
+
+    before = compile_resolve_plan(root, overrides_path=override_path)
+    crackle = root / "assets" / "crackle.wav"
+    crackle.write_bytes(crackle.read_bytes() + b"changed")
+    after = compile_resolve_plan(root, overrides_path=override_path)
+
+    assert after["build_id"] != before["build_id"]
+    assert after["checksums"]["build_fingerprint_sha256"] != before[
+        "checksums"
+    ]["build_fingerprint_sha256"]
+    sfx = next(
+        item for item in after["cold_open"]["media_inputs"] if item["role"] == "sfx"
+    )
+    assert sfx["sha256"] == _sha256(crackle)
+
+
+def test_invalid_cold_open_override_uses_public_manifest_error(tmp_path):
+    root = _project(tmp_path)
+    override_path = root / "resolve-overrides.json"
+    _write_json(
+        override_path,
+        {"cold_open": {"duration_seconds": 1, "video": []}},
+    )
+
+    with pytest.raises(ResolveManifestError, match="invalid cold_open override"):
+        compile_resolve_plan(root, overrides_path=override_path)
+
+
+def test_presentation_subtitles_exclude_cold_open_and_text_led_visuals(
+    tmp_path,
+):
+    root = _project(tmp_path)
+    edl_path = root / "edit" / "edl.json"
+    edl = json.loads(edl_path.read_text(encoding="utf-8"))
+    edl["overlays"].extend(
+        [
+            {
+                "kind": "subtitle_exclusion",
+                "start": 0.0,
+                "end": 0.5,
+                "text": "",
+                "detail": {"reason": "cold_open"},
+            },
+            {
+                "kind": "subtitle",
+                "start": 1.8,
+                "end": 2.3,
+                "text": "Boundary caption",
+                "detail": {},
+            },
+            {
+                "kind": "subtitle",
+                "start": 2.5,
+                "end": 3.0,
+                "text": "Article caption",
+                "detail": {},
+            },
+        ]
+    )
+    _write_json(edl_path, edl)
+
+    plan = compile_resolve_plan(root)
+
+    assert [cue["text"] for cue in plan["upload_subtitles"]] == [
+        "One & sentence.",
+        "Boundary caption",
+        "Article caption",
+    ]
+    assert [
+        (cue["start_frame"], cue["end_frame"], cue["text"])
+        for cue in plan["subtitles"]
+    ] == [
+        (15, 33, "One & sentence."),
+        (54, 60, "Boundary caption"),
+    ]
+    assert all(
+        overlay["kind"] != "subtitle_exclusion"
+        for overlay in plan["overlays"]
+    )
+    policy = plan["subtitle_policy"]
+    assert [
+        (item["start_frame"], item["end_frame"], item["reasons"])
+        for item in policy["exclusion_intervals"]
+    ] == [
+        (0, 15, ["cold_open"]),
+        (60, 120, ["text_led_visual"]),
+    ]
+    assert policy["upload_cue_count"] == 3
+    assert policy["presentation_cue_count"] == 2
+    assert policy["affected_upload_cue_count"] == 3
+    assert policy["fully_suppressed_upload_cue_count"] == 1
+    assert len(policy["contract_sha256"]) == 64
+    assert plan["timeline_validation"]["subtitle_count"] == 2
+
+    result = write_resolve_bundle(root, update_current=False)
+    upload_srt = result["subtitles_path"].read_text(encoding="utf-8")
+    presentation_srt = result["presentation_subtitles_path"].read_text(
+        encoding="utf-8"
+    )
+    assert "Article caption" in upload_srt
+    assert "Article caption" not in presentation_srt
+    assert "00:00:00,500 --> 00:00:01,100" in presentation_srt
+    assert "00:00:01,800 --> 00:00:02,000" in presentation_srt
+
+
+@pytest.mark.parametrize("technical_kind", ["browser", "screenshot", "graphic"])
+def test_generic_technical_source_frame_kind_keeps_presentation_caption(
+    tmp_path, technical_kind
+):
+    root = _project(tmp_path)
+    cue_text = _configure_visual_subtitle_case(
+        root,
+        slot_kind=technical_kind,
+        provider="rabbithole-source-frame",
+        notes="silent retained source frame at 1.250s",
+    )
+
+    plan = compile_resolve_plan(root)
+
+    assert cue_text in [cue["text"] for cue in plan["upload_subtitles"]]
+    assert cue_text in [cue["text"] for cue in plan["subtitles"]]
+    assert technical_kind not in plan["subtitle_policy"]["text_led_slot_kinds"]
+    assert not any(
+        interval["start_frame"] < 90 and interval["end_frame"] > 63
+        for interval in plan["subtitle_policy"]["exclusion_intervals"]
+    )
+
+
+def test_page_capture_metadata_suppresses_only_presentation_sidecar(tmp_path):
+    root = _project(tmp_path)
+    cue_text = _configure_visual_subtitle_case(
+        root,
+        slot_kind="screenshot",
+        provider="archive.example",
+        notes="page capture with claim target and browser framing",
+    )
+
+    plan = compile_resolve_plan(root)
+
+    assert cue_text in [cue["text"] for cue in plan["upload_subtitles"]]
+    assert cue_text not in [cue["text"] for cue in plan["subtitles"]]
+    assert any(
+        interval["start_frame"] <= 63
+        and interval["end_frame"] >= 90
+        and "text_led_visual" in interval["reasons"]
+        for interval in plan["subtitle_policy"]["exclusion_intervals"]
+    )
+
+    result = write_resolve_bundle(root, update_current=False)
+    assert cue_text in result["subtitles_path"].read_text(encoding="utf-8")
+    assert cue_text not in result["presentation_subtitles_path"].read_text(
+        encoding="utf-8"
+    )
 
 
 def test_audio_source_metadata_is_probed_for_portable_fcpxml(tmp_path):
@@ -899,6 +1294,7 @@ def test_bundle_paths_and_current_pointer_are_atomic_contract(tmp_path):
     assert result["plan_path"].is_file()
     assert result["fcpxml_path"].is_file()
     assert result["subtitles_path"].is_file()
+    assert result["presentation_subtitles_path"].is_file()
     assert result["current_path"] == root / "resolve" / "current.json"
     current = json.loads(result["current_path"].read_text(encoding="utf-8"))
     assert current["build_id"] == result["build_id"]
@@ -919,11 +1315,24 @@ def test_bundle_paths_and_current_pointer_are_atomic_contract(tmp_path):
         == result["subtitles_sha256"]
         == _sha256(result["subtitles_path"])
     )
+    assert (
+        current["presentation_subtitles_path"]
+        == result["plan"]["output_paths"]["presentation_subtitles"]
+    )
+    assert (
+        current["presentation_subtitles_sha256"]
+        == result["plan"]["output_paths"]["presentation_subtitles_sha256"]
+        == result["presentation_subtitles_sha256"]
+        == _sha256(result["presentation_subtitles_path"])
+    )
     assert result["subtitles_path"].read_text(encoding="utf-8") == (
         "1\n"
         "00:00:00,000 --> 00:00:01,100\n"
         "One & sentence.\n"
     )
+    assert result["presentation_subtitles_path"].read_text(
+        encoding="utf-8"
+    ) == result["subtitles_path"].read_text(encoding="utf-8")
 
 
 def test_resolve_srt_is_sorted_utf8_and_frame_deterministic():

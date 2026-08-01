@@ -22,6 +22,11 @@ from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
 from rabbithole.audiomix import bed_spans, sfx_events, silence_windows
+from rabbithole.cold_open import (
+    ColdOpenError,
+    compile_cold_open,
+    shift_plan_for_prefix,
+)
 from rabbithole.resolve_audio import ResolveAudioStemError, load_current_audio_stems
 from rabbithole.sources.music import resolve_cue
 from rabbithole.sources.soundgen import (
@@ -33,12 +38,14 @@ from rabbithole.sources.soundgen import (
 
 
 SCHEMA_VERSION = "resolve-plan.v1"
-COMPILER_VERSION = "resolve-compiler.v10"
+COMPILER_VERSION = "resolve-compiler.v13"
 DEFAULT_FPS = 30
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
 DEFAULT_SAMPLE_RATE = 48_000
 _SOURCE_CAPTION_POLICY_VERSION = "source-caption.v1"
+_PRESENTATION_SUBTITLE_POLICY_VERSION = "presentation-subtitles.v1"
+_PRESENTATION_SUBTITLE_STYLE_VERSION = "presentation-subtitle-style.v1"
 
 _VIDEO_TRACKS = (
     ("V1", "base_footage"),
@@ -78,6 +85,62 @@ _STILL_SUFFIXES = {
     ".webp",
 }
 _SUBTITLE_KINDS = {"caption", "captions", "subtitle", "subtitles"}
+_SUBTITLE_EXCLUSION_KINDS = {
+    "caption_exclusion",
+    "subtitle_exclusion",
+}
+# These kinds express text-heavy editorial semantics. Generic acquisition or
+# rendering mechanics such as browser, screenshot, and graphic are deliberately
+# excluded; provider/notes metadata below decides whether their actual pixels
+# are a page/card that needs a caption-free interval.
+_TEXT_LED_SLOT_KINDS = {
+    "article",
+    "callout",
+    "card",
+    "checklist",
+    "citation",
+    "comparison",
+    "document",
+    "quote",
+    "stat",
+    "statistics",
+    "text",
+    "timeline",
+}
+_TEXT_LED_OVERLAY_KINDS = {
+    "article",
+    "article_card",
+    "callout",
+    "callout_card",
+    "chapter",
+    "chapter_card",
+    "checklist",
+    "checklist_card",
+    "citation",
+    "citation_card",
+    "comparison",
+    "comparison_card",
+    "document",
+    "document_card",
+    "evidence_card",
+    "graphic",
+    "graphic_card",
+    "quote",
+    "quote_card",
+    "stat",
+    "stat_card",
+    "statistics",
+    "text",
+    "text_card",
+    "timeline",
+    "timeline_card",
+    "title",
+    "title_card",
+}
+_TEXT_LED_PROVIDERS = {
+    "rabbithole-cards",
+    "rabbithole-evidence-card",
+}
 _EVIDENCE_TERMS = {
     "document",
     "evidence",
@@ -333,7 +396,12 @@ def write_resolve_bundle(
     overrides_path: Path | None = None,
     update_current: bool = True,
 ) -> dict[str, Any]:
-    """Compile and atomically write a Resolve plan, FCPXML, and subtitle SRT.
+    """Compile and atomically write a Resolve plan, FCPXML, and subtitle SRTs.
+
+    ``subtitles.srt`` remains the complete upload sidecar.  The separately
+    checksummed ``presentation-subtitles.srt`` is the selective track intended
+    for Resolve, with cues removed only inside the plan's explicit exclusion
+    intervals.
 
     The return value is a plain dictionary so orchestration layers can serialize
     it directly.  Paths in the result are ``Path`` objects.
@@ -358,11 +426,16 @@ def write_resolve_bundle(
     plan_path = destination / "resolve-plan.v1.json"
     fcpxml_path = destination / "timeline.fcpxml"
     subtitles_path = destination / "subtitles.srt"
+    presentation_subtitles_path = destination / "presentation-subtitles.srt"
     portable_plan_path, plan_path_kind = _path_for_plan(plan_path, root)
     portable_xml_path, xml_path_kind = _path_for_plan(fcpxml_path, root)
     portable_subtitles_path, subtitles_path_kind = _path_for_plan(
         subtitles_path, root
     )
+    (
+        portable_presentation_subtitles_path,
+        presentation_subtitles_path_kind,
+    ) = _path_for_plan(presentation_subtitles_path, root)
     plan["output_paths"] = {
         "plan": portable_plan_path,
         "plan_path_kind": plan_path_kind,
@@ -370,19 +443,34 @@ def write_resolve_bundle(
         "fcpxml_path_kind": xml_path_kind,
         "subtitles": portable_subtitles_path,
         "subtitles_path_kind": subtitles_path_kind,
+        "presentation_subtitles": portable_presentation_subtitles_path,
+        "presentation_subtitles_path_kind": presentation_subtitles_path_kind,
     }
 
     from .fcpxml import build_fcpxml
 
     fcpxml_text = build_fcpxml(plan, project_root=root)
     fcpxml_sha256 = _sha256_bytes(fcpxml_text.encode("utf-8"))
-    subtitles_text = build_resolve_srt(plan)
-    subtitles_sha256 = _sha256_bytes(subtitles_text.encode("utf-8"))
+    presentation_subtitles_text = build_resolve_srt(plan)
+    upload_subtitles_text = build_resolve_srt(
+        {
+            "fps": plan["fps"],
+            "subtitles": plan.get("upload_subtitles", plan.get("subtitles", [])),
+        }
+    )
+    subtitles_sha256 = _sha256_bytes(upload_subtitles_text.encode("utf-8"))
+    presentation_subtitles_sha256 = _sha256_bytes(
+        presentation_subtitles_text.encode("utf-8")
+    )
     plan["output_paths"]["fcpxml_sha256"] = fcpxml_sha256
     plan["output_paths"]["subtitles_sha256"] = subtitles_sha256
+    plan["output_paths"][
+        "presentation_subtitles_sha256"
+    ] = presentation_subtitles_sha256
     plan_text = _canonical_json(plan, pretty=True) + "\n"
     _atomic_write_text(fcpxml_path, fcpxml_text)
-    _atomic_write_text(subtitles_path, subtitles_text)
+    _atomic_write_text(subtitles_path, upload_subtitles_text)
+    _atomic_write_text(presentation_subtitles_path, presentation_subtitles_text)
     _atomic_write_text(plan_path, plan_text)
 
     current_path: Path | None = None
@@ -397,6 +485,8 @@ def write_resolve_bundle(
             "fcpxml_sha256": fcpxml_sha256,
             "subtitles_path": portable_subtitles_path,
             "subtitles_sha256": subtitles_sha256,
+            "presentation_subtitles_path": portable_presentation_subtitles_path,
+            "presentation_subtitles_sha256": presentation_subtitles_sha256,
         }
         _atomic_write_text(current_path, _canonical_json(current, pretty=True) + "\n")
 
@@ -407,10 +497,12 @@ def write_resolve_bundle(
         "plan_path": plan_path,
         "fcpxml_path": fcpxml_path,
         "subtitles_path": subtitles_path,
+        "presentation_subtitles_path": presentation_subtitles_path,
         "current_path": current_path,
         "plan_sha256": _sha256_bytes(plan_text.encode("utf-8")),
         "fcpxml_sha256": fcpxml_sha256,
         "subtitles_sha256": subtitles_sha256,
+        "presentation_subtitles_sha256": presentation_subtitles_sha256,
         "plan": plan,
     }
 
@@ -514,6 +606,16 @@ def _compile_loaded(
     edl = _normalize_edl(edl_raw, fps)
     overrides_map = _normalize_overrides(overrides)
     provenance = _normalize_provenance(provenance_raw, root, overrides_map)
+    try:
+        cold_open = compile_cold_open(
+            overrides_map.get("cold_open"),
+            root=root,
+            fps=fps,
+            provenance=provenance,
+            probe_audio=_probe_audio_metadata,
+        )
+    except ColdOpenError as exc:
+        raise ResolveManifestError(f"invalid cold_open override: {exc}") from exc
     slot_metadata = _slot_metadata(timing_raw)
     audio = _compile_audio(source_audio, root, fps, timing["duration_frames"])
     if audio_stems is not None and audio_stems_path is not None:
@@ -556,12 +658,31 @@ def _compile_loaded(
     fingerprint_payload = {
         "compiler": COMPILER_VERSION,
         "source_caption_policy": _SOURCE_CAPTION_POLICY_VERSION,
+        "presentation_subtitle_policy": {
+            "version": _PRESENTATION_SUBTITLE_POLICY_VERSION,
+            "track_style": {
+                "version": _PRESENTATION_SUBTITLE_STYLE_VERSION,
+                "track_name": "PRESENTATION_SUBTITLES",
+                "font_color": "#FFFFFF",
+                "background_color": "#000000",
+                "minimum_background_opacity": 0.65,
+                "position": "lower-center-title-safe",
+                "application": "manual-resolve-track-style",
+            },
+            "text_led_slot_kinds": sorted(_TEXT_LED_SLOT_KINDS),
+            "text_led_overlay_kinds": sorted(_TEXT_LED_OVERLAY_KINDS),
+            "text_led_providers": sorted(_TEXT_LED_PROVIDERS),
+        },
         "schema_version": SCHEMA_VERSION,
         "fps": fps,
         "width": width,
         "height": height,
         "sample_rate": sample_rate,
         "style": style_base,
+        "cold_open": {
+            "contract_sha256": cold_open["contract_sha256"],
+            "media_inputs": cold_open["media_inputs"],
+        },
         "sources": {
             name: record["sha256"] for name, record in sorted(sources.items())
         },
@@ -573,6 +694,13 @@ def _compile_loaded(
             f"audio:{item['asset_id']}:{item['media_path'] or ''}": item["sha256"]
             for item in audio
         },
+        "cold_open_media": {
+            (
+                f"{item['role']}:{item['asset_id']}:"
+                f"{item['media_path']}"
+            ): item["sha256"]
+            for item in cold_open["media_inputs"]
+        },
     }
     build_digest = _sha256_json(fingerprint_payload)
     build_id = f"b-{build_digest[:12]}"
@@ -580,6 +708,9 @@ def _compile_loaded(
     default_plan_path = f"resolve/builds/{build_id}/resolve-plan.v1.json"
     default_xml_path = f"resolve/builds/{build_id}/timeline.fcpxml"
     default_subtitles_path = f"resolve/builds/{build_id}/subtitles.srt"
+    default_presentation_subtitles_path = (
+        f"resolve/builds/{build_id}/presentation-subtitles.srt"
+    )
 
     review_flags: list[dict[str, Any]] = []
     missing_media: list[dict[str, Any]] = []
@@ -799,7 +930,11 @@ def _compile_loaded(
                 "Verify redaction placement and tracking.",
             )
 
-    overlays, explicit_subtitles = _compile_overlays(edl["overlays"], fps)
+    (
+        overlays,
+        explicit_subtitles,
+        authored_subtitle_exclusions,
+    ) = _compile_overlays(edl["overlays"], fps)
     overlays.extend(
         _compile_source_caption_overlays(clips, provenance, overlays)
     )
@@ -822,11 +957,38 @@ def _compile_loaded(
                 "Review the timing of this heavy story beat.",
             )
 
-    subtitles = (
+    upload_subtitles = (
         explicit_subtitles
         if explicit_subtitles
         else _subtitles_from_words(timing["words"], fps)
     )
+    subtitle_timeline_end = max(
+        timing["duration_frames"],
+        edl["duration_frames"],
+        max((clip["end_frame"] for clip in clips), default=0),
+        max((item["end_frame"] for item in audio), default=0),
+    )
+    subtitles, subtitle_policy = _compile_presentation_subtitles(
+        upload_subtitles,
+        clips=clips,
+        overlays=overlays,
+        provenance=provenance,
+        slot_metadata=slot_metadata,
+        authored_exclusions=authored_subtitle_exclusions,
+        duration_frames=subtitle_timeline_end,
+    )
+    if subtitles:
+        _add_review(
+            review_flags,
+            "presentation_caption_readability",
+            "human",
+            int(subtitles[0]["start_frame"]),
+            (
+                "In Resolve, verify PRESENTATION_SUBTITLES Track Style uses "
+                "white text on a black background at 65% or greater opacity; "
+                "approve the machine-local caption-style gate before render."
+            ),
+        )
     for audio_clip in audio:
         if audio_clip["media_path"] and not audio_clip["exists"]:
             missing = {
@@ -959,6 +1121,7 @@ def _compile_loaded(
     markers.sort(key=lambda item: (item["frame"], item["kind"], item["id"]))
     clips.sort(key=lambda item: (item["start_frame"], item["index"], item["id"]))
     overlays.sort(key=lambda item: (item["start_frame"], item["track"], item["id"]))
+    upload_subtitles.sort(key=lambda item: (item["start_frame"], item["id"]))
     subtitles.sort(key=lambda item: (item["start_frame"], item["id"]))
     audio.sort(key=lambda item: (item["track"], item["start_frame"], item["id"]))
     missing_media.sort(
@@ -1012,6 +1175,8 @@ def _compile_loaded(
             "fcpxml_path_kind": "project-relative",
             "subtitles": default_subtitles_path,
             "subtitles_path_kind": "project-relative",
+            "presentation_subtitles": default_presentation_subtitles_path,
+            "presentation_subtitles_path_kind": "project-relative",
         },
         "fps": fps,
         "resolution": {"width": width, "height": height},
@@ -1086,6 +1251,8 @@ def _compile_loaded(
         "clips": clips,
         "markers": markers,
         "subtitles": subtitles,
+        "upload_subtitles": upload_subtitles,
+        "subtitle_policy": subtitle_policy,
         "overlays": overlays,
         "audio": audio,
         "provenance": provenance,
@@ -1093,6 +1260,13 @@ def _compile_loaded(
         "missing_media": missing_media,
         "review_flags": review_flags,
     }
+    if cold_open["prefix_frames"]:
+        try:
+            plan = shift_plan_for_prefix(plan, cold_open)
+        except ColdOpenError as exc:
+            raise ResolveManifestError(
+                f"could not apply cold_open override: {exc}"
+            ) from exc
     return plan
 
 
@@ -1480,6 +1654,7 @@ def _normalize_overrides(raw: Any) -> dict[str, Any]:
     allowed = {
         "asset_paths",
         "clip_tracks",
+        "cold_open",
         "media_root",
         "review_resolutions",
         "transforms",
@@ -1493,6 +1668,10 @@ def _normalize_overrides(raw: Any) -> dict[str, Any]:
     for key in ("asset_paths", "clip_tracks", "review_resolutions", "transforms"):
         if key in obj:
             normalized[key] = dict(_require_mapping(obj[key], f"overrides.{key}"))
+    if "cold_open" in obj:
+        normalized["cold_open"] = dict(
+            _require_mapping(obj["cold_open"], "overrides.cold_open")
+        )
     if "media_root" in obj:
         normalized["media_root"] = _required_string(
             obj["media_root"], "overrides.media_root"
@@ -1725,13 +1904,44 @@ def _compile_markers(
 
 def _compile_overlays(
     raw_overlays: Sequence[Mapping[str, Any]], fps: int
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     overlays: list[dict[str, Any]] = []
     subtitles: list[dict[str, Any]] = []
+    subtitle_exclusions: list[dict[str, Any]] = []
     for position, raw in enumerate(raw_overlays):
         kind = _slug(raw["kind"])
         start_frame = _seconds_to_frame(raw["start"], fps)
         end_frame = _end_frame(raw["start"], raw["end"], fps)
+        if kind in _SUBTITLE_EXCLUSION_KINDS:
+            detail = raw.get("detail")
+            authored_reason = (
+                detail.get("reason")
+                if isinstance(detail, Mapping)
+                else None
+            )
+            reason = _slug(
+                _string_or_empty(authored_reason)
+                or _string_or_empty(raw.get("text"))
+                or "editorial_exclusion"
+            )
+            payload = {
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "reasons": [reason],
+                "sources": [
+                    {
+                        "type": "edl_overlay",
+                        "position": position,
+                        "kind": kind,
+                    }
+                ],
+            }
+            subtitle_exclusions.append(payload)
+            continue
         track = "V4" if kind in _V4_TERMS else "V3"
         payload = {
             "kind": kind,
@@ -1764,7 +1974,293 @@ def _compile_overlays(
                 "editable": True,
             }
             subtitles.append(subtitle)
-    return overlays, subtitles
+    return overlays, subtitles, subtitle_exclusions
+
+
+def _clip_subtitle_exclusion_reasons(
+    clip: Mapping[str, Any],
+    slot: Mapping[str, Any] | None,
+    asset: Mapping[str, Any] | None,
+) -> list[str]:
+    """Classify visual intervals that must carry no presentation captions."""
+
+    slot_kind = _slug(
+        _string_or_empty((slot or {}).get("kind"))
+        or _string_or_empty(clip.get("slot_kind"))
+    )
+    slot_detail = _string_or_empty((slot or {}).get("detail")).lower()
+    provider = _string_or_empty((asset or {}).get("provider")).lower()
+    notes = _string_or_empty((asset or {}).get("notes")).lower()
+    editorial_text = " ".join(
+        (
+            slot_kind.replace("_", " "),
+            slot_detail,
+            _string_or_empty(clip.get("origin")).lower(),
+            _string_or_empty(clip.get("reason")).lower(),
+        )
+    )
+
+    reasons: set[str] = set()
+    if slot_kind == "cold_open" or re.search(r"\bcold[ _-]?open\b", editorial_text):
+        reasons.add("cold_open")
+    if (
+        slot_kind in _TEXT_LED_SLOT_KINDS
+        or provider in _TEXT_LED_PROVIDERS
+        or "page capture" in notes
+        or "browser capture" in notes
+        or re.search(
+            r"\b(?:article|citation|document|quote|timeline|"
+            r"stat(?:istic)?|comparison)\b",
+            slot_detail,
+        )
+    ):
+        reasons.add("text_led_visual")
+    return sorted(reasons)
+
+
+def _merge_subtitle_exclusions(
+    intervals: Sequence[Mapping[str, Any]],
+    *,
+    duration_frames: int,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for raw in intervals:
+        start = max(0, min(int(raw.get("start_frame", 0)), duration_frames))
+        end = max(0, min(int(raw.get("end_frame", 0)), duration_frames))
+        if end <= start:
+            continue
+        reasons = sorted(
+            {
+                _slug(str(reason))
+                for reason in raw.get("reasons", [])
+                if str(reason).strip()
+            }
+        )
+        sources = [
+            _json_safe(source)
+            for source in raw.get("sources", [])
+            if isinstance(source, Mapping)
+        ]
+        sources.sort(key=_canonical_json)
+        normalized.append(
+            {
+                "start_frame": start,
+                "end_frame": end,
+                "reasons": reasons or ["editorial_exclusion"],
+                "sources": sources,
+            }
+        )
+    normalized.sort(
+        key=lambda item: (
+            item["start_frame"],
+            item["end_frame"],
+            item["reasons"],
+            [_canonical_json(source) for source in item["sources"]],
+        )
+    )
+
+    merged: list[dict[str, Any]] = []
+    for item in normalized:
+        if not merged or item["start_frame"] > merged[-1]["end_frame"]:
+            merged.append(
+                {
+                    "start_frame": item["start_frame"],
+                    "end_frame": item["end_frame"],
+                    "reasons": list(item["reasons"]),
+                    "sources": list(item["sources"]),
+                }
+            )
+            continue
+        current = merged[-1]
+        current["end_frame"] = max(current["end_frame"], item["end_frame"])
+        current["reasons"] = sorted(
+            set(current["reasons"]) | set(item["reasons"])
+        )
+        unique_sources = {
+            _canonical_json(source): source
+            for source in current["sources"] + item["sources"]
+        }
+        current["sources"] = [
+            unique_sources[key] for key in sorted(unique_sources)
+        ]
+
+    for item in merged:
+        item["duration_frames"] = item["end_frame"] - item["start_frame"]
+        item["id"] = _stable_id(
+            "subtitle-exclusion",
+            {
+                "policy": _PRESENTATION_SUBTITLE_POLICY_VERSION,
+                "start_frame": item["start_frame"],
+                "end_frame": item["end_frame"],
+                "reasons": item["reasons"],
+                "sources": item["sources"],
+            },
+        )
+    return merged
+
+
+def _subtract_subtitle_exclusions(
+    start_frame: int,
+    end_frame: int,
+    exclusions: Sequence[Mapping[str, Any]],
+) -> list[tuple[int, int]]:
+    segments = [(start_frame, end_frame)]
+    for exclusion in exclusions:
+        exclusion_start = int(exclusion["start_frame"])
+        exclusion_end = int(exclusion["end_frame"])
+        next_segments: list[tuple[int, int]] = []
+        for segment_start, segment_end in segments:
+            if exclusion_end <= segment_start or exclusion_start >= segment_end:
+                next_segments.append((segment_start, segment_end))
+                continue
+            if segment_start < exclusion_start:
+                next_segments.append((segment_start, exclusion_start))
+            if exclusion_end < segment_end:
+                next_segments.append((exclusion_end, segment_end))
+        segments = next_segments
+        if not segments:
+            break
+    return segments
+
+
+def _compile_presentation_subtitles(
+    upload_subtitles: Sequence[Mapping[str, Any]],
+    *,
+    clips: Sequence[Mapping[str, Any]],
+    overlays: Sequence[Mapping[str, Any]],
+    provenance: Sequence[Mapping[str, Any]],
+    slot_metadata: Mapping[str, Mapping[str, Any]],
+    authored_exclusions: Sequence[Mapping[str, Any]],
+    duration_frames: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build a clean Resolve track while retaining every upload-sidecar cue."""
+
+    candidates = [dict(item) for item in authored_exclusions]
+    assets = {
+        str(item.get("asset_id")): item
+        for item in provenance
+        if item.get("asset_id")
+    }
+    for clip in clips:
+        slot_id = _string_or_empty(clip.get("slot_id"))
+        asset_id = _string_or_empty(clip.get("asset_id"))
+        reasons = _clip_subtitle_exclusion_reasons(
+            clip,
+            slot_metadata.get(slot_id),
+            assets.get(asset_id),
+        )
+        if reasons:
+            candidates.append(
+                {
+                    "start_frame": int(clip["start_frame"]),
+                    "end_frame": int(clip["end_frame"]),
+                    "reasons": reasons,
+                    "sources": [
+                        {
+                            "type": "clip",
+                            "id": clip.get("id"),
+                            "slot_id": slot_id or None,
+                            "asset_id": asset_id or None,
+                        }
+                    ],
+                }
+            )
+    for overlay in overlays:
+        kind = _slug(_string_or_empty(overlay.get("kind")))
+        if kind not in _TEXT_LED_OVERLAY_KINDS:
+            continue
+        candidates.append(
+            {
+                "start_frame": int(overlay["start_frame"]),
+                "end_frame": int(overlay["end_frame"]),
+                "reasons": ["text_led_overlay"],
+                "sources": [
+                    {
+                        "type": "overlay",
+                        "id": overlay.get("id"),
+                        "kind": kind,
+                    }
+                ],
+            }
+        )
+
+    exclusions = _merge_subtitle_exclusions(
+        candidates,
+        duration_frames=duration_frames,
+    )
+    presentation: list[dict[str, Any]] = []
+    affected_cues = 0
+    fully_suppressed_cues = 0
+    for position, raw in enumerate(upload_subtitles):
+        subtitle = dict(raw)
+        start = int(subtitle.get("start_frame", 0))
+        raw_end = subtitle.get("end_frame")
+        if raw_end is None:
+            raw_end = start + int(subtitle.get("duration_frames", 0))
+        end = int(raw_end)
+        segments = _subtract_subtitle_exclusions(start, end, exclusions)
+        if segments == [(start, end)]:
+            presentation.append(subtitle)
+            continue
+        affected_cues += 1
+        if not segments:
+            fully_suppressed_cues += 1
+            continue
+        source_id = str(subtitle.get("id") or f"subtitle-{position}")
+        for fragment_index, (fragment_start, fragment_end) in enumerate(segments):
+            fragment = dict(subtitle)
+            fragment.update(
+                {
+                    "id": _stable_id(
+                        "subtitle",
+                        {
+                            "policy": _PRESENTATION_SUBTITLE_POLICY_VERSION,
+                            "source_subtitle_id": source_id,
+                            "fragment_index": fragment_index,
+                            "start_frame": fragment_start,
+                            "end_frame": fragment_end,
+                        },
+                    ),
+                    "start_frame": fragment_start,
+                    "end_frame": fragment_end,
+                    "duration_frames": fragment_end - fragment_start,
+                    "source_subtitle_id": source_id,
+                    "presentation_fragment": True,
+                }
+            )
+            presentation.append(fragment)
+
+    presentation.sort(key=lambda item: (item["start_frame"], item["id"]))
+    track_style = {
+        "schema_version": _PRESENTATION_SUBTITLE_STYLE_VERSION,
+        "track_name": "PRESENTATION_SUBTITLES",
+        "font_color": "#FFFFFF",
+        "background_color": "#000000",
+        "minimum_background_opacity": 0.65,
+        "position": "lower-center-title-safe",
+        "application": "manual-resolve-track-style",
+        "render_approval_required": bool(presentation),
+    }
+    track_style["contract_sha256"] = _sha256_json(track_style)
+    policy = {
+        "schema_version": "resolve-subtitle-policy.v1",
+        "policy_version": _PRESENTATION_SUBTITLE_POLICY_VERSION,
+        "mode": "selective",
+        "timeline_track_name": "PRESENTATION_SUBTITLES",
+        "upload_sidecar": "complete",
+        "presentation_track": "exclude_text_led_visuals",
+        "track_style": track_style,
+        "text_led_slot_kinds": sorted(_TEXT_LED_SLOT_KINDS),
+        "text_led_overlay_kinds": sorted(_TEXT_LED_OVERLAY_KINDS),
+        "text_led_providers": sorted(_TEXT_LED_PROVIDERS),
+        "exclusion_intervals": exclusions,
+        "upload_cue_count": len(upload_subtitles),
+        "presentation_cue_count": len(presentation),
+        "affected_upload_cue_count": affected_cues,
+        "fully_suppressed_upload_cue_count": fully_suppressed_cues,
+    }
+    policy["contract_sha256"] = _sha256_json(policy)
+    return presentation, policy
 
 
 def _assign_non_overlapping_title_tracks(

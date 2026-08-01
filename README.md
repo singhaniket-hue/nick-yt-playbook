@@ -25,14 +25,15 @@ archives, and local application state are intentionally excluded from Git.
 - Python 3.11 or newer
 - DaVinci Resolve 21 or newer
 - FFmpeg and ffprobe on `PATH` for conforming, generated plates, audio stems,
-  verification, and the explicit legacy backend. Subtitle and graphic-card
-  generation requires FFmpeg's `ass` filter (libass).
-- `yt-dlp` is installed inside the uv-managed project environment; no separate
-  machine-global installation is required.
-- Chrome, Edge, or Chromium for browser-capture operations
-- Poppler's `pdftoppm` for PDF evidence capture
-- an ElevenLabs API key when using narration or sound generation; narration
-  additionally requires a voice ID
+  verification, and the explicit legacy backend. The repository's portability
+  doctor also requires FFmpeg's `ass` filter (libass).
+- `yt-dlp` is installed inside the project environment by either bootstrap
+  path; no separate machine-global installation is required.
+- For end-to-end acquisition only: Chrome, Edge, or Chromium for live-page
+  motion capture, Poppler's `pdftoppm` for PDF evidence, and the network/API
+  credentials required by the selected narration or sound services. A host
+  rendering an already prepared episode does not need a browser, Poppler, or
+  those credentials.
 
 Resolve Free uses an in-app runner. Resolve Studio may use the external scripting
 bridge. The timeline compiler, queue, safety checks, and handoff format are the
@@ -58,6 +59,8 @@ On macOS:
 # Homebrew's regular FFmpeg 8 formula omits libass; use the keg-only full build.
 brew install uv ffmpeg-full poppler
 export PATH="$(brew --prefix ffmpeg-full)/bin:$PATH"
+# End-to-end acquisition only; skip if Chrome or Edge is already installed.
+brew install --cask google-chrome
 bash scripts/bootstrap.sh
 ```
 
@@ -67,6 +70,15 @@ Or use the identical manual setup on either platform:
 uv sync --extra dev
 uv run rabbithole resolve doctor --mode free
 ```
+
+The bootstrap scripts prefer an installed `uv`. If `uv` is unavailable, they
+create `.venv`, install the editable project and development dependencies with
+pip, and print a direct command prefix that works without activation. The
+prefix also puts the environment's console scripts (including `yt-dlp`) on the
+child-process `PATH`. In that fallback environment, replace
+`uv run rabbithole ...` below with the printed command. For `uv run python ...`,
+use the same PATH prefix and `.venv` Python. Do not assume a global `uv` was
+installed by the fallback.
 
 Fill in `.env` only for the paid/network services you use. The checked-in
 example contains no credentials or account-specific voice identifier.
@@ -183,6 +195,17 @@ The generated timeline is immutable and named `AUTO_BUILD_<hash>`. Duplicate it
 to `EDITORIAL_v1` before making human edits; automation never changes or deletes
 an `EDITORIAL_` timeline.
 
+Before a final render, inspect `PRESENTATION_SUBTITLES` Track Style on one
+bright and one dark frame. It must use white text on a black background at 65%
+or greater opacity. Record that exact-build, machine-local check with:
+
+```text
+uv run rabbithole resolve approve-caption-style projects/my-episode
+```
+
+Render fails closed until this check is present. It does not transfer to another
+computer, so repeat it after restoring on Windows or macOS.
+
 Render and package a complete editor handoff:
 
 ```text
@@ -238,6 +261,7 @@ uv run rabbithole resolve install-runner
 uv run rabbithole resolve preflight projects/my-episode --mode <free|studio>
 uv run rabbithole resolve prepare projects/my-episode
 uv run rabbithole resolve build projects/my-episode --mode <free|studio>
+uv run rabbithole resolve approve-caption-style projects/my-episode
 uv run rabbithole resolve render projects/my-episode --mode <free|studio>
 ```
 

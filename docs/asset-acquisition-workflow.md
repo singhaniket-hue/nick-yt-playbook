@@ -84,6 +84,14 @@ slot. Existing source metadata remains useful:
 - `full_page: true`;
 - `crop` as `{x, y, width, height}` in the retained screenshot.
 
+For article and webpage evidence, retain a Chromium motion recording rather
+than a simulated pan across one screenshot. Establish the real page and browser
+context first, make one restrained scroll or push to the authored selector or
+text target, then hold the claim long enough to read. The recorded target and
+final crop must pass the same fail-closed QA as a still capture. Use a still
+only when motion would add no source context or when the source itself is a
+static document/image.
+
 The same fields may be supplied by a `research/capture-targets*.json` overlay
 keyed by slot ID. Invalid targets and crops are rejected during planning before
 browser or network work begins.
@@ -122,8 +130,11 @@ have text-like structure. Uniform frames, failed embeds, error panels, and
 repeated dot or box grids remain rejected. This narrow fallback is not an
 operator bypass.
 
-When source pixels cannot be retained, the supported local evidence-card
-strategies are explicit editorial choices:
+When usable source pixels exist, keep them on screen. If a particular claim is
+not fully verified, add a small claim-specific qualifier/source label in a safe
+corner; do not replace real pixels with a full-screen `source unverified`
+placeholder. When source pixels cannot be retained at all, the supported local
+evidence-card strategies are explicit editorial choices:
 
 ```text
 manual-editorial-card-no-page-capture
@@ -149,6 +160,11 @@ The second floor prevents a timeline made mostly from local paraphrase cards
 from passing the documentary evidence gate merely because those records cite
 real sources. Ordinary generated graphics, plates, and atmospherics enter
 neither measurement.
+
+Keep card density restrained. Prefer moving primary-source footage, Chromium
+evidence, retained video frames, and archival material; use a designed card for
+chapter structure or a concept that source pixels cannot communicate. Avoid
+consecutive text-led cards and plan caption exclusion over every text-led shot.
 
 ## Deriving video from a licensed source image
 

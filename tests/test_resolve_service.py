@@ -1,8 +1,171 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import rabbithole.resolve_service as service
+
+
+def _probe_result(
+    duration: float,
+    *,
+    frame_rate: str = "30/1",
+    nb_frames: int | None = None,
+    format_duration: float | None = None,
+    returncode: int = 0,
+):
+    frames = round(duration * 30) if nb_frames is None else nb_frames
+    format_section = (
+        f', "format": {{"duration": "{format_duration}"}}'
+        if format_duration is not None
+        else ""
+    )
+    return SimpleNamespace(
+        returncode=returncode,
+        stdout=(
+            '{"streams": [{"duration": "'
+            f'{duration}", "nb_frames": "{frames}", '
+            f'"avg_frame_rate": "{frame_rate}"}}]{format_section}}}'
+        ),
+        stderr="" if returncode == 0 else "probe failed",
+    )
+
+
+def test_video_source_range_audit_probes_each_file_once(tmp_path, monkeypatch):
+    root = tmp_path / "episode"
+    root.mkdir()
+    calls = []
+    monkeypatch.setattr(service.shutil, "which", lambda name: f"/{name}")
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _probe_result(10.0)
+
+    monkeypatch.setattr(service.subprocess, "run", fake_run)
+    plan = {
+        "fps": 30,
+        "clips": [
+            {
+                "id": "clip-a",
+                "media_type": "video",
+                "media_path": "assets/source.mp4",
+                "source_end_frame": 300,
+            },
+            {
+                "id": "clip-b",
+                "media_type": "video",
+                "media_path": "assets/source.mp4",
+                "source_end_frame": 150,
+            },
+            {
+                "id": "still",
+                "media_type": "image",
+                "media_path": "assets/source.png",
+                "source_end_frame": 900,
+            },
+        ],
+    }
+
+    result = service._audit_video_source_ranges(root, plan)
+
+    assert result["ok"] is True
+    assert result["clip_count"] == 2
+    assert result["unique_media_count"] == 1
+    assert len(calls) == 1
+    assert calls[0][0][-1] == str((root / "assets" / "source.mp4").resolve())
+
+
+def test_video_source_range_audit_fails_for_unavailable_terminal_frame(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "episode"
+    root.mkdir()
+    monkeypatch.setattr(service.shutil, "which", lambda name: f"/{name}")
+    monkeypatch.setattr(
+        service.subprocess,
+        "run",
+        lambda *args, **kwargs: _probe_result(9.99),
+    )
+    plan = {
+        "fps": 30,
+        "clips": [
+            {
+                "id": "clip-a",
+                "media_type": "video",
+                "media_path": "assets/source.mp4",
+                "source_end_frame": 300,
+            }
+        ],
+    }
+
+    result = service._audit_video_source_ranges(root, plan)
+
+    assert result["ok"] is False
+    assert result["probe_failures"] == []
+    assert result["shortages"][0]["required_end_frame"] == 300
+    assert result["shortages"][0]["clip_ids"] == ["clip-a"]
+
+
+def test_video_source_range_audit_ignores_longer_container_duration(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "episode"
+    root.mkdir()
+    monkeypatch.setattr(service.shutil, "which", lambda name: f"/{name}")
+    monkeypatch.setattr(
+        service.subprocess,
+        "run",
+        lambda *args, **kwargs: _probe_result(
+            9.9,
+            nb_frames=297,
+            format_duration=10.5,
+        ),
+    )
+    plan = {
+        "fps": 30,
+        "clips": [
+            {
+                "id": "clip-a",
+                "media_type": "video",
+                "media_path": "assets/source.mp4",
+                "source_end_frame": 300,
+            }
+        ],
+    }
+
+    result = service._audit_video_source_ranges(root, plan)
+
+    assert result["ok"] is False
+    assert result["shortages"][0]["available_seconds"] == 9.9
+
+
+def test_video_source_range_audit_allows_mp4_timescale_rounding(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "episode"
+    root.mkdir()
+    monkeypatch.setattr(service.shutil, "which", lambda name: f"/{name}")
+    monkeypatch.setattr(
+        service.subprocess,
+        "run",
+        lambda *args, **kwargs: _probe_result(9.9995),
+    )
+    plan = {
+        "fps": 30,
+        "clips": [
+            {
+                "id": "clip-a",
+                "media_type": "video",
+                "media_path": "assets/source.mp4",
+                "source_end_frame": 300,
+            }
+        ],
+    }
+
+    result = service._audit_video_source_ranges(root, plan)
+
+    assert result["ok"] is True
+    assert result["shortages"] == []
 
 
 def test_free_preflight_keeps_console_python_as_manual_warning(

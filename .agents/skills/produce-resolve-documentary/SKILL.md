@@ -156,6 +156,34 @@ Never dismiss consent automatically or bypass blank QA. Use an unobstructed
 archive, an exact frame from already retained source video, or an explicitly
 disclosed citation-card fallback.
 
+Treat article and webpage evidence as a Chromium motion recording by default:
+establish the real page and browser context, then make one restrained scroll or
+push to the authored claim and hold it long enough to read. Do not animate a
+frozen screenshot to imitate browsing. If usable source pixels exist but a
+claim remains uncertain, keep the pixels and add a small, claim-specific
+qualifier; never replace them with a full-screen `source unverified` placeholder.
+Reserve a full citation card for the fail-closed case where no usable source
+pixels can be retained, and label it as editorial paraphrase.
+
+When the episode authors a source-led cold open, reserve approximately eleven
+seconds before narration for the retained primary-source clip. Mute source
+audio by default; enable it only when the episode rights ledger explicitly
+permits that exact use. Burn a small source credit into the derived excerpt when
+the cold open intentionally excludes overlays. An authored crackle may lead the
+clip; narration, music, and captions stay silent until the hard cut into the
+documentary. Do not synthesize or extend source action merely to reach the
+target duration.
+
+Author the prefix under `cold_open` in project-local `resolve-overrides.json`.
+Use provenance `asset_id` values for video, project-relative paths for SFX, and
+exact gap-free V1 coverage. Follow the canonical example in
+`docs/resolve-workflow.md`, then pass the same override to both immutable stages:
+
+```text
+uv run rabbithole resolve prepare projects/<slug> --overrides resolve-overrides.json
+uv run rabbithole resolve build projects/<slug> --mode <free|studio> --overrides resolve-overrides.json
+```
+
 Use the uv-managed yt-dlp path. Primary downloads must retain their exact claims
 URL gate and pass the portable H.264 MP4/ffprobe checks before provenance accepts
 them.
@@ -179,6 +207,10 @@ Review both graphics and evidence sheets in timeline order. Exit code `1` means
 the sheets were written with red missing/unreadable cards; resolve every
 intended gap before approval. Check source/date labels, target context, derived
 frame timestamp/crop, citation-card disclosures, and both signal-card caveats.
+Keep designed cards sparse: use them for chapter structure or a concept that
+source footage cannot show, not as the default visual for every narration beat.
+Avoid consecutive text-led cards and never stack a narration caption over a
+text-led card, article, browser page, quote, or document excerpt.
 
 For a no-network technical pass, use `--tier atmospheric --quality animatic`.
 A final run requires source-bound evidence, rights/licence notes, complete
@@ -209,14 +241,27 @@ job or render. Resolve stem preparation must fail closed when
 `research/source-audio.json` contains bites until their A1/A3 duck automation
 can be baked faithfully; use the FFmpeg renderer for that case.
 
-`prepare` must also emit a checksum-pinned `subtitles.srt` beside the FCPXML.
-Resolve 21 may ignore otherwise-valid FCPXML `caption` elements. The in-app
-runner must keep a complete native caption import, append the SRT only when the
-imported subtitle count is exactly zero, and fail closed on a partial count so
-it never duplicates captions. Validate exact cue timing and normalized text
-after import, on immutable timeline reuse, and before render. Use only
+`prepare` must retain checksum-pinned `subtitles.srt` as the complete upload
+sidecar and compile selective `presentation-subtitles.srt` for Resolve. Suppress
+presentation cues during the source-led cold open and every text-led visual
+(cards, quotes, documents, articles, and browser evidence); retain cues over
+non-textual footage. Resolve 21 may ignore otherwise-valid FCPXML `caption`
+elements, so the in-app runner must import only `presentation-subtitles.srt`,
+append it only when the imported caption count is exactly zero,
+and fail closed on a partial count so it never duplicates captions. Validate
+exact cue timing, exclusions, and normalized text after import, on immutable
+timeline reuse, and before render. Use only
 Resolve-supported marker colors; warning and human-review markers are Yellow
 because Resolve rejects `Orange`.
+
+Plain SRT fallback carries no styling. Before final render, inspect
+`PRESENTATION_SUBTITLES` in Resolve Track Style on both a bright and dark frame;
+require white text on a black background at 65% or greater opacity inside title
+safe. Then run `uv run rabbithole resolve approve-caption-style
+projects/<slug> --overrides resolve-overrides.json`. This approval is local to
+the exact build and host, is excluded from transfer bundles, and must be repeated
+after restoring on another Windows or macOS machine. Never bypass the render
+gate by copying an approval file.
 Create a marker with empty custom data first, then attach its JSON through
 `UpdateMarkerCustomData`; Resolve can reject the equivalent combined
 `AddMarker` call. Defensively handle a transient `False` response only with
