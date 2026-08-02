@@ -297,6 +297,52 @@ def test_gain_bake_fingerprint_distinguishes_identical_project_sources(tmp_path)
     )
 
 
+def test_gain_bake_normalizes_source_identity_and_plan_provenance(tmp_path):
+    root = tmp_path / "episode"
+    source = _tone(
+        root / "resolve" / "audio-stems" / "current" / "music-stem.wav"
+    )
+    source_sha = resolve_audio._sha256_file(source)
+    aliased_path = r"resolve\audio-stems\current\.\music-stem.wav"
+    canonical_path = "resolve/audio-stems/current/music-stem.wav"
+    clip = {
+        "id": "music",
+        "media_path": aliased_path,
+        "path_kind": "project-relative",
+        "sha256": source_sha,
+        "source_start_frame": 0,
+        "duration_frames": 30,
+        "gain_db": -3.0,
+        "exists": True,
+    }
+
+    aliased = resolve_audio.prepare_resolve_gain_bake(root, clip, fps=30)
+    canonical = resolve_audio.prepare_resolve_gain_bake(
+        root,
+        {**clip, "media_path": canonical_path},
+        fps=30,
+    )
+    plan = {"fps": 30, "audio": [dict(clip)]}
+    resolve_audio.bake_resolve_plan_audio_gains(root, plan)
+
+    assert aliased["fingerprint"] == canonical["fingerprint"]
+    assert canonical["generated"] is False
+    assert aliased["manifest"]["source"]["media_path"] == canonical_path
+    assert plan["audio"][0]["gain_bake_source_media_path"] == canonical_path
+    assert plan["audio"][0]["gain_bake_source_path_kind"] == "project-relative"
+
+    external = resolve_audio.prepare_resolve_gain_bake(
+        root,
+        {
+            **clip,
+            "media_path": str(source.resolve()),
+            "path_kind": "external-absolute",
+        },
+        fps=30,
+    )
+    assert external["fingerprint"] != canonical["fingerprint"]
+
+
 def test_gain_bake_plan_rewrites_nested_cold_open_audio(tmp_path):
     root = tmp_path / "episode"
     source = _tone(root / "assets" / "crackle.wav", seconds=0.6)

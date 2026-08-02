@@ -1228,6 +1228,7 @@ def _load_current_audio_bake_selection(root: Path) -> dict[str, dict[str, Any]]:
             "media_path": media_path,
             "sha256": raw_clip["sha256"],
             "source_media_path": source_path,
+            "source_path_kind": raw_clip["gain_bake_source_path_kind"],
             "source_sha256": raw_clip["gain_bake_source_sha256"],
             "source_start_frame": raw_clip["gain_bake_source_start_frame"],
             "duration_frames": raw_clip["duration_frames"],
@@ -1336,13 +1337,26 @@ def _audit_audio_bake_selection(
                     f"{manifest_relative}: contract {field} does not match the "
                     "current Resolve plan"
                 )
+        contract_source_media_path = contract.get("source_media_path")
+        contract_source_path_kind = contract.get("source_path_kind")
+        if (
+            contract_source_media_path is not None
+            or contract_source_path_kind is not None
+        ) and (
+            contract_source_media_path != record["source_media_path"]
+            or contract_source_path_kind != record["source_path_kind"]
+        ):
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: contract source identity does not match "
+                "the current Resolve plan"
+            )
 
         source = _audio_json_object(
             manifest.get("source"),
             label=f"{manifest_relative} source",
         )
         if (
-            source.get("path_kind") != "project-relative"
+            source.get("path_kind") != record["source_path_kind"]
             or source.get("media_path") != record["source_media_path"]
             or source.get("sha256") != record["source_sha256"]
         ):
@@ -2173,6 +2187,7 @@ def _audit_bundled_audio_bakes(
             "media_path": f"{_AUDIO_BAKES_ROOT}/{fingerprint}/{output_name}",
             "sha256": output.get("sha256"),
             "source_media_path": source_path,
+            "source_path_kind": source.get("path_kind"),
             "source_sha256": source.get("sha256"),
             "source_start_frame": integer_fields["source_start_frame"],
             "duration_frames": integer_fields["duration_frames"],

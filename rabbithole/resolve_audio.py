@@ -354,7 +354,12 @@ def _fingerprint(contract: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_bytes(contract)).hexdigest()
 
 
-def _gain_bake_source_path(root: Path, clip: Mapping[str, Any]) -> Path:
+def _gain_bake_source_identity(
+    root: Path,
+    clip: Mapping[str, Any],
+) -> tuple[Path, str, str]:
+    """Return the resolved file and one canonical logical source identity."""
+
     raw = clip.get("media_path")
     if not isinstance(raw, str) or not raw.strip():
         raise ResolveAudioBakeError(
@@ -379,12 +384,18 @@ def _gain_bake_source_path(root: Path, clip: Mapping[str, Any]) -> Path:
             raise ResolveAudioBakeError(
                 f"audio clip {clip.get('id')!r} escapes the project: {raw!r}"
             ) from exc
-        return path
+        logical_path = PurePosixPath(*parts).as_posix()
+        return path, logical_path, "project-relative"
     if path_kind == "external-absolute":
-        return Path(raw).expanduser().resolve()
+        path = Path(raw).expanduser().resolve()
+        return path, path.as_posix(), "external-absolute"
     raise ResolveAudioBakeError(
         f"audio clip {clip.get('id')!r} has unsupported path_kind {path_kind!r}"
     )
+
+
+def _gain_bake_source_path(root: Path, clip: Mapping[str, Any]) -> Path:
+    return _gain_bake_source_identity(root, clip)[0]
 
 
 def _pcm_wave_metadata(path: Path) -> dict[str, int]:
@@ -602,7 +613,10 @@ def prepare_resolve_gain_bake(
     """Create or reuse one immutable, exact-duration gain-baked WAV clip."""
 
     root = Path(project_root).resolve()
-    source = _gain_bake_source_path(root, clip)
+    source, source_media_path, source_path_kind = _gain_bake_source_identity(
+        root,
+        clip,
+    )
     if not source.is_file():
         raise ResolveAudioBakeError(f"gain-bake source is missing: {source}")
     if source.suffix.casefold() != ".wav":
@@ -630,8 +644,6 @@ def prepare_resolve_gain_bake(
             f"audio clip {clip.get('id')!r} has an invalid gain-bake frame range"
         )
     metadata = _pcm_wave_metadata(source)
-    source_media_path = str(clip["media_path"]).replace("\\", "/")
-    source_path_kind = clip.get("path_kind")
     source_start_sample = _frame_to_audio_sample(
         source_start_frame, metadata["sample_rate"], fps
     )
@@ -788,12 +800,17 @@ def bake_resolve_plan_audio_gains(
                 "again; refusing to emit editable timeline gain"
             )
         original = {
-            "media_path": media_path,
-            "path_kind": clip.get("path_kind"),
             "sha256": clip.get("sha256"),
             "source_start_frame": int(clip.get("source_start_frame", 0)),
         }
         result = prepare_resolve_gain_bake(root, clip, fps=fps)
+        manifest_source = result["manifest"]["source"]
+        original.update(
+            {
+                "media_path": manifest_source["media_path"],
+                "path_kind": manifest_source["path_kind"],
+            }
+        )
         audio_path = Path(result["audio_path"]).resolve()
         try:
             portable_path = audio_path.relative_to(root).as_posix()

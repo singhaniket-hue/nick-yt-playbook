@@ -106,6 +106,8 @@ def _write_audio_bakes(root: Path) -> tuple[str, str, str]:
     contract = {
         "generator_version": "resolve-audio-gain-bake.v1",
         "source_basename": source.name,
+        "source_media_path": "narration/vo.wav",
+        "source_path_kind": "project-relative",
         "source_sha256": source_sha,
         "gain_db": -2.0,
         "source_start_frame": 0,
@@ -377,6 +379,56 @@ def test_bundle_includes_only_current_plan_audio_bakes_with_checksums(
         episode / manifest_path
     )
     assert records[output_path]["sha256"] == _sha256(episode / output_path)
+
+
+def test_package_rejects_gain_bake_contract_source_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    episode = _episode(tmp_path / "episode")
+    fingerprint, output_name, _historical = _write_audio_bakes(episode)
+    old_directory = episode / "resolve" / "audio-bakes" / fingerprint
+    manifest = json.loads((old_directory / "manifest.json").read_text())
+    manifest["contract"]["source_media_path"] = "narration/other.wav"
+    replacement_fingerprint = hashlib.sha256(
+        json.dumps(
+            manifest["contract"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    replacement_directory = (
+        episode / "resolve" / "audio-bakes" / replacement_fingerprint
+    )
+    replacement_directory.mkdir()
+    replacement_output_name = f"vo.gain-{replacement_fingerprint[:12]}.wav"
+    (replacement_directory / replacement_output_name).write_bytes(
+        (old_directory / output_name).read_bytes()
+    )
+    manifest["fingerprint"] = replacement_fingerprint
+    manifest["output"]["path"] = replacement_output_name
+    (replacement_directory / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    plan_path = episode / "resolve" / "builds" / "b-current" / "resolve-plan.v1.json"
+    plan = json.loads(plan_path.read_text())
+    clip = plan["audio"][0]
+    clip["gain_bake_fingerprint"] = replacement_fingerprint
+    clip["media_path"] = (
+        f"resolve/audio-bakes/{replacement_fingerprint}/{replacement_output_name}"
+    )
+    plan_path.write_text(
+        json.dumps(plan, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        EpisodeBundleValidationError,
+        match="contract source identity does not match",
+    ):
+        package_episode(episode, tmp_path / "mismatched-source.zip")
 
 
 @pytest.mark.parametrize("target", ["source", "output"])
