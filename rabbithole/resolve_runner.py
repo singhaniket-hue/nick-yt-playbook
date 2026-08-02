@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -1980,6 +1981,556 @@ def _ensure_and_name_tracks(timeline: Any, plan: Mapping[str, Any]) -> None:
         )
 
 
+def _portable_media_basename(value: Any) -> str:
+    """Return a case-insensitive basename across Windows/POSIX plan paths."""
+
+    return str(value or "").replace("\\", "/").rsplit("/", 1)[-1].casefold()
+
+
+_AUDIO_API_RETRY_DELAYS_SECONDS = (0.05, 0.15, 0.30)
+
+
+def _audio_item_signature(item: Any) -> tuple[str, int, int, int, int]:
+    """Read the immutable identity/ranges used to match imported audio.
+
+    Resolve 21 can briefly return ``None`` for a newly appended audio item's
+    frame metadata.  Read-only retries are bounded; the item is accepted only
+    after every boundary is present and internally consistent.
+    """
+
+    name = _call_required(item, "GetName")
+    attempts = len(_AUDIO_API_RETRY_DELAYS_SECONDS) + 1
+    raw_values: dict[str, Any] = {}
+    conversion_error: Exception | None = None
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(_AUDIO_API_RETRY_DELAYS_SECONDS[attempt - 1])
+        raw_values = {
+            "start": _call_required(item, "GetStart"),
+            "duration": _call_required(item, "GetDuration", False),
+            "end": _call_required(item, "GetEnd"),
+            "source_start": _call_required(item, "GetSourceStartFrame"),
+            "source_end": _call_required(item, "GetSourceEndFrame"),
+        }
+        try:
+            start = int(raw_values["start"])
+            duration = int(raw_values["duration"])
+            raw_end = int(raw_values["end"])
+            source_start = int(raw_values["source_start"])
+            source_end = int(raw_values["source_end"])
+        except (TypeError, ValueError) as exc:
+            conversion_error = exc
+            continue
+        break
+    else:
+        raise ImmutableTimelineError(
+            f"audio item {name!r} returned incomplete frame metadata after "
+            f"{attempts} bounded reads: {raw_values!r}"
+        ) from conversion_error
+
+    canonical_end = start + duration
+    # Resolve can expose the same audio range with a half-open GetEnd() after
+    # FCPXML import and an inclusive GetEnd() after AppendToTimeline().
+    if raw_end not in {canonical_end - 1, canonical_end}:
+        raise ImmutableTimelineError(
+            f"audio item {name!r} has inconsistent end/duration: "
+            f"start={start}, end={raw_end}, duration={duration}"
+        )
+    return (
+        _portable_media_basename(name),
+        start,
+        canonical_end,
+        source_start,
+        source_end,
+    )
+
+
+def _planned_audio_signature(
+    clip: Mapping[str, Any],
+    *,
+    timeline_offset: int,
+) -> tuple[str, int, int, int, int]:
+    start = int(clip["start_frame"])
+    end = int(clip.get("end_frame", start + int(clip["duration_frames"])))
+    duration = int(clip.get("duration_frames", end - start))
+    source_start = int(clip.get("source_start_frame", 0))
+    # Resolve's source-end API and AppendToTimeline endFrame are inclusive.
+    source_end = int(clip.get("source_end_frame", source_start + duration)) - 1
+    return (
+        _portable_media_basename(clip.get("media_path")),
+        timeline_offset + start,
+        timeline_offset + end,
+        source_start,
+        source_end,
+    )
+
+
+def _delete_audio_clones(
+    timeline: Any,
+    clones: Sequence[Any],
+    *,
+    original_error: Exception,
+) -> None:
+    """Rollback only newly appended clones, never the imported originals."""
+
+    rollback_error: Exception | None = None
+    attempts = len(_AUDIO_API_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(_AUDIO_API_RETRY_DELAYS_SECONDS[attempt - 1])
+        try:
+            rolled_back = _call_required(
+                timeline, "DeleteClips", list(clones), False
+            )
+        except Exception as exc:
+            rollback_error = exc
+            continue
+        if rolled_back is True:
+            return
+    if rollback_error is not None:
+        raise ResolveExecutionError(
+            f"{original_error}; appended audio-clone rollback failed after "
+            f"{attempts} bounded attempts: {rollback_error}"
+        ) from original_error
+    raise ResolveExecutionError(
+        f"{original_error}; appended audio-clone rollback was rejected after "
+        f"{attempts} bounded attempts"
+    ) from original_error
+
+
+def _append_verified_audio_clone(
+    media_pool: Any,
+    timeline: Any,
+    *,
+    media_item: Any,
+    track_index: int,
+    expected_signature: tuple[str, int, int, int, int],
+) -> Any:
+    """Append one exact audio item, probing Resolve's endpoint convention."""
+
+    source_start, imported_source_end = expected_signature[3], expected_signature[4]
+    duration = expected_signature[2] - expected_signature[1]
+    endpoint_candidates = list(
+        dict.fromkeys((imported_source_end, source_start + duration))
+    )
+    validation_errors: list[Exception] = []
+    for append_end in endpoint_candidates:
+        append_info = {
+            "mediaPoolItem": media_item,
+            "startFrame": source_start,
+            "endFrame": append_end,
+            "mediaType": 2,
+            "trackIndex": track_index,
+            "recordFrame": expected_signature[1],
+        }
+        appended = _sequence_values(
+            _call_required(media_pool, "AppendToTimeline", [append_info]),
+            label="AppendToTimeline([audio clipInfo])",
+        )
+        if len(appended) != 1:
+            error = ResolveExecutionError(
+                f"AppendToTimeline() returned {len(appended)} audio clones; expected 1"
+            )
+            clones = [item for item in appended if item is not None]
+            if clones:
+                _delete_audio_clones(timeline, clones, original_error=error)
+            raise error
+        candidate = appended[0]
+        if candidate is None:
+            validation_errors.append(
+                ResolveExecutionError("AppendToTimeline() returned a null audio clone")
+            )
+            continue
+        try:
+            actual_signature = _audio_item_signature(candidate)
+            track_type_index = _sequence_values(
+                _call_required(candidate, "GetTrackTypeAndIndex"),
+                label="GetTrackTypeAndIndex()",
+            )
+            if (
+                actual_signature != expected_signature
+                or track_type_index != ["audio", track_index]
+            ):
+                raise ImmutableTimelineError(
+                    "appended audio clone failed identity/range/track validation: "
+                    f"got {actual_signature!r} on {track_type_index!r}, expected "
+                    f"{expected_signature!r} on ['audio', {track_index}]"
+                )
+        except Exception as exc:
+            _delete_audio_clones(timeline, [candidate], original_error=exc)
+            validation_errors.append(exc)
+            continue
+        return candidate
+    raise ImmutableTimelineError(
+        "no AppendToTimeline audio boundary preserved the compiled range: "
+        + "; ".join(str(item) for item in validation_errors)
+    )
+
+
+def _rollback_audio_rehome_transaction(
+    media_pool: Any,
+    timeline: Any,
+    committed: Sequence[
+        tuple[Any, Any, int, tuple[str, int, int, int, int]]
+    ],
+    *,
+    original_error: Exception,
+) -> None:
+    """Restore every earlier move in reverse order or fail explicitly."""
+
+    failures: list[str] = []
+    for replacement, media_item, original_track, signature in reversed(committed):
+        try:
+            _append_verified_audio_clone(
+                media_pool,
+                timeline,
+                media_item=media_item,
+                track_index=original_track,
+                expected_signature=signature,
+            )
+        except Exception as exc:
+            failures.append(f"restore A{original_track} {signature!r}: {exc}")
+            continue
+        try:
+            _delete_audio_clones(
+                timeline,
+                [replacement],
+                original_error=original_error,
+            )
+        except Exception as exc:
+            failures.append(f"remove repaired clone {signature!r}: {exc}")
+    if failures:
+        raise ResolveExecutionError(
+            f"{original_error}; audio-lane repair transaction rollback incomplete: "
+            + "; ".join(failures)
+        ) from original_error
+
+
+def _remove_audio_lane_materializers(
+    timeline: Any,
+    plan: Mapping[str, Any],
+) -> None:
+    """Delete only compiler-declared sparse-lane clips after exact matching."""
+
+    raw_materializers = plan.get("audio_lane_materializers")
+    if raw_materializers in (None, []):
+        return
+    if not isinstance(raw_materializers, Sequence) or isinstance(
+        raw_materializers, (str, bytes)
+    ):
+        raise ResolveExecutionError(
+            "plan audio_lane_materializers must be an array"
+        )
+    materializers = [
+        item for item in raw_materializers if isinstance(item, Mapping)
+    ]
+    if len(materializers) != len(raw_materializers):
+        raise ResolveExecutionError(
+            "plan audio_lane_materializers entries must be objects"
+        )
+
+    specs = _track_specs(plan, "audio")
+    index_by_id = {str(spec["id"]): int(spec["index"]) for spec in specs}
+    validation = plan.get("timeline_validation")
+    plan_start = (
+        int(validation.get("start_frame", 0))
+        if isinstance(validation, Mapping)
+        else 0
+    )
+    timeline_offset = int(_call_required(timeline, "GetStartFrame")) - plan_start
+    getter = getattr(timeline, "GetItemListInTrack", None)
+    if not callable(getter):
+        raise ImmutableTimelineError(
+            "timeline cannot inspect audio lane materializers"
+        )
+
+    matched: list[Any] = []
+    matched_by_track: list[tuple[int, tuple[str, int, int, int, int]]] = []
+    for clip in materializers:
+        track_index = index_by_id.get(str(clip.get("track") or ""))
+        if track_index is None:
+            raise ResolveExecutionError(
+                f"unknown audio lane materializer track {clip.get('track')!r}"
+            )
+        expected = _planned_audio_signature(
+            clip,
+            timeline_offset=timeline_offset,
+        )
+        track_items = _sequence_values(
+            getter("audio", track_index),
+            label=f"GetItemListInTrack('audio', {track_index})",
+        )
+        candidates = [
+            item for item in track_items if _audio_item_signature(item) == expected
+        ]
+        if len(candidates) != 1:
+            raise ImmutableTimelineError(
+                "expected exactly one compiler audio lane materializer "
+                f"{expected!r} on A{track_index}, found {len(candidates)}"
+            )
+        track_type_index = _sequence_values(
+            _call_required(candidates[0], "GetTrackTypeAndIndex"),
+            label="GetTrackTypeAndIndex()",
+        )
+        if track_type_index != ["audio", track_index]:
+            raise ImmutableTimelineError(
+                "audio lane materializer resolved to unexpected track "
+                f"{track_type_index!r}; expected ['audio', {track_index}]"
+            )
+        matched.append(candidates[0])
+        matched_by_track.append((track_index, expected))
+
+    deleted = _call_required(timeline, "DeleteClips", matched, False)
+    if deleted is not True:
+        raise ResolveExecutionError(
+            "DeleteClips(audio lane materializers, non-ripple) was rejected"
+        )
+    for track_index, expected in matched_by_track:
+        remaining = _sequence_values(
+            getter("audio", track_index),
+            label=f"GetItemListInTrack('audio', {track_index})",
+        )
+        if any(_audio_item_signature(item) == expected for item in remaining):
+            raise ImmutableTimelineError(
+                f"audio lane materializer {expected!r} remains after deletion"
+            )
+
+
+def _rehome_compacted_audio_items(
+    project: Any,
+    media_pool: Any,
+    timeline: Any,
+    plan: Mapping[str, Any],
+) -> None:
+    """Repair Resolve FCPXML lane compaction on a newly imported timeline.
+
+    Resolve can merge an early A4 sound into A1 while compacting the other
+    non-empty logical lanes.  We first prove a one-to-one match by portable
+    basename plus timeline/source ranges.  A misplaced item is cloned into its
+    planned lane, the clone is fully verified, and only then is the original
+    removed with a non-ripple delete.
+    """
+
+    raw_audio = plan.get("audio")
+    audio = (
+        [item for item in raw_audio if isinstance(item, Mapping) and item.get("media_path")]
+        if isinstance(raw_audio, Sequence) and not isinstance(raw_audio, (str, bytes))
+        else []
+    )
+    if not audio:
+        return
+    specs = _track_specs(plan, "audio")
+    index_by_id = {str(spec["id"]): int(spec["index"]) for spec in specs}
+    expected_counts = {
+        index: sum(1 for clip in audio if index_by_id.get(str(clip.get("track"))) == index)
+        for index in index_by_id.values()
+    }
+    getter = getattr(timeline, "GetItemListInTrack", None)
+    if not callable(getter):
+        raise ImmutableTimelineError("timeline cannot inspect imported audio items")
+    items_by_track = {
+        index: _sequence_values(
+            getter("audio", index),
+            label=f"GetItemListInTrack('audio', {index})",
+        )
+        for index in sorted(expected_counts)
+    }
+    if all(len(items_by_track[index]) == count for index, count in expected_counts.items()):
+        return
+
+    validation = plan.get("timeline_validation")
+    plan_start = int(validation.get("start_frame", 0)) if isinstance(validation, Mapping) else 0
+    timeline_offset = int(_call_required(timeline, "GetStartFrame")) - plan_start
+    expected_by_signature: dict[tuple[str, int, int, int, int], list[tuple[Mapping[str, Any], int]]] = {}
+    for clip in audio:
+        track_index = index_by_id.get(str(clip.get("track")))
+        if track_index is None:
+            raise ResolveExecutionError(f"unknown planned audio track {clip.get('track')!r}")
+        signature = _planned_audio_signature(clip, timeline_offset=timeline_offset)
+        expected_by_signature.setdefault(signature, []).append((clip, track_index))
+
+    moves: list[
+        tuple[
+            Any,
+            Any,
+            Mapping[str, Any],
+            int,
+            int,
+            tuple[str, int, int, int, int],
+        ]
+    ] = []
+    for current_track, items in items_by_track.items():
+        for item in items:
+            signature = _audio_item_signature(item)
+            matches = expected_by_signature.get(signature)
+            if not matches:
+                raise ImmutableTimelineError(
+                    f"imported audio item {signature!r} does not match the compiled plan"
+                )
+            clip, desired_track = matches.pop(0)
+            media_item = _call_required(item, "GetMediaPoolItem")
+            if media_item is None:
+                raise ImmutableTimelineError("imported audio item is not linked to Media Pool")
+            if current_track != desired_track:
+                moves.append(
+                    (
+                        item,
+                        media_item,
+                        clip,
+                        current_track,
+                        desired_track,
+                        signature,
+                    )
+                )
+    missing = [signature for signature, matches in expected_by_signature.items() if matches]
+    if missing:
+        raise ImmutableTimelineError(f"compiled audio items are missing after import: {missing!r}")
+
+    if not moves:
+        raise ImmutableTimelineError("imported audio lane counts differ from the compiled plan")
+    unsafe_gains: list[tuple[str, float]] = []
+    for _, _, clip, _, _, _ in moves:
+        raw_gain = clip.get("gain_db", 0.0)
+        if isinstance(raw_gain, bool) or not isinstance(raw_gain, (int, float)):
+            raise ImmutableTimelineError(
+                f"planned audio clip {clip.get('id')!r} has invalid gain_db "
+                f"{raw_gain!r}"
+            )
+        gain = float(raw_gain)
+        if not math.isfinite(gain):
+            raise ImmutableTimelineError(
+                f"planned audio clip {clip.get('id')!r} has non-finite gain_db"
+            )
+        if abs(gain) > 1e-9:
+            unsafe_gains.append((str(clip.get("id") or ""), gain))
+    if unsafe_gains:
+        raise ImmutableTimelineError(
+            "Resolve compacted audio clips with editable gain; refusing to "
+            "recreate them at unity. Bake the gain into the source audio before "
+            "compiling, or repair the lane manually: "
+            f"{unsafe_gains!r}"
+        )
+    selected = _call_required(project, "SetCurrentTimeline", timeline)
+    if selected is not True:
+        raise ResolveExecutionError("SetCurrentTimeline() rejected audio-lane repair")
+
+    # Compaction only shifts lanes down. Rehome high lanes first and commit
+    # each exact clone before advancing. Resolve rejects a clone when its
+    # destination is still occupied by the next compacted item (for example,
+    # A3 contains the SFX item while the music item needs to move from A2 to
+    # A3). Deleting an original only after its verified replacement exists
+    # frees that lane without ever leaving the new timeline short of media.
+    committed: list[
+        tuple[Any, Any, int, tuple[str, int, int, int, int]]
+    ] = []
+    pending_clone: Any | None = None
+    try:
+        for (
+            original,
+            media_item,
+            _clip,
+            original_track,
+            desired_track,
+            expected_signature,
+        ) in sorted(moves, key=lambda move: move[4], reverse=True):
+            pending_clone = _append_verified_audio_clone(
+                media_pool,
+                timeline,
+                media_item=media_item,
+                track_index=desired_track,
+                expected_signature=expected_signature,
+            )
+            deleted = _call_required(timeline, "DeleteClips", [original], False)
+            if deleted is not True:
+                raise ResolveExecutionError(
+                    "DeleteClips(original, non-ripple) was rejected"
+                )
+            committed.append(
+                (pending_clone, media_item, original_track, expected_signature)
+            )
+            pending_clone = None
+    except Exception as exc:
+        cleanup_failures: list[str] = []
+        if pending_clone is not None:
+            try:
+                _delete_audio_clones(
+                    timeline,
+                    [pending_clone],
+                    original_error=exc,
+                )
+            except Exception as cleanup_exc:
+                cleanup_failures.append(str(cleanup_exc))
+        try:
+            _rollback_audio_rehome_transaction(
+                media_pool,
+                timeline,
+                committed,
+                original_error=exc,
+            )
+        except Exception as rollback_exc:
+            cleanup_failures.append(str(rollback_exc))
+        if cleanup_failures:
+            raise ResolveExecutionError(
+                f"{exc}; sparse audio-lane transaction recovery failed: "
+                + "; ".join(cleanup_failures)
+            ) from exc
+        raise
+
+
+def _audio_repair_recovery_name(target_name: str) -> str:
+    build_token = target_name.removeprefix("AUTO_BUILD_")[:24]
+    nonce = hashlib.sha256(
+        f"{target_name}:{time.time_ns()}".encode("utf-8")
+    ).hexdigest()[:12].upper()
+    return f"RABBITHOLE_AUDIO_RECOVERY_{build_token}_{nonce}"
+
+
+def _repair_sparse_audio_lanes(
+    project: Any,
+    media_pool: Any,
+    timeline: Any,
+    plan: Mapping[str, Any],
+) -> None:
+    """Stage a new AUTO_BUILD under a recovery name for crash-safe repair."""
+
+    raw_audio = plan.get("audio")
+    raw_materializers = plan.get("audio_lane_materializers")
+    if raw_audio in (None, []) and raw_materializers in (None, []):
+        return
+
+    target_name = _timeline_name(timeline)
+    recovery_name: str | None = None
+    if target_name.startswith("AUTO_BUILD_"):
+        recovery_name = _audio_repair_recovery_name(target_name)
+        renamed = _call_required(timeline, "SetName", recovery_name)
+        if renamed is not True or _timeline_name(timeline) != recovery_name:
+            raise ResolveExecutionError(
+                "could not stage the newly imported AUTO_BUILD under a safe "
+                "audio-repair recovery name"
+            )
+
+    try:
+        _remove_audio_lane_materializers(timeline, plan)
+        _rehome_compacted_audio_items(project, media_pool, timeline, plan)
+    except Exception as exc:
+        if recovery_name is not None:
+            raise ResolveExecutionError(
+                f"{exc}; sparse audio-lane repair aborted and the generated "
+                f"timeline remains safely staged as {recovery_name!r}, not "
+                f"{target_name!r}"
+            ) from exc
+        raise
+
+    if recovery_name is not None:
+        renamed = _call_required(timeline, "SetName", target_name)
+        if renamed is not True or _timeline_name(timeline) != target_name:
+            raise ResolveExecutionError(
+                "audio-lane repair succeeded but the staged generated timeline "
+                f"could not be restored to {target_name!r}; it remains safely "
+                f"named {recovery_name!r}"
+            )
+
+
 def _marker_color(kind: str, severity: str | None = None) -> str:
     if severity == "error":
         return "Red"
@@ -2598,6 +3149,7 @@ def execute_build(
             )
 
     _ensure_and_name_tracks(imported, plan_data)
+    _repair_sparse_audio_lanes(project, media_pool, imported, plan_data)
     subtitle_result = _ensure_imported_subtitles(
         project,
         media_pool,

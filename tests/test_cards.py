@@ -554,13 +554,14 @@ def test_short_timeline_labels_keep_single_line_text(style):
     assert all(r"\N" not in line for line in body_events)
 
 
-def test_upload_timeline_labels_are_measured_inside_inset_clip_boxes(style):
-    """Regression for the upload card whose first label lost its left words.
+def test_upload_timeline_labels_are_nonoverlapping_and_title_safe(style):
+    """Regression for the upload card whose endpoint labels collided.
 
     A position inside title-safe is not sufficient: left/right anchored glyphs
     also need an inset anchor, a clip box inside the 1.30x detail crop, and each
     hard-wrapped line must measure narrower than the space remaining from that
-    anchor to its clip edge.
+    anchor to its clip edge. The endpoint clip and rendered bounding boxes must
+    also be disjoint; checking each endpoint in isolation missed the collision.
     """
     import re
 
@@ -598,12 +599,14 @@ def test_upload_timeline_labels_are_measured_inside_inset_clip_boxes(style):
     expected_title_safe_margin = width * (1 - TITLE_SAFE_FRACTION) / 2
     expected_text_inset = width * TITLE_SAFE_FRACTION * TEXT_SAFE_INSET_FRACTION
 
+    rendered_boxes = []
+    clip_boxes = []
     for event in body_events:
         position = re.search(r"\\pos\((-?\d+),(-?\d+)\)", event)
         clip = re.search(r"\\clip\((\d+),(\d+),(\d+),(\d+)\)", event)
         assert position and clip
-        x = int(position.group(1))
-        clip_left, _clip_top, clip_right, _clip_bottom = map(int, clip.groups())
+        x, y = map(int, position.groups())
+        clip_left, clip_top, clip_right, clip_bottom = map(int, clip.groups())
 
         assert clip_left > detail_crop_left
         assert clip_right < detail_crop_right
@@ -612,12 +615,15 @@ def test_upload_timeline_labels_are_measured_inside_inset_clip_boxes(style):
         assert min(x - clip_left, clip_right - x) >= expected_text_inset * 0.20
 
         payload = event.rsplit("}", 1)[-1]
-        for rendered_line in payload.split(r"\N"):
+        rendered_lines = payload.split(r"\N")
+        measured_widths = []
+        for rendered_line in rendered_lines:
             measured = _measured_line_width(
                 rendered_line,
                 body_size,
                 font_family=body_font,
             )
+            measured_widths.append(measured)
             if r"\an4" in event:
                 available = clip_right - x
             elif r"\an6" in event:
@@ -625,6 +631,35 @@ def test_upload_timeline_labels_are_measured_inside_inset_clip_boxes(style):
             else:
                 available = 2 * min(x - clip_left, clip_right - x)
             assert measured <= available
+
+        rendered_width = max(measured_widths)
+        if r"\an4" in event:
+            rendered_left, rendered_right = x, x + rendered_width
+        elif r"\an6" in event:
+            rendered_left, rendered_right = x - rendered_width, x
+        else:
+            rendered_left = x - rendered_width / 2
+            rendered_right = x + rendered_width / 2
+        line_height = body_size * 1.2
+        rendered_height = len(rendered_lines) * line_height
+        rendered_boxes.append(
+            (
+                rendered_left,
+                y - rendered_height / 2,
+                rendered_right,
+                y + rendered_height / 2,
+            )
+        )
+        clip_boxes.append((clip_left, clip_top, clip_right, clip_bottom))
+
+    left_box, right_box = rendered_boxes
+    assert left_box[2] < right_box[0], "timeline endpoint label bboxes overlap"
+    assert clip_boxes[0][2] < clip_boxes[1][0], "timeline label regions lack a safe gap"
+    for left, top, right, bottom in rendered_boxes:
+        assert left >= expected_title_safe_margin - 1
+        assert right <= width - expected_title_safe_margin + 1
+        assert top >= height * (1 - TITLE_SAFE_FRACTION) / 2 - 1
+        assert bottom <= height - height * (1 - TITLE_SAFE_FRACTION) / 2 + 1
 
 
 def test_comparison_items_wrap_and_are_clipped_to_their_own_columns(style):

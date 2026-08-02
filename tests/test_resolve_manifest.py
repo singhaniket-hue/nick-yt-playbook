@@ -49,8 +49,18 @@ def _project(tmp_path: Path) -> Path:
     (root / "edit").mkdir()
     (root / "assets").mkdir()
     (root / "research").mkdir()
-    (root / "narration" / "vo.wav").write_bytes(b"narration-v1")
-    (root / "research" / "bite.wav").write_bytes(b"source-bite-v1")
+    _write_wave(
+        root / "narration" / "vo.wav",
+        channels=1,
+        sample_rate=44_100,
+        seconds=4.0,
+    )
+    _write_wave(
+        root / "research" / "bite.wav",
+        channels=2,
+        sample_rate=48_000,
+        seconds=2.0,
+    )
     (root / "assets" / "plate.mp4").write_bytes(b"plate-v1")
     (root / "assets" / "capture.png").write_bytes(b"capture-v1")
     _write_json(
@@ -399,8 +409,8 @@ def _add_prepared_sound_stems(root: Path) -> Path:
     stem_dir.mkdir(parents=True)
     music = stem_dir / "music-stem.wav"
     sfx = stem_dir / "sfx-stem.wav"
-    music.write_bytes(b"approved-music-stem")
-    sfx.write_bytes(b"approved-sfx-stem")
+    _write_wave(music, channels=1, sample_rate=44_100, seconds=4.0)
+    _write_wave(sfx, channels=1, sample_rate=44_100, seconds=4.0)
     manifest_path = stem_dir / "manifest.json"
     _write_json(
         manifest_path,
@@ -463,7 +473,7 @@ def test_compile_is_deterministic_and_preserves_render_offsets(tmp_path):
     assert first["timeline_name"].startswith("AUTO_BUILD_")
     assert first["project_root"] == "."
     assert first["fps"] == 30
-    assert first["compiler_version"] == "resolve-compiler.v13"
+    assert first["compiler_version"] == "resolve-compiler.v23"
     assert "cold_open" not in first
     assert first["render"]["format"] == "mp4"
     assert first["render"]["codec"] == "H264"
@@ -912,6 +922,7 @@ def test_prepared_mix_stems_apply_uniform_master_gain_to_all_layers(tmp_path):
     assert effect["mix_baked"] is True
     [narration] = [clip for clip in plan["audio"] if clip["track"] == "A1"]
     assert narration["gain_db"] == music["gain_db"] == effect["gain_db"] == -0.125
+    assert plan["audio_lane_materializers"] == []
     assert music["start_frame"] == effect["start_frame"] == 0
     assert music["end_frame"] == effect["end_frame"] == plan["duration_frames"]
     assert all(
@@ -920,6 +931,71 @@ def test_prepared_mix_stems_apply_uniform_master_gain_to_all_layers(tmp_path):
         if clip["track"] in {"A3", "A4"}
     )
     assert plan["timeline_validation"]["audio_clip_count"] == 3
+
+
+def test_written_bundle_bakes_audio_gains_into_unity_wav_derivatives(
+    tmp_path, monkeypatch
+):
+    root = _project(tmp_path)
+    _add_generated_sound_library(root)
+    stem_manifest = _add_prepared_sound_stems(root)
+    overrides_path = _add_cold_open_override(root)
+    monkeypatch.setattr(
+        resolve_manifest,
+        "_probe_audio_metadata",
+        lambda _path: {"channels": 2, "sample_rate": 48_000},
+    )
+    source_paths = [
+        root / "narration" / "vo.wav",
+        stem_manifest.parent / "music-stem.wav",
+        stem_manifest.parent / "sfx-stem.wav",
+        root / "assets" / "crackle.wav",
+    ]
+    source_bytes = {path: path.read_bytes() for path in source_paths}
+
+    first = write_resolve_bundle(
+        root,
+        overrides_path=overrides_path,
+        update_current=False,
+    )
+    plan = first["plan"]
+    baked = [item for item in plan["audio"] if "gain_baked_db" in item]
+
+    assert first["audio_gain_bakes"]["count"] == 4
+    assert plan["audio_lane_materializers"] == []
+    assert all(item["gain_db"] == 0.0 for item in plan["audio"])
+    assert sorted(item["gain_baked_db"] for item in baked) == [
+        -2.0,
+        -0.125,
+        -0.125,
+        -0.125,
+    ]
+    derived_names = [Path(item["media_path"]).name for item in baked]
+    assert len(set(derived_names)) == 4
+    assert any(name.startswith("vo.gain-") for name in derived_names)
+    assert any(name.startswith("music-stem.gain-") for name in derived_names)
+    assert any(name.startswith("sfx-stem.gain-") for name in derived_names)
+    assert any(name.startswith("crackle.gain-") for name in derived_names)
+    assert all(
+        item["media_path"].startswith("resolve/audio-bakes/")
+        and item["path_kind"] == "project-relative"
+        and item["source_start_frame"] == 0
+        and len(item["gain_bake_source_sha256"]) == 64
+        for item in baked
+    )
+    assert all(path.read_bytes() == source_bytes[path] for path in source_paths)
+    assert "adjust-volume" not in first["fcpxml_path"].read_text(encoding="utf-8")
+
+    second = write_resolve_bundle(
+        root,
+        overrides_path=overrides_path,
+        update_current=False,
+    )
+    assert second["build_id"] == first["build_id"]
+    assert all(
+        entry["generated"] is False
+        for entry in second["audio_gain_bakes"]["entries"]
+    )
 
 
 def test_prepared_mix_stems_reject_source_audio_until_ducking_is_baked(tmp_path):

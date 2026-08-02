@@ -121,6 +121,11 @@ _AUDIO_STEM_FILES = {
     "music": ("A3", "music-stem.wav"),
     "sfx": ("A4", "sfx-stem.wav"),
 }
+_AUDIO_BAKES_ROOT = "resolve/audio-bakes"
+_AUDIO_BAKE_SCHEMA = "resolve-audio-gain-bake.v1"
+_AUDIO_BAKE_GENERATOR = "resolve-audio-gain-bake.v1"
+_AUDIO_BAKE_MANIFEST_NAME = "manifest.json"
+_RESOLVE_CURRENT_POINTER = "resolve/current.json"
 
 
 class EpisodeBundleError(RuntimeError):
@@ -1066,12 +1071,435 @@ def _select_current_audio_stem_paths(
     )
 
 
+def _load_current_audio_bake_selection(root: Path) -> dict[str, dict[str, Any]]:
+    """Load gain-bakes reachable from the current Resolve plan.
+
+    ``resolve/current.json`` and generated build plans are intentionally not
+    transferred.  They are nevertheless the authoritative local reachability
+    roots used while packaging immutable ``resolve/audio-bakes`` media.
+    """
+
+    bakes_root = root.joinpath(*PurePosixPath(_AUDIO_BAKES_ROOT).parts)
+    if not bakes_root.is_dir():
+        return {}
+    pointer_path = root.joinpath(*PurePosixPath(_RESOLVE_CURRENT_POINTER).parts)
+    if not pointer_path.is_file():
+        return {}
+    try:
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EpisodeBundleValidationError(
+            f"cannot audit current Resolve plan pointer {_RESOLVE_CURRENT_POINTER}: "
+            f"{exc}"
+        ) from exc
+    pointer = _audio_json_object(pointer, label=_RESOLVE_CURRENT_POINTER)
+    plan_relative = _audio_portable_path(
+        pointer.get("plan_path"),
+        label=f"{_RESOLVE_CURRENT_POINTER} plan_path",
+    )
+    plan_parts = PurePosixPath(plan_relative).parts
+    if (
+        len(plan_parts) != 4
+        or plan_parts[:2] != ("resolve", "builds")
+        or plan_parts[-1] != "resolve-plan.v1.json"
+    ):
+        raise EpisodeBundleValidationError(
+            f"{_RESOLVE_CURRENT_POINTER}: plan_path must select one generated "
+            "resolve/builds/<build-id>/resolve-plan.v1.json"
+        )
+    plan_path = root.joinpath(*plan_parts)
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EpisodeBundleValidationError(
+            f"cannot audit current Resolve plan {plan_relative}: {exc}"
+        ) from exc
+    plan = _audio_json_object(plan, label=plan_relative)
+    raw_audio = plan.get("audio")
+    if not isinstance(raw_audio, list):
+        raise EpisodeBundleValidationError(
+            f"{plan_relative}: audio must be an array"
+        )
+    fps = plan.get("fps")
+    if isinstance(fps, bool) or not isinstance(fps, int) or fps <= 0:
+        raise EpisodeBundleValidationError(
+            f"{plan_relative}: fps must be a positive integer"
+        )
+
+    selected: dict[str, dict[str, Any]] = {}
+    for index, raw_clip in enumerate(raw_audio):
+        label = f"{plan_relative} audio[{index}]"
+        if not isinstance(raw_clip, dict):
+            raise EpisodeBundleValidationError(f"{label} must be an object")
+        raw_media_path = raw_clip.get("media_path")
+        has_bake_metadata = any(
+            key in raw_clip
+            for key in (
+                "gain_baked_db",
+                "gain_bake_fingerprint",
+                "gain_bake_source_sha256",
+            )
+        )
+        is_bake_path = (
+            isinstance(raw_media_path, str)
+            and raw_media_path.startswith(f"{_AUDIO_BAKES_ROOT}/")
+        )
+        if not has_bake_metadata and not is_bake_path:
+            continue
+        if not has_bake_metadata or not is_bake_path:
+            raise EpisodeBundleValidationError(
+                f"{label}: gain-bake metadata and media_path must be present together"
+            )
+        fingerprint = raw_clip.get("gain_bake_fingerprint")
+        if not isinstance(fingerprint, str) or not _HASH_RE.fullmatch(fingerprint):
+            raise EpisodeBundleValidationError(
+                f"{label}: gain_bake_fingerprint must be a full SHA-256 digest"
+            )
+        media_path = _audio_portable_path(
+            raw_media_path,
+            label=f"{label}.media_path",
+        )
+        media_parts = PurePosixPath(media_path).parts
+        if (
+            len(media_parts) != 4
+            or media_parts[:2] != ("resolve", "audio-bakes")
+            or media_parts[2] != fingerprint
+        ):
+            raise EpisodeBundleValidationError(
+                f"{label}: media_path must select its immutable gain-bake "
+                f"directory {_AUDIO_BAKES_ROOT}/{fingerprint}/"
+            )
+        if raw_clip.get("path_kind") != "project-relative":
+            raise EpisodeBundleValidationError(
+                f"{label}: gain-bake media must be project-relative"
+            )
+        if raw_clip.get("gain_bake_source_path_kind") != "project-relative":
+            raise EpisodeBundleValidationError(
+                f"{label}: gain-bake source must be project-relative for transfer"
+            )
+        source_path = _audio_portable_path(
+            raw_clip.get("gain_bake_source_media_path"),
+            label=f"{label}.gain_bake_source_media_path",
+        )
+        for field in ("sha256", "gain_bake_source_sha256"):
+            digest = raw_clip.get(field)
+            if not isinstance(digest, str) or not _HASH_RE.fullmatch(digest):
+                raise EpisodeBundleValidationError(
+                    f"{label}.{field} must be a full SHA-256 digest"
+                )
+        for field in (
+            "source_start_frame",
+            "gain_bake_source_start_frame",
+            "duration_frames",
+            "channels",
+            "source_sample_rate",
+        ):
+            value = raw_clip.get(field)
+            minimum = 1 if field in {"duration_frames", "channels", "source_sample_rate"} else 0
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise EpisodeBundleValidationError(
+                    f"{label}.{field} must be an integer >= {minimum}"
+                )
+        gain_db = raw_clip.get("gain_db")
+        baked_gain = raw_clip.get("gain_baked_db")
+        if (
+            isinstance(gain_db, bool)
+            or not isinstance(gain_db, (int, float))
+            or not math.isfinite(float(gain_db))
+            or abs(float(gain_db)) > 1e-9
+        ):
+            raise EpisodeBundleValidationError(
+                f"{label}: gain-baked media must be authored at unity"
+            )
+        if (
+            isinstance(baked_gain, bool)
+            or not isinstance(baked_gain, (int, float))
+            or not math.isfinite(float(baked_gain))
+        ):
+            raise EpisodeBundleValidationError(
+                f"{label}.gain_baked_db must be finite"
+            )
+        if raw_clip.get("gain_bake_generator_version") != _AUDIO_BAKE_GENERATOR:
+            raise EpisodeBundleValidationError(
+                f"{label}: unsupported gain-bake generator"
+            )
+        record = {
+            "fingerprint": fingerprint,
+            "media_path": media_path,
+            "sha256": raw_clip["sha256"],
+            "source_media_path": source_path,
+            "source_sha256": raw_clip["gain_bake_source_sha256"],
+            "source_start_frame": raw_clip["gain_bake_source_start_frame"],
+            "duration_frames": raw_clip["duration_frames"],
+            "fps": fps,
+            "gain_db": float(baked_gain),
+            "generator_version": raw_clip["gain_bake_generator_version"],
+            "channels": raw_clip["channels"],
+            "sample_rate": raw_clip["source_sample_rate"],
+        }
+        previous = selected.get(fingerprint)
+        if previous is not None and previous != record:
+            raise EpisodeBundleValidationError(
+                f"{plan_relative}: fingerprint {fingerprint} selects conflicting "
+                "gain-bake contracts"
+            )
+        selected[fingerprint] = record
+    return selected
+
+
+def _select_current_audio_bake_paths(
+    root: Path,
+    paths: list[Path],
+    directory_paths: list[Path],
+    selected: dict[str, dict[str, Any]],
+) -> tuple[list[Path], list[Path]]:
+    """Exclude every gain-bake directory not referenced by the current plan."""
+
+    bakes_root = root.joinpath(*PurePosixPath(_AUDIO_BAKES_ROOT).parts)
+
+    def reachable(path: Path) -> bool:
+        try:
+            tail = path.relative_to(bakes_root).parts
+        except ValueError:
+            return True
+        if not tail:
+            return True
+        return tail[0] in selected
+
+    return (
+        [path for path in paths if reachable(path)],
+        [path for path in directory_paths if reachable(path)],
+    )
+
+
+def _audit_audio_bake_selection(
+    selected: dict[str, dict[str, Any]],
+    *,
+    included_files: set[str],
+    read_json_value: Callable[[str], Any],
+    sha256_for: Callable[[str], str],
+) -> None:
+    """Validate selected bake manifests, output bytes, and original sources."""
+
+    for fingerprint, record in sorted(selected.items()):
+        bake_directory = f"{_AUDIO_BAKES_ROOT}/{fingerprint}"
+        manifest_relative = f"{bake_directory}/{_AUDIO_BAKE_MANIFEST_NAME}"
+        if manifest_relative not in included_files:
+            raise EpisodeBundleValidationError(
+                f"current Resolve plan gain-bake manifest is missing from the "
+                f"portable bundle: {manifest_relative!r}"
+            )
+        manifest = _audio_json_object(
+            read_json_value(manifest_relative),
+            label=manifest_relative,
+        )
+        if manifest.get("schema_version") != _AUDIO_BAKE_SCHEMA:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: unsupported gain-bake schema"
+            )
+        if manifest.get("generator_version") != _AUDIO_BAKE_GENERATOR:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: unsupported gain-bake generator"
+            )
+        if manifest.get("fingerprint") != fingerprint:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: fingerprint does not match its directory"
+            )
+        contract = _audio_json_object(
+            manifest.get("contract"),
+            label=f"{manifest_relative} contract",
+        )
+        observed_fingerprint = _sha256_bytes(
+            json.dumps(
+                contract,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if observed_fingerprint != fingerprint:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: contract fingerprint does not match its "
+                "immutable directory"
+            )
+        expected_contract = {
+            "generator_version": record["generator_version"],
+            "source_sha256": record["source_sha256"],
+            "gain_db": record["gain_db"],
+            "source_start_frame": record["source_start_frame"],
+            "duration_frames": record["duration_frames"],
+            "fps": record["fps"],
+        }
+        for field, expected in expected_contract.items():
+            if contract.get(field) != expected:
+                raise EpisodeBundleValidationError(
+                    f"{manifest_relative}: contract {field} does not match the "
+                    "current Resolve plan"
+                )
+
+        source = _audio_json_object(
+            manifest.get("source"),
+            label=f"{manifest_relative} source",
+        )
+        if (
+            source.get("path_kind") != "project-relative"
+            or source.get("media_path") != record["source_media_path"]
+            or source.get("sha256") != record["source_sha256"]
+        ):
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: source does not match the current Resolve plan"
+            )
+        source_relative = record["source_media_path"]
+        if source_relative not in included_files:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: original gain-bake source is missing from "
+                f"the portable bundle: {source_relative!r}"
+            )
+        if sha256_for(source_relative) != record["source_sha256"]:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: original gain-bake source is stale or changed: "
+                f"{source_relative!r}"
+            )
+
+        output = _audio_json_object(
+            manifest.get("output"),
+            label=f"{manifest_relative} output",
+        )
+        output_name = _audio_portable_path(
+            output.get("path"),
+            label=f"{manifest_relative} output.path",
+        )
+        if len(PurePosixPath(output_name).parts) != 1:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: output.path must be one filename"
+            )
+        output_relative = f"{bake_directory}/{output_name}"
+        if (
+            output_relative != record["media_path"]
+            or output.get("sha256") != record["sha256"]
+        ):
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: output does not match the current Resolve plan"
+            )
+        if output_relative not in included_files:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: gain-baked WAV is missing from the portable "
+                f"bundle: {output_relative!r}"
+            )
+        if sha256_for(output_relative) != record["sha256"]:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: gain-baked WAV checksum changed: "
+                f"{output_relative!r}"
+            )
+
+        contract_output = _audio_json_object(
+            contract.get("output"),
+            label=f"{manifest_relative} contract.output",
+        )
+        for field, expected in (
+            ("channels", record["channels"]),
+            ("sample_rate", record["sample_rate"]),
+        ):
+            if contract_output.get(field) != expected or output.get(field) != expected:
+                raise EpisodeBundleValidationError(
+                    f"{manifest_relative}: output {field} is inconsistent"
+                )
+        if contract_output.get("sample_width") != 2:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: output sample_width is inconsistent"
+            )
+        sample_count = contract_output.get("sample_count")
+        copied = output.get("copied_sample_count")
+        padded = output.get("padded_sample_count")
+        if (
+            isinstance(sample_count, bool)
+            or not isinstance(sample_count, int)
+            or sample_count <= 0
+            or output.get("sample_count") != sample_count
+            or isinstance(copied, bool)
+            or not isinstance(copied, int)
+            or copied < 0
+            or isinstance(padded, bool)
+            or not isinstance(padded, int)
+            or padded < 0
+            or copied + padded != sample_count
+            or output.get("codec") != "pcm_s16le"
+        ):
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: output sample contract is inconsistent"
+            )
+        expected_samples = (
+            (
+                2
+                * (record["source_start_frame"] + record["duration_frames"])
+                * record["sample_rate"]
+                + record["fps"]
+            )
+            // (2 * record["fps"])
+            - (
+                2
+                * record["source_start_frame"]
+                * record["sample_rate"]
+                + record["fps"]
+            )
+            // (2 * record["fps"])
+        )
+        if sample_count != expected_samples:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: output sample count does not exactly match "
+                "the current Resolve plan frame range"
+            )
+        actual_bake_files = {
+            relative
+            for relative in included_files
+            if PurePosixPath(relative).parent.as_posix() == bake_directory
+        }
+        expected_bake_files = {manifest_relative, output_relative}
+        if actual_bake_files != expected_bake_files:
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: immutable gain-bake directory has unexpected "
+                "or missing files"
+            )
+
+
+def _audit_local_audio_bakes(
+    root: Path,
+    included_files: set[str],
+    selected: dict[str, dict[str, Any]],
+) -> None:
+    def read_value(relative: str) -> Any:
+        path = root.joinpath(*PurePosixPath(relative).parts)
+        try:
+            return json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise EpisodeBundleValidationError(
+                f"cannot audit gain-bake metadata {relative}: {exc}"
+            ) from exc
+
+    def checksum(relative: str) -> str:
+        return _sha256_file(root.joinpath(*PurePosixPath(relative).parts))
+
+    _audit_audio_bake_selection(
+        selected,
+        included_files=included_files,
+        read_json_value=read_value,
+        sha256_for=checksum,
+    )
+
+
 def _collect_sources(root: Path) -> tuple[list[_SourceFile], list[str]]:
     paths, directory_paths = _scan_tree(root)
     paths, directory_paths = _select_current_audio_stem_paths(
         root,
         paths,
         directory_paths,
+    )
+    selected_audio_bakes = _load_current_audio_bake_selection(root)
+    paths, directory_paths = _select_current_audio_bake_paths(
+        root,
+        paths,
+        directory_paths,
+        selected_audio_bakes,
     )
     portable_paths: dict[str, str] = {}
     relative_files: set[str] = set()
@@ -1092,6 +1520,7 @@ def _collect_sources(root: Path) -> tuple[list[_SourceFile], list[str]]:
             relative_files.add(relative)
 
     _audit_local_audio_stems(root, relative_files)
+    _audit_local_audio_bakes(root, relative_files, selected_audio_bakes)
     _audit_json_metadata(root, paths, relative_files)
 
     sources: list[_SourceFile] = []
@@ -1631,6 +2060,136 @@ def _audit_bundled_audio_stems(
     )
 
 
+def _audit_bundled_audio_bakes(
+    archive: zipfile.ZipFile,
+    infos: dict[str, zipfile.ZipInfo],
+    file_records: list[dict[str, Any]],
+) -> None:
+    records_by_path = {record["path"]: record for record in file_records}
+    included_files = set(records_by_path)
+    prefix = f"{_AUDIO_BAKES_ROOT}/"
+    bake_files = sorted(path for path in included_files if path.startswith(prefix))
+    if not bake_files:
+        return
+
+    def read_value(relative: str) -> Any:
+        member = f"{ARCHIVE_ROOT}/{relative}"
+        try:
+            return json.loads(
+                _read_small_member(
+                    archive,
+                    infos[member],
+                    label=f"gain-bake metadata {relative!r}",
+                    maximum=64 * 1024 * 1024,
+                ).decode("utf-8-sig")
+            )
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise EpisodeBundleValidationError(
+                f"cannot audit gain-bake metadata {relative}: {exc}"
+            ) from exc
+
+    def checksum(relative: str) -> str:
+        record = records_by_path.get(relative)
+        if record is None:
+            raise EpisodeBundleValidationError(
+                f"gain-bake file is missing from bundle manifest: {relative!r}"
+            )
+        return str(record["sha256"])
+
+    fingerprints: set[str] = set()
+    for relative in bake_files:
+        parts = PurePosixPath(relative).parts
+        if (
+            len(parts) != 4
+            or parts[:2] != ("resolve", "audio-bakes")
+            or not _HASH_RE.fullmatch(parts[2])
+        ):
+            raise EpisodeBundleValidationError(
+                f"bundle has an invalid immutable gain-bake path: {relative!r}"
+            )
+        fingerprints.add(parts[2])
+
+    selected: dict[str, dict[str, Any]] = {}
+    for fingerprint in sorted(fingerprints):
+        manifest_relative = (
+            f"{_AUDIO_BAKES_ROOT}/{fingerprint}/{_AUDIO_BAKE_MANIFEST_NAME}"
+        )
+        if manifest_relative not in included_files:
+            raise EpisodeBundleValidationError(
+                f"bundled gain-bake has no manifest: {manifest_relative!r}"
+            )
+        manifest = _audio_json_object(
+            read_value(manifest_relative),
+            label=manifest_relative,
+        )
+        contract = _audio_json_object(
+            manifest.get("contract"),
+            label=f"{manifest_relative} contract",
+        )
+        output = _audio_json_object(
+            manifest.get("output"),
+            label=f"{manifest_relative} output",
+        )
+        source = _audio_json_object(
+            manifest.get("source"),
+            label=f"{manifest_relative} source",
+        )
+        output_name = _audio_portable_path(
+            output.get("path"),
+            label=f"{manifest_relative} output.path",
+        )
+        source_path = _audio_portable_path(
+            source.get("media_path"),
+            label=f"{manifest_relative} source.media_path",
+        )
+        integer_fields = {
+            "source_start_frame": contract.get("source_start_frame"),
+            "duration_frames": contract.get("duration_frames"),
+            "fps": contract.get("fps"),
+            "channels": output.get("channels"),
+            "sample_rate": output.get("sample_rate"),
+        }
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in integer_fields.values()
+        ) or any(
+            integer_fields[field] <= 0
+            for field in ("duration_frames", "fps", "channels", "sample_rate")
+        ):
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: gain-bake frame/audio fields are invalid"
+            )
+        gain_db = contract.get("gain_db")
+        if (
+            isinstance(gain_db, bool)
+            or not isinstance(gain_db, (int, float))
+            or not math.isfinite(float(gain_db))
+        ):
+            raise EpisodeBundleValidationError(
+                f"{manifest_relative}: gain_db must be finite"
+            )
+        selected[fingerprint] = {
+            "fingerprint": fingerprint,
+            "media_path": f"{_AUDIO_BAKES_ROOT}/{fingerprint}/{output_name}",
+            "sha256": output.get("sha256"),
+            "source_media_path": source_path,
+            "source_sha256": source.get("sha256"),
+            "source_start_frame": integer_fields["source_start_frame"],
+            "duration_frames": integer_fields["duration_frames"],
+            "fps": integer_fields["fps"],
+            "gain_db": float(gain_db),
+            "generator_version": contract.get("generator_version"),
+            "channels": integer_fields["channels"],
+            "sample_rate": integer_fields["sample_rate"],
+        }
+    _audit_audio_bake_selection(
+        selected,
+        included_files=included_files,
+        read_json_value=read_value,
+        sha256_for=checksum,
+    )
+
+
 def validate_episode_bundle(
     bundle: os.PathLike[str] | str,
 ) -> dict[str, Any]:
@@ -1753,6 +2312,7 @@ def validate_episode_bundle(
                 total_bytes += info.file_size
 
         _audit_bundled_audio_stems(archive, infos, file_records)
+        _audit_bundled_audio_bakes(archive, infos, file_records)
         _audit_bundled_json_metadata(archive, infos, file_records)
 
     return {

@@ -100,6 +100,118 @@ def _write_audio_stems(root: Path) -> str:
     return fingerprint
 
 
+def _write_audio_bakes(root: Path) -> tuple[str, str, str]:
+    source = root / "narration" / "vo.wav"
+    source_sha = _sha256(source)
+    contract = {
+        "generator_version": "resolve-audio-gain-bake.v1",
+        "source_basename": source.name,
+        "source_sha256": source_sha,
+        "gain_db": -2.0,
+        "source_start_frame": 0,
+        "duration_frames": 1,
+        "fps": 30,
+        "source": {
+            "channels": 1,
+            "sample_width": 2,
+            "sample_rate": 44_100,
+            "sample_count": 1_470,
+        },
+        "output": {
+            "channels": 1,
+            "sample_width": 2,
+            "sample_rate": 44_100,
+            "sample_count": 1_470,
+        },
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    bake_dir = root / "resolve" / "audio-bakes" / fingerprint
+    bake_dir.mkdir(parents=True)
+    output_name = f"vo.gain-{fingerprint[:12]}.wav"
+    output = bake_dir / output_name
+    output.write_bytes(b"immutable gain-baked voice")
+    manifest = {
+        "schema_version": "resolve-audio-gain-bake.v1",
+        "generator_version": "resolve-audio-gain-bake.v1",
+        "fingerprint": fingerprint,
+        "contract": contract,
+        "source": {
+            "media_path": "narration/vo.wav",
+            "path_kind": "project-relative",
+            "sha256": source_sha,
+        },
+        "output": {
+            "path": output_name,
+            "sha256": _sha256(output),
+            "codec": "pcm_s16le",
+            "channels": 1,
+            "sample_rate": 44_100,
+            "sample_count": 1_470,
+            "copied_sample_count": 1_470,
+            "padded_sample_count": 0,
+        },
+    }
+    (bake_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    build = root / "resolve" / "builds" / "b-current"
+    build.mkdir(parents=True, exist_ok=True)
+    plan_relative = "resolve/builds/b-current/resolve-plan.v1.json"
+    (build / "resolve-plan.v1.json").write_text(
+        json.dumps(
+            {
+                "fps": 30,
+                "audio": [
+                    {
+                        "id": "voice",
+                        "media_path": (
+                            f"resolve/audio-bakes/{fingerprint}/{output_name}"
+                        ),
+                        "path_kind": "project-relative",
+                        "sha256": _sha256(output),
+                        "source_start_frame": 0,
+                        "duration_frames": 1,
+                        "channels": 1,
+                        "source_sample_rate": 44_100,
+                        "gain_db": 0.0,
+                        "gain_baked_db": -2.0,
+                        "gain_bake_source_media_path": "narration/vo.wav",
+                        "gain_bake_source_path_kind": "project-relative",
+                        "gain_bake_source_sha256": source_sha,
+                        "gain_bake_source_start_frame": 0,
+                        "gain_bake_fingerprint": fingerprint,
+                        "gain_bake_generator_version": (
+                            "resolve-audio-gain-bake.v1"
+                        ),
+                    }
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / "resolve" / "current.json").write_text(
+        json.dumps({"plan_path": plan_relative}),
+        encoding="utf-8",
+    )
+    historical = "f" * 64
+    historical_dir = root / "resolve" / "audio-bakes" / historical
+    historical_dir.mkdir()
+    (historical_dir / "manifest.json").write_bytes(b"historical manifest")
+    (historical_dir / "old.wav").write_bytes(b"historical bake")
+    return fingerprint, output_name, historical
+
+
 def _episode(root: Path) -> Path:
     root.mkdir()
     (root / "assets").mkdir()
@@ -231,6 +343,62 @@ def test_package_is_deterministic_portable_and_excludes_machine_state(
         )
         assert not any(f"audio-stems/{'f' * 64}/" in name for name in names)
         assert all(info.date_time == (1980, 1, 1, 0, 0, 0) for info in archive.infolist())
+
+
+def test_bundle_includes_only_current_plan_audio_bakes_with_checksums(
+    tmp_path: Path,
+) -> None:
+    episode = _episode(tmp_path / "episode")
+    fingerprint, output_name, historical = _write_audio_bakes(episode)
+    bundle = tmp_path / "episode.zip"
+
+    package_episode(episode, bundle)
+
+    manifest_path = f"resolve/audio-bakes/{fingerprint}/manifest.json"
+    output_path = f"resolve/audio-bakes/{fingerprint}/{output_name}"
+    with zipfile.ZipFile(bundle) as archive:
+        names = set(archive.namelist())
+        checksums = archive.read(
+            "project/.rabbithole-bundle/checksums.sha256"
+        ).decode("utf-8")
+        bundle_manifest = json.loads(
+            archive.read("project/.rabbithole-bundle/manifest.json")
+        )
+
+    assert f"project/{manifest_path}" in names
+    assert f"project/{output_path}" in names
+    assert f"  {manifest_path}\n" in checksums
+    assert f"  {output_path}\n" in checksums
+    assert not any(f"resolve/audio-bakes/{historical}/" in name for name in names)
+    assert "project/resolve/current.json" not in names
+    assert not any("project/resolve/builds/" in name for name in names)
+    records = {item["path"]: item for item in bundle_manifest["files"]}
+    assert records[manifest_path]["sha256"] == _sha256(
+        episode / manifest_path
+    )
+    assert records[output_path]["sha256"] == _sha256(episode / output_path)
+
+
+@pytest.mark.parametrize("target", ["source", "output"])
+def test_package_rejects_changed_current_plan_audio_bake_chain(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    episode = _episode(tmp_path / "episode")
+    fingerprint, output_name, _historical = _write_audio_bakes(episode)
+    path = (
+        episode / "narration" / "vo.wav"
+        if target == "source"
+        else episode
+        / "resolve"
+        / "audio-bakes"
+        / fingerprint
+        / output_name
+    )
+    path.write_bytes(path.read_bytes() + b"changed")
+
+    with pytest.raises(EpisodeBundleValidationError, match="stale or changed|checksum changed"):
+        package_episode(episode, tmp_path / "changed.zip")
 
 
 @pytest.mark.parametrize("state", ["clean", "dirty"])

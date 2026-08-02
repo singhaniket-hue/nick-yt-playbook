@@ -36,6 +36,7 @@ class AssetRecord:
     local_path: str
     used_in_slots: tuple[str, ...] = ()
     notes: str = ""
+    attribution_burned: bool = False
 
 
 @dataclass(frozen=True)

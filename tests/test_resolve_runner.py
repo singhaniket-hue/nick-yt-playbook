@@ -16,6 +16,9 @@ from rabbithole.resolve_runner import (
     ResolveUnavailableError,
     _ensure_and_name_tracks,
     _marker_color,
+    _repair_sparse_audio_lanes,
+    _remove_audio_lane_materializers,
+    _rehome_compacted_audio_items,
     connect_resolve,
     enqueue_job,
     execute_build,
@@ -530,6 +533,584 @@ def test_track_contract_restores_audio_lanes_compacted_by_resolve(
     assert [
         timeline.GetTrackName("audio", index) for index in range(1, 6)
     ] == ["A1", "A2", "A3", "A4", "A5"]
+
+
+class _CompactedAudioMediaItem:
+    def __init__(self, path: str, source_end: int) -> None:
+        self.path = path
+        self.source_end = source_end
+
+
+class _CompactedAudioTimelineItem:
+    def __init__(
+        self,
+        media_item: _CompactedAudioMediaItem,
+        *,
+        track: int,
+        start: int,
+        end: int,
+        source_start: int,
+        source_end: int,
+        duration: int | None = None,
+    ) -> None:
+        self.media_item = media_item
+        self.track = track
+        self.start = start
+        self.end = end
+        self.source_start = source_start
+        self.source_end = source_end
+        self.duration = end - start if duration is None else duration
+
+    def GetName(self):
+        return self.media_item.path.replace("\\", "/").rsplit("/", 1)[-1]
+
+    def GetStart(self):
+        return self.start
+
+    def GetEnd(self):
+        return self.end
+
+    def GetDuration(self, subframe_precision=False):
+        return self.duration
+
+    def GetSourceStartFrame(self):
+        return self.source_start
+
+    def GetSourceEndFrame(self):
+        return self.source_end
+
+    def GetMediaPoolItem(self):
+        return self.media_item
+
+    def GetTrackTypeAndIndex(self):
+        return ["audio", self.track]
+
+
+class _EarlyCrackleTimeline(FakeTimeline):
+    def __init__(self, *, reject_original_delete: bool = False) -> None:
+        super().__init__(
+            "AUTO_BUILD_DEADBEEFCAFE",
+            video_tracks=4,
+            audio_tracks=5,
+            subtitle_tracks=1,
+        )
+        self.reject_original_delete = reject_original_delete
+        self.delete_calls: list[tuple[list[object], bool]] = []
+        self.media = {
+            name: _CompactedAudioMediaItem(path, source_end)
+            for name, (path, source_end) in {
+                "crackle": ("C:\\portable\\static-crackle.wav", 17),
+                "voice": ("C:\\portable\\vo.wav", 31663),
+                "music": ("/portable/music-stem.wav", 31663),
+                "sfx": ("/portable/sfx-stem.wav", 31663),
+            }.items()
+        }
+        self.originals = {
+            "crackle": _CompactedAudioTimelineItem(
+                self.media["crackle"],
+                track=1,
+                start=0,
+                end=18,
+                source_start=0,
+                source_end=17,
+            ),
+            "voice": _CompactedAudioTimelineItem(
+                self.media["voice"],
+                track=1,
+                start=330,
+                end=31994,
+                source_start=0,
+                source_end=31663,
+            ),
+            "music": _CompactedAudioTimelineItem(
+                self.media["music"],
+                track=2,
+                start=330,
+                end=31994,
+                source_start=0,
+                source_end=31663,
+            ),
+            "sfx": _CompactedAudioTimelineItem(
+                self.media["sfx"],
+                track=3,
+                start=330,
+                end=31994,
+                source_start=0,
+                source_end=31663,
+            ),
+        }
+        self.audio_items = {
+            1: [self.originals["crackle"], self.originals["voice"]],
+            2: [self.originals["music"]],
+            3: [self.originals["sfx"]],
+            4: [],
+            5: [],
+        }
+
+    def GetItemListInTrack(self, kind, index):
+        if kind == "audio":
+            return list(self.audio_items.get(index, []))
+        return super().GetItemListInTrack(kind, index)
+
+    def DeleteClips(self, items, ripple):
+        values = list(items)
+        self.delete_calls.append((values, ripple))
+        if self.reject_original_delete and any(
+            value in self.originals.values() for value in values
+        ):
+            return False
+        for value in values:
+            for track_items in self.audio_items.values():
+                if value in track_items:
+                    track_items.remove(value)
+                    break
+        return True
+
+
+class _AudioRehomeMediaPool:
+    def __init__(
+        self,
+        project: FakeProject,
+        *,
+        inclusive_end: bool = False,
+        reject_overlaps: bool = False,
+    ) -> None:
+        self.project = project
+        self.inclusive_end = inclusive_end
+        self.reject_overlaps = reject_overlaps
+        self.overlap_rejections = 0
+        self.append_calls: list[dict] = []
+        self.clones: list[_CompactedAudioTimelineItem] = []
+
+    def AppendToTimeline(self, items):
+        info = dict(list(items)[0])
+        self.append_calls.append(info)
+        duration = (
+            info["endFrame"]
+            - info["startFrame"]
+            + (1 if self.inclusive_end else 0)
+        )
+        record_start = info["recordFrame"]
+        record_end = record_start + duration
+        if self.reject_overlaps and any(
+            item.GetStart() < record_end and record_start < item.GetStart() + item.GetDuration(False)
+            for item in self.project.current.audio_items[info["trackIndex"]]
+        ):
+            self.overlap_rejections += 1
+            rejected = _CompactedAudioTimelineItem(
+                info["mediaPoolItem"],
+                track=info["trackIndex"],
+                start=record_start,
+                end=record_start,
+                source_start=info["startFrame"],
+                source_end=info["startFrame"],
+            )
+            rejected.GetName = lambda: None
+            rejected.GetStart = lambda: None
+            rejected.GetEnd = lambda: None
+            rejected.GetDuration = lambda subframe_precision=False: None
+            rejected.GetSourceStartFrame = lambda: None
+            rejected.GetSourceEndFrame = lambda: None
+            return [rejected]
+        clone = _CompactedAudioTimelineItem(
+            info["mediaPoolItem"],
+            track=info["trackIndex"],
+            start=record_start,
+            end=record_end,
+            source_start=info["startFrame"],
+            source_end=min(info["endFrame"], info["mediaPoolItem"].source_end),
+            duration=duration,
+        )
+        self.project.current.audio_items[info["trackIndex"]].append(clone)
+        self.clones.append(clone)
+        return [clone]
+
+
+def _early_crackle_audio_plan() -> dict:
+    duration = 31994 - 330
+    return {
+        "tracks": {
+            "audio": [
+                {"id": f"A{index}", "index": index}
+                for index in range(1, 6)
+            ]
+        },
+        "timeline_validation": {"start_frame": 0, "end_frame": 31994},
+        "audio": [
+            {
+                "id": "voice",
+                "track": "A1",
+                "media_path": "narration/vo.wav",
+                "start_frame": 330,
+                "end_frame": 31994,
+                "duration_frames": duration,
+                "source_start_frame": 0,
+            },
+            {
+                "id": "music",
+                "track": "A3",
+                "media_path": "audio/music-stem.wav",
+                "start_frame": 330,
+                "end_frame": 31994,
+                "duration_frames": duration,
+                "source_start_frame": 0,
+            },
+            {
+                "id": "crackle",
+                "track": "A4",
+                "media_path": "assets/static-crackle.wav",
+                "start_frame": 0,
+                "end_frame": 18,
+                "duration_frames": 18,
+                "source_start_frame": 0,
+            },
+            {
+                "id": "sfx",
+                "track": "A4",
+                "media_path": "audio/sfx-stem.wav",
+                "start_frame": 330,
+                "end_frame": 31994,
+                "duration_frames": duration,
+                "source_start_frame": 0,
+            },
+        ],
+    }
+
+
+def test_rehome_compacted_audio_handles_early_crackle_lane() -> None:
+    timeline = _EarlyCrackleTimeline()
+    project = FakeProject(timelines=[timeline])
+    media_pool = _AudioRehomeMediaPool(project)
+
+    _rehome_compacted_audio_items(
+        project,
+        media_pool,
+        timeline,
+        _early_crackle_audio_plan(),
+    )
+
+    assert [item.GetName() for item in timeline.audio_items[1]] == ["vo.wav"]
+    assert timeline.audio_items[2] == []
+    assert [item.GetName() for item in timeline.audio_items[3]] == ["music-stem.wav"]
+    assert [item.GetName() for item in timeline.audio_items[4]] == [
+        "static-crackle.wav",
+        "sfx-stem.wav",
+    ]
+    assert [
+        (
+            call["mediaPoolItem"].path.replace("\\", "/").rsplit("/", 1)[-1],
+            call["startFrame"],
+            call["endFrame"],
+            call["mediaType"],
+            call["trackIndex"],
+            call["recordFrame"],
+        )
+        for call in media_pool.append_calls
+    ] == [
+        ("static-crackle.wav", 0, 17, 2, 4, 0),
+        ("static-crackle.wav", 0, 18, 2, 4, 0),
+        ("sfx-stem.wav", 0, 31663, 2, 4, 330),
+        ("sfx-stem.wav", 0, 31664, 2, 4, 330),
+        ("music-stem.wav", 0, 31663, 2, 3, 330),
+        ("music-stem.wav", 0, 31664, 2, 3, 330),
+    ]
+    assert all(ripple is False for _, ripple in timeline.delete_calls)
+
+
+def test_remove_audio_lane_materializer_preserves_authored_clip_gains() -> None:
+    timeline = _EarlyCrackleTimeline()
+    materializer = _CompactedAudioTimelineItem(
+        timeline.media["crackle"],
+        track=2,
+        start=0,
+        end=1,
+        source_start=0,
+        source_end=0,
+    )
+    timeline.originals["crackle"].track = 4
+    timeline.originals["music"].track = 3
+    timeline.originals["sfx"].track = 4
+    timeline.audio_items = {
+        1: [timeline.originals["voice"]],
+        2: [materializer],
+        3: [timeline.originals["music"]],
+        4: [timeline.originals["crackle"], timeline.originals["sfx"]],
+        5: [],
+    }
+    plan = _early_crackle_audio_plan()
+    for clip in plan["audio"]:
+        clip["gain_db"] = -0.1
+    plan["audio_lane_materializers"] = [
+        {
+            "id": "temporary-a2",
+            "track": "A2",
+            "media_path": "assets/static-crackle.wav",
+            "start_frame": 0,
+            "end_frame": 1,
+            "duration_frames": 1,
+            "source_start_frame": 0,
+        }
+    ]
+
+    _remove_audio_lane_materializers(timeline, plan)
+    project = FakeProject(timelines=[timeline])
+    _rehome_compacted_audio_items(
+        project,
+        _AudioRehomeMediaPool(project),
+        timeline,
+        plan,
+    )
+
+    assert timeline.audio_items[2] == []
+    assert [item.GetName() for item in timeline.audio_items[1]] == ["vo.wav"]
+    assert [item.GetName() for item in timeline.audio_items[3]] == [
+        "music-stem.wav"
+    ]
+    assert [item.GetName() for item in timeline.audio_items[4]] == [
+        "static-crackle.wav",
+        "sfx-stem.wav",
+    ]
+    assert timeline.delete_calls == [([materializer], False)]
+
+
+def test_rehome_compacted_audio_refuses_to_discard_nonzero_gain() -> None:
+    timeline = _EarlyCrackleTimeline()
+    project = FakeProject(timelines=[timeline])
+    media_pool = _AudioRehomeMediaPool(project)
+    plan = _early_crackle_audio_plan()
+    for clip in plan["audio"]:
+        clip["gain_db"] = -0.1
+
+    with pytest.raises(ImmutableTimelineError, match="editable gain"):
+        _rehome_compacted_audio_items(project, media_pool, timeline, plan)
+
+    assert media_pool.append_calls == []
+    assert timeline.delete_calls == []
+
+
+def test_rehome_compacted_audio_supports_inclusive_audio_api() -> None:
+    timeline = _EarlyCrackleTimeline()
+    project = FakeProject(timelines=[timeline])
+    media_pool = _AudioRehomeMediaPool(project, inclusive_end=True)
+
+    _rehome_compacted_audio_items(
+        project,
+        media_pool,
+        timeline,
+        _early_crackle_audio_plan(),
+    )
+
+    assert [call["endFrame"] for call in media_pool.append_calls] == [
+        17,
+        31663,
+        31663,
+    ]
+    assert [item.GetName() for item in timeline.audio_items[1]] == ["vo.wav"]
+    assert [item.GetName() for item in timeline.audio_items[3]] == ["music-stem.wav"]
+    assert [item.GetName() for item in timeline.audio_items[4]] == [
+        "static-crackle.wav",
+        "sfx-stem.wav",
+    ]
+
+
+def test_rehome_compacted_audio_frees_destination_before_overlapping_move() -> None:
+    timeline = _EarlyCrackleTimeline()
+    project = FakeProject(timelines=[timeline])
+    media_pool = _AudioRehomeMediaPool(project, reject_overlaps=True)
+
+    _rehome_compacted_audio_items(
+        project,
+        media_pool,
+        timeline,
+        _early_crackle_audio_plan(),
+    )
+
+    assert media_pool.overlap_rejections == 0
+    assert [item.GetName() for item in timeline.audio_items[1]] == ["vo.wav"]
+    assert timeline.audio_items[2] == []
+    assert [item.GetName() for item in timeline.audio_items[3]] == ["music-stem.wav"]
+    assert [item.GetName() for item in timeline.audio_items[4]] == [
+        "static-crackle.wav",
+        "sfx-stem.wav",
+    ]
+
+
+def test_rehome_compacted_audio_retries_transient_none_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeline = _EarlyCrackleTimeline()
+    project = FakeProject(timelines=[timeline])
+    sleep_calls: list[float] = []
+
+    class TransientBoundaryMediaPool(_AudioRehomeMediaPool):
+        injected = False
+
+        def AppendToTimeline(self, items):
+            appended = super().AppendToTimeline(items)
+            if not self.injected:
+                self.injected = True
+                candidate = appended[0]
+                stable_getter = candidate.GetSourceEndFrame
+                responses = iter((None, stable_getter()))
+                candidate.GetSourceEndFrame = lambda: next(responses)
+            return appended
+
+    media_pool = TransientBoundaryMediaPool(project)
+    monkeypatch.setattr(
+        "rabbithole.resolve_runner.time.sleep",
+        sleep_calls.append,
+    )
+
+    _rehome_compacted_audio_items(
+        project,
+        media_pool,
+        timeline,
+        _early_crackle_audio_plan(),
+    )
+
+    assert sleep_calls == [0.05]
+    assert [item.GetName() for item in timeline.audio_items[1]] == ["vo.wav"]
+    assert [item.GetName() for item in timeline.audio_items[4]] == [
+        "static-crackle.wav",
+        "sfx-stem.wav",
+    ]
+
+
+def test_rehome_compacted_audio_retries_transient_clone_delete_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TransientDeleteTimeline(_EarlyCrackleTimeline):
+        rejected_once = False
+
+        def DeleteClips(self, items, ripple):
+            values = list(items)
+            if not self.rejected_once and not any(
+                value in self.originals.values() for value in values
+            ):
+                self.rejected_once = True
+                self.delete_calls.append((values, ripple))
+                return False
+            return super().DeleteClips(values, ripple)
+
+    timeline = TransientDeleteTimeline()
+    project = FakeProject(timelines=[timeline])
+    media_pool = _AudioRehomeMediaPool(project)
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(
+        "rabbithole.resolve_runner.time.sleep",
+        sleep_calls.append,
+    )
+
+    _rehome_compacted_audio_items(
+        project,
+        media_pool,
+        timeline,
+        _early_crackle_audio_plan(),
+    )
+
+    assert sleep_calls == [0.05]
+    assert timeline.delete_calls[0] == timeline.delete_calls[1]
+    assert [item.GetName() for item in timeline.audio_items[1]] == ["vo.wav"]
+    assert [item.GetName() for item in timeline.audio_items[4]] == [
+        "static-crackle.wav",
+        "sfx-stem.wav",
+    ]
+
+
+def test_rehome_compacted_audio_rolls_back_clone_when_original_delete_fails() -> None:
+    timeline = _EarlyCrackleTimeline(reject_original_delete=True)
+    project = FakeProject(timelines=[timeline])
+    media_pool = _AudioRehomeMediaPool(project)
+
+    with pytest.raises(ResolveExecutionError, match="non-ripple"):
+        _rehome_compacted_audio_items(
+            project,
+            media_pool,
+            timeline,
+            _early_crackle_audio_plan(),
+        )
+
+    assert timeline.originals["crackle"] in timeline.audio_items[1]
+    assert timeline.audio_items[4] == []
+    assert timeline.delete_calls == [
+        ([media_pool.clones[0]], False),
+        ([timeline.originals["crackle"]], False),
+        ([media_pool.clones[1]], False),
+    ]
+
+
+def test_rehome_compacted_audio_rolls_back_all_earlier_moves_on_later_failure() -> None:
+    timeline = _EarlyCrackleTimeline()
+    project = FakeProject(timelines=[timeline])
+
+    class LaterAppendFailure(_AudioRehomeMediaPool):
+        def AppendToTimeline(self, items):
+            info = dict(list(items)[0])
+            if (
+                info["mediaPoolItem"].path.replace("\\", "/").endswith(
+                    "/music-stem.wav"
+                )
+                and info["trackIndex"] == 3
+            ):
+                raise ResolveExecutionError("injected later append failure")
+            return super().AppendToTimeline(items)
+
+    with pytest.raises(ResolveExecutionError, match="injected later append"):
+        _rehome_compacted_audio_items(
+            project,
+            LaterAppendFailure(project),
+            timeline,
+            _early_crackle_audio_plan(),
+        )
+
+    assert [item.GetName() for item in timeline.audio_items[1]] == [
+        "vo.wav",
+        "static-crackle.wav",
+    ]
+    assert [item.GetName() for item in timeline.audio_items[2]] == [
+        "music-stem.wav"
+    ]
+    assert [item.GetName() for item in timeline.audio_items[3]] == [
+        "sfx-stem.wav"
+    ]
+    assert timeline.audio_items[4] == []
+
+
+def test_sparse_audio_repair_failure_keeps_partial_timeline_off_auto_build() -> None:
+    timeline = _EarlyCrackleTimeline()
+    target_name = timeline.GetName()
+    project = FakeProject(timelines=[timeline])
+
+    class RollbackFailure(_AudioRehomeMediaPool):
+        later_failure_seen = False
+
+        def AppendToTimeline(self, items):
+            info = dict(list(items)[0])
+            basename = info["mediaPoolItem"].path.replace("\\", "/").rsplit(
+                "/", 1
+            )[-1]
+            if basename == "music-stem.wav" and info["trackIndex"] == 3:
+                self.later_failure_seen = True
+                raise ResolveExecutionError("injected later append failure")
+            if (
+                self.later_failure_seen
+                and basename == "sfx-stem.wav"
+                and info["trackIndex"] == 3
+            ):
+                raise ResolveExecutionError("injected rollback failure")
+            return super().AppendToTimeline(items)
+
+    with pytest.raises(ResolveExecutionError, match="remains safely staged"):
+        _repair_sparse_audio_lanes(
+            project,
+            RollbackFailure(project),
+            timeline,
+            _early_crackle_audio_plan(),
+        )
+
+    assert timeline.GetName().startswith("RABBITHOLE_AUDIO_RECOVERY_DEADBEEFCAFE_")
+    assert timeline.GetName() != target_name
+    assert target_name not in timeline.rename_calls
 
 
 def test_no_current_project_allows_only_deterministic_create(tmp_path: Path) -> None:

@@ -28,13 +28,14 @@
     "subtitle_policy",
     "overlays",
     "audio",
+    "audio_lane_materializers",
     "provenance",
     "missing_media",
     "review_flags"
   ],
   "properties": {
     "schema_version": {"const": "resolve-plan.v1"},
-    "compiler_version": {"const": "resolve-compiler.v13"},
+    "compiler_version": {"const": "resolve-compiler.v23"},
     "build_id": {"type": "string", "pattern": "^b-[0-9a-f]{12}$"},
     "timeline_name": {"type": "string", "pattern": "^AUTO_BUILD_[0-9A-F]{12}$"},
     "project_root": {"const": "."},
@@ -195,6 +196,12 @@
     "cold_open": {"$ref": "#/$defs/coldOpen"},
     "overlays": {"type": "array", "items": {"type": "object"}},
     "audio": {"type": "array", "items": {"$ref": "#/$defs/audio"}},
+    "audio_lane_materializers": {
+      "description": "Legacy compatibility field. Compiler v23 always emits an empty array; non-unity gains are frozen into immutable WAV derivatives.",
+      "type": "array",
+      "maxItems": 0,
+      "items": {"$ref": "#/$defs/audio"}
+    },
     "provenance": {"type": "array", "items": {"type": "object"}},
     "highlights": {"type": "array", "items": {"type": "object"}},
     "missing_media": {"type": "array", "items": {"type": "object"}},
@@ -470,7 +477,17 @@
         "channels": {"type": ["integer", "null"], "minimum": 1},
         "source_sample_rate": {"type": ["integer", "null"], "minimum": 1},
         "gain_db": {"type": "number"},
-        "duck_vo_db": {"type": "number"}
+        "gain_baked_db": {"type": "number"},
+        "gain_bake_source_sha256": {"$ref": "#/$defs/sha256"},
+        "gain_bake_source_media_path": {"$ref": "#/$defs/path"},
+        "gain_bake_source_path_kind": {"$ref": "#/$defs/pathKind"},
+        "gain_bake_source_start_frame": {"type": "integer", "minimum": 0},
+        "gain_bake_fingerprint": {"$ref": "#/$defs/sha256"},
+        "gain_bake_generator_version": {
+          "const": "resolve-audio-gain-bake.v1"
+        },
+        "duck_vo_db": {"type": "number"},
+        "lane_materializer": {"type": "boolean"}
       }
     },
     "coldOpenAudio": {

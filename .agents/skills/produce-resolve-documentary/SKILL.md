@@ -233,11 +233,16 @@ uv run rabbithole resolve build projects/<slug> --mode <free|studio>
 gain, category-specific SFX levels, cue placement, and silence-drop ramps that
 FCPXML cannot reproduce from raw tiles. Keep the raw sound library in the
 episode for editorial replacement, but do not substitute raw unity-gain clips
-for the approved stems. Preserve the manifest-recorded shared peak-ceiling gain
-on A1/A3/A4 as editable FCPXML volume adjustments. A changed narration, timing
-file, sound file, manifest, implementation, or style map must produce a new
-immutable stem directory; never overwrite one referenced by an existing queue
-job or render. Resolve stem preparation must fail closed when
+for the approved stems. Before writing FCPXML, freeze every non-zero clip gain
+into an exact-duration, content-addressed PCM WAV under
+`resolve/audio-bakes/`, set the plan clip to unity, and retain its original
+path, checksum, gain, and bake fingerprint as audit metadata. This is required
+because Resolve may compact sparse audio lanes and API re-homing must not lose
+an FCPXML-only volume adjustment. Never use temporary lane-materializer clips,
+and make the runner reject any non-unity clip that would require cloning. A
+changed narration, timing file, sound file, gain, manifest, implementation, or
+style map must produce new immutable media; never overwrite media referenced by
+an existing queue job or render. Resolve stem preparation must fail closed when
 `research/source-audio.json` contains bites until their A1/A3 duck automation
 can be baked faithfully; use the FFmpeg renderer for that case.
 
@@ -277,7 +282,8 @@ timeline validation.
 
 Resolve may compact empty FCPXML audio lanes. Accept only an exact compacted
 audio-count pattern, insert missing logical lanes at their intended positions,
-then name and validate A1-A5. Fail closed on any other imported audio layout.
+re-home only checksum-pinned unity-gain derivatives, then name and validate
+A1-A5. Fail closed on any other imported audio layout or non-unity clone.
 
 Never proceed while the user reports an active render. Never stop a render,
 clear a render queue, quit Resolve, switch databases/projects, delete a

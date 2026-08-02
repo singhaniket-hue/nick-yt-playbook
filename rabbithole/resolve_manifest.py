@@ -27,7 +27,13 @@ from rabbithole.cold_open import (
     compile_cold_open,
     shift_plan_for_prefix,
 )
-from rabbithole.resolve_audio import ResolveAudioStemError, load_current_audio_stems
+from rabbithole.resolve_audio import (
+    GAIN_BAKE_GENERATOR_VERSION,
+    ResolveAudioBakeError,
+    ResolveAudioStemError,
+    bake_resolve_plan_audio_gains,
+    load_current_audio_stems,
+)
 from rabbithole.sources.music import resolve_cue
 from rabbithole.sources.soundgen import (
     BED_EDGE_TRIM_SECONDS,
@@ -38,7 +44,7 @@ from rabbithole.sources.soundgen import (
 
 
 SCHEMA_VERSION = "resolve-plan.v1"
-COMPILER_VERSION = "resolve-compiler.v13"
+COMPILER_VERSION = "resolve-compiler.v23"
 DEFAULT_FPS = 30
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
@@ -416,6 +422,14 @@ def write_resolve_bundle(
         sample_rate=sample_rate,
         overrides_path=overrides_path,
     )
+    try:
+        audio_gain_bakes = bake_resolve_plan_audio_gains(root, plan)
+    except ResolveAudioBakeError as exc:
+        raise ResolveManifestError(str(exc)) from exc
+    # Kept in the v1 schema as an explicitly empty legacy field.  Sparse-lane
+    # materializers are not reliable in Resolve; authored gains are frozen in
+    # immutable WAV derivatives before FCPXML generation instead.
+    plan["audio_lane_materializers"] = []
     if output_dir is None:
         destination = root / "resolve" / "builds" / plan["build_id"]
     else:
@@ -503,6 +517,7 @@ def write_resolve_bundle(
         "fcpxml_sha256": fcpxml_sha256,
         "subtitles_sha256": subtitles_sha256,
         "presentation_subtitles_sha256": presentation_subtitles_sha256,
+        "audio_gain_bakes": audio_gain_bakes,
         "plan": plan,
     }
 
@@ -657,6 +672,7 @@ def _compile_loaded(
 
     fingerprint_payload = {
         "compiler": COMPILER_VERSION,
+        "audio_gain_bake_generator": GAIN_BAKE_GENERATOR_VERSION,
         "source_caption_policy": _SOURCE_CAPTION_POLICY_VERSION,
         "presentation_subtitle_policy": {
             "version": _PRESENTATION_SUBTITLE_POLICY_VERSION,
@@ -1255,6 +1271,7 @@ def _compile_loaded(
         "subtitle_policy": subtitle_policy,
         "overlays": overlays,
         "audio": audio,
+        "audio_lane_materializers": [],
         "provenance": provenance,
         "highlights": compiled_highlights,
         "missing_media": missing_media,

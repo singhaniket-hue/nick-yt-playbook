@@ -2,6 +2,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from jsonschema.validators import validator_for
+
 import rabbithole.provenance as provenance_module
 from rabbithole.provenance import (
     AssetRecord,
@@ -49,6 +51,24 @@ def test_save_then_load_round_trips_records_faithfully(tmp_path):
 
     assert loaded == [record]
     assert isinstance(loaded[0].used_in_slots, tuple)
+
+
+def test_load_accepts_attribution_burned_cold_open_metadata(tmp_path):
+    path = tmp_path / "provenance.json"
+    record = _record("cold-open", attribution_burned=True)
+
+    save_provenance(path, [record])
+
+    assert load_provenance(path) == [record]
+    assert load_provenance(path)[0].attribution_burned is True
+
+    schema = json.loads(
+        (Path(__file__).parents[1] / "schemas" / "provenance.v1.schema.json")
+        .read_text(encoding="utf-8")
+    )
+    validator_for(schema)(schema).validate(
+        json.loads(path.read_text(encoding="utf-8"))
+    )
 
 
 def test_save_replaces_the_ledger_only_after_complete_json_is_on_disk(

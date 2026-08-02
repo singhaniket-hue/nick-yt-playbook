@@ -1295,9 +1295,12 @@ def _timeline_events(spec, layout, palette, typography):
             f"\\c{_wrap_override(accent)}}}{_rect(0, 0, thickness, tick_h)}"))
 
         # Endpoint text grows inward from its tick. Centre anchoring made half
-        # of a long first/last label extend beyond title-safe. Each label also
-        # gets a local wrap/clip box so unusually long text cannot escape the
-        # safe area or collide with the opposite endpoint.
+        # of a long first/last label extend beyond title-safe. Give every point
+        # the non-overlapping region between the midpoints to its neighbours,
+        # with a visible gutter at each shared boundary. The old 0.86 * interval
+        # boxes overlapped one another by 72% for a two-point timeline: wrapping
+        # each label independently kept it title-safe but still allowed the two
+        # rendered labels to collide.
         if count == 1:
             alignment = _ASS_MIDDLE_CENTER
             clip_left = layout.text_left
@@ -1305,22 +1308,35 @@ def _timeline_events(spec, layout, palette, typography):
             text_x = layout.centre_x
         else:
             interval = axis_w / (count - 1)
-            label_w = interval * 0.86
-            edge_inset = max(layout.width * 0.012, label_w * 0.04)
+            gutter = max(layout.width * 0.025, body_size * 0.75)
+            region_left = (
+                x
+                if index == 0
+                else x - interval / 2 + gutter / 2
+            )
+            region_right = (
+                x
+                if index == count - 1
+                else x + interval / 2 - gutter / 2
+            )
+            edge_inset = max(
+                layout.width * 0.012,
+                (region_right - region_left) * 0.04,
+            )
             if index == 0:
                 alignment = _ASS_MIDDLE_LEFT
-                clip_left = x
-                clip_right = min(x + label_w, layout.left + layout.safe_w)
+                clip_left = region_left
+                clip_right = region_right
                 text_x = clip_left + edge_inset
             elif index == count - 1:
                 alignment = _ASS_MIDDLE_RIGHT
-                clip_left = max(x - label_w, layout.left)
-                clip_right = x
+                clip_left = region_left
+                clip_right = region_right
                 text_x = clip_right - edge_inset
             else:
                 alignment = _ASS_MIDDLE_CENTER
-                clip_left = max(x - label_w / 2, layout.left)
-                clip_right = min(x + label_w / 2, layout.left + layout.safe_w)
+                clip_left = region_left
+                clip_right = region_right
                 text_x = x
         horizontal_inset = max(layout.width * 0.008, (clip_right - clip_left) * 0.025)
         if alignment == _ASS_MIDDLE_LEFT:

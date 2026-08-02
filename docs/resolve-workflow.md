@@ -197,10 +197,14 @@ to discard one because two titles occupy the same connected lane. Imported
 primary-story transitions are counted separately from linked clips and titles
 in the immutable timeline contract.
 
-Resolve can compact empty FCPXML audio lanes during import. The runner accepts
-only the exact compacted count pattern, inserts the missing empty logical lanes
-at their intended positions, and then names and validates A1-A5. Unexpected
-audio layouts still fail closed before save or render.
+Resolve can compact empty FCPXML audio lanes during import. Before FCPXML is
+written, every non-zero clip gain is therefore frozen into an immutable,
+exact-duration PCM WAV under `resolve/audio-bakes/`; the timeline references
+that derivative at unity and records the source checksum, original gain, and
+bake fingerprint. The runner accepts only the exact compacted count pattern,
+inserts the missing empty logical lanes, re-homes only unity-gain derivatives,
+and then names and validates A1-A5. Unexpected layouts or a non-unity clone fail
+closed before save or render.
 
 Resolve 21 can ignore valid FCPXML `caption` elements. `resolve prepare`
 therefore emits two checksum-pinned artifacts beside the FCPXML:
@@ -246,11 +250,13 @@ The raw project-local sound library is retained for editors who want to replace
 individual cues. Resolve imports the stems by default because FCPXML cannot
 faithfully express RabbitHole's constant-power tiling and per-cue automation.
 The stem manifest also records the non-positive peak-ceiling gain calculated
-from the summed A1/A3/A4 mix. FCPXML applies that same editable volume
-adjustment to all three tracks, matching the approved FFmpeg master without
-flattening the handoff. Authored source-audio bites are rejected by Resolve
-stem preparation for now because their A1/A3 duck automation is not yet baked;
-those projects remain supported by the FFmpeg renderer.
+from the summed A1/A3/A4 mix. Bundle preparation applies that value to immutable
+gain-baked narration/music/SFX derivatives and writes those clips at unity in
+FCPXML. This preserves the approved FFmpeg master even when Resolve compacts and
+repairs sparse lanes, while the original WAVs remain available to the editor.
+Authored source-audio bites are rejected by Resolve stem preparation for now
+because their A1/A3 duck automation is not yet baked; those projects remain
+supported by the FFmpeg renderer.
 
 For direct-source media carrying an original URL, the compiler also derives an
 editable lower-left V3 source caption from provenance. It uses the authored
@@ -376,6 +382,9 @@ excluded directory fails bundle creation instead of silently producing an
 incomplete archive. The content-addressed A3/A4 stems are media inputs, not
 queue/build state, so the set selected by `current.json` is included and
 checksum-verified; historical stem directories are omitted.
+Content-addressed `resolve/audio-bakes/` derivatives and their manifests are
+also project-local media, so they travel with the episode and retain identical
+PCM bytes on Windows and macOS.
 Bundle creation and verification also follow `audio-stems/current.json` into
 the selected immutable manifest, verify its fingerprint, both exact stem files,
 and every project-local source-input checksum. Repository implementation/style

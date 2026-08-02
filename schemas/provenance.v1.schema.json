@@ -25,6 +25,7 @@
       "license": {"type": "string"},
       "retrieved_at": {"type": "string"},
       "local_path": {"type": "string"},
+      "attribution_burned": {"type": "boolean"},
       "used_in_slots": {
         "oneOf": [
           {"type": "string", "minLength": 1},

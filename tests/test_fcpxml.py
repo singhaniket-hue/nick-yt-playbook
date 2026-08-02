@@ -137,8 +137,17 @@ def test_fcpxml_places_generated_music_and_sfx_on_separate_audio_lanes(tmp_path)
         for item in document.findall(".//asset-clip")
         if int(item.attrib.get("lane", "0")) < 0
     ]
-    music = [item for item in audio if item.attrib["lane"] == "-3"]
-    effects = [item for item in audio if item.attrib["lane"] == "-4"]
+    authored_audio = [
+        item
+        for item in audio
+        if "temporary_lane_materializer=1" not in (item.findtext("note") or "")
+    ]
+    music = [
+        item for item in authored_audio if item.attrib["lane"] == "-3"
+    ]
+    effects = [
+        item for item in authored_audio if item.attrib["lane"] == "-4"
+    ]
 
     assert len(music) == 2
     assert len(effects) == 1
@@ -185,16 +194,25 @@ def test_fcpxml_preserves_audio_clip_gain_as_editable_volume_adjustment(tmp_path
         for item in document.findall(".//asset-clip")
         if int(item.attrib.get("lane", "0")) < 0
     ]
+    authored_audio = audio
 
-    assert {item.attrib["lane"] for item in audio} == {"-1", "-3", "-4"}
+    assert {item.attrib["lane"] for item in authored_audio} == {
+        "-1",
+        "-3",
+        "-4",
+    }
     assert {
         item.find("adjust-volume").attrib["amount"]
-        for item in audio
+        for item in authored_audio
     } == {"-0.125dB"}
     assert {
         tuple(child.tag for child in item)
-        for item in audio
+        for item in authored_audio
     } == {("note", "adjust-volume")}
+    assert all(
+        "temporary_lane_materializer=1" not in (item.findtext("note") or "")
+        for item in authored_audio
+    )
 
 
 def test_fcpxml_omits_identity_audio_volume_adjustment(tmp_path):

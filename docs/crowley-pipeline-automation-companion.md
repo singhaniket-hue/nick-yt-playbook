@@ -222,12 +222,14 @@ This section is a target-state Fairlight specification. The current reusable
 pipeline prepares content-addressed A3/A4 stems before FCPXML compilation:
 constant-power bed tiling and style gain are baked into A3; cue placement and
 category-specific levels are baked into A4; both carry the authored 30 ms
-click-safe silence-drop ramps. A manifest-recorded shared volume adjustment on
-A1/A3/A4 preserves the final mix peak ceiling. The raw sound library remains
-portable for editor replacements. Source-audio bites still use the FFmpeg
-renderer because their narration/music duck automation is not yet represented
-by the Resolve stems. The pipeline does not yet build the complete Fairlight
-processor chain through Resolve's scripting API.
+click-safe silence-drop ramps. Before FCPXML compilation, the manifest-recorded
+shared peak-ceiling gain is frozen into immutable, exact-duration A1/A3/A4 PCM
+WAV derivatives. Resolve references those gain-baked derivatives at unity,
+preserving the final mix even when sparse lanes are compacted or repaired. The
+raw sound library remains portable for editor replacements. Source-audio bites
+still use the FFmpeg renderer because their narration/music duck automation is
+not yet represented by the Resolve stems. The pipeline does not yet build the
+complete Fairlight processor chain through Resolve's scripting API.
 
 - **Narration chain** (per Playbook §05), applied as a saved Fairlight preset: high-pass 80 Hz → mud cut ~300–400 Hz → presence lift 2–5 kHz → compression ~3:1 targeting 4–6 dB reduction → normalize dialogue to **−15 LUFS ±1**.
 - **Ducking:** sidechain compressor on A2 keyed from A1, ~−15 dB under speech, slow release so beds swell gently in pauses — mimicking the manual keyframing the Playbook describes.

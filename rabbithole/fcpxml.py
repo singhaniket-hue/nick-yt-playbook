@@ -184,7 +184,9 @@ def build_fcpxml(
         duration_frames,
     )
 
-    audio_clips = list(plan.get("audio", []))
+    audio_clips = list(plan.get("audio", [])) + list(
+        plan.get("audio_lane_materializers", [])
+    )
     for track_number in range(1, 6):
         track_id = f"A{track_number}"
         track_audio = [
@@ -261,7 +263,9 @@ def _collect_media(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
         durations[key] = max(durations.get(key, 0), int(clip["source_end_frame"]))
         types[key] = str(clip.get("media_type") or _media_type(str(path)))
         names[key] = str(asset_id)
-    for clip in plan.get("audio", []):
+    for clip in list(plan.get("audio", [])) + list(
+        plan.get("audio_lane_materializers", [])
+    ):
         asset_id = clip.get("asset_id")
         path = clip.get("media_path")
         if not asset_id or not path:
@@ -610,6 +614,8 @@ def _append_audio_track(
         )
         note = ET.SubElement(item, "note")
         note.text = f"id={clip['id']} track={track_id}"
+        if clip.get("lane_materializer"):
+            note.text += " temporary_lane_materializer=1"
         gain_db = _audio_gain_db(clip)
         if abs(gain_db) > 1e-9:
             ET.SubElement(
