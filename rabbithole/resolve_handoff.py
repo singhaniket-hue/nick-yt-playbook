@@ -126,6 +126,28 @@ def _canonical(path: os.PathLike[str] | str) -> Path:
     return Path(path).expanduser().resolve(strict=False)
 
 
+def _filesystem_path(path: Path) -> Path:
+    r"""Return a Windows extended-length path for filesystem I/O.
+
+    ZIP members are capped at a portable 240 characters, but prepending a
+    validation or restore staging directory can still take the absolute path
+    beyond the legacy Windows ``MAX_PATH`` limit.  The ``\\?\`` namespace lets
+    Python use the Unicode Win32 APIs without weakening the portable member
+    checks applied to the archive itself.  Other platforms retain the original
+    path unchanged.
+    """
+
+    if os.name != "nt":
+        return path
+    raw = os.fspath(path)
+    if raw.startswith("\\\\?\\"):
+        return path
+    absolute = os.path.abspath(raw)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
 def _safe_name(value: str, *, fallback: str) -> str:
     cleaned = _SAFE_NAME_RE.sub("_", value).strip("._-")
     return (cleaned or fallback)[:96]
@@ -1470,20 +1492,24 @@ def validate_handoff(
     """Validate checksums/policy and run optional restored-project hooks."""
 
     source = _canonical(package)
-    if source.is_dir():
-        return _validate_directory(
-            source, hooks=hooks, restored_project=restored_project
+    io_source = _filesystem_path(source)
+    if io_source.is_dir():
+        result = _validate_directory(
+            io_source, hooks=hooks, restored_project=restored_project
         )
-    if not source.is_file() or source.suffix.lower() != ".zip":
+        result["package_root"] = os.fspath(source)
+        return result
+    if not io_source.is_file() or source.suffix.lower() != ".zip":
         raise HandoffValidationError(
             f"handoff must be a package directory or ZIP: {source}"
         )
-    with tempfile.TemporaryDirectory(prefix="rabbithole-handoff-validate-") as temp:
-        destination = Path(temp)
-        with zipfile.ZipFile(source, "r") as archive:
+    destination = Path(tempfile.mkdtemp(prefix="rabbithole-handoff-validate-"))
+    io_destination = _filesystem_path(destination)
+    try:
+        with zipfile.ZipFile(io_source, "r") as archive:
             root_name, members = _safe_zip_members(archive)
-            _extract_zip_members(archive, destination, members)
-        package_root = destination / root_name
+            _extract_zip_members(archive, io_destination, members)
+        package_root = io_destination / root_name
         if not package_root.is_dir():
             raise HandoffValidationError(
                 "handoff ZIP top-level package root is not a directory"
@@ -1493,8 +1519,11 @@ def validate_handoff(
             hooks=hooks,
             restored_project=restored_project,
         )
+        result["package_root"] = os.fspath(destination / root_name)
         result["zip_path"] = os.fspath(source)
         return result
+    finally:
+        _remove_owned_path(io_destination)
 
 
 def restore_handoff(
@@ -1513,11 +1542,13 @@ def restore_handoff(
 
     source = _canonical(package)
     target = _canonical(destination)
+    io_source = _filesystem_path(source)
+    io_target = _filesystem_path(target)
     anchor = Path(target.anchor).resolve(strict=False)
     home = Path.home().resolve(strict=False)
     if target in (anchor, home):
         raise UnsafeWriteError(f"restore destination is too broad: {target}")
-    if target.exists():
+    if io_target.exists():
         raise ResolveHandoffError(
             f"restore destination already exists; refusing overwrite: {target}"
         )
@@ -1525,30 +1556,31 @@ def restore_handoff(
         target.name,
         label="restore destination name",
     )
-    if source.is_dir() and is_path_within(target, source):
+    if io_source.is_dir() and is_path_within(target, source):
         raise UnsafeWriteError(
             f"restore destination cannot be inside source package: {target}"
         )
-    target.parent.mkdir(parents=True, exist_ok=True)
+    io_target.parent.mkdir(parents=True, exist_ok=True)
     staging = target.parent / f".rh-restore-{uuid4().hex[:12]}"
-    if staging.exists():
+    io_staging = _filesystem_path(staging)
+    if io_staging.exists():
         raise ResolveHandoffError(
             f"unique restore staging path already exists: {staging}"
         )
     promoted = False
     try:
         package_relative = Path()
-        if source.is_dir():
-            _validate_portable_tree(source)
-            shutil.copytree(source, staging, symlinks=True)
-            package_root = staging
-        elif source.is_file() and source.suffix.lower() == ".zip":
-            staging.mkdir(parents=False, exist_ok=False)
-            with zipfile.ZipFile(source, "r") as archive:
+        if io_source.is_dir():
+            _validate_portable_tree(io_source)
+            shutil.copytree(io_source, io_staging, symlinks=True)
+            package_root = io_staging
+        elif io_source.is_file() and source.suffix.lower() == ".zip":
+            io_staging.mkdir(parents=False, exist_ok=False)
+            with zipfile.ZipFile(io_source, "r") as archive:
                 root_name, members = _safe_zip_members(archive)
-                _extract_zip_members(archive, staging, members)
+                _extract_zip_members(archive, io_staging, members)
             package_relative = Path(root_name)
-            package_root = staging / package_relative
+            package_root = io_staging / package_relative
             if not package_root.is_dir():
                 raise HandoffValidationError(
                     "handoff ZIP top-level package root is not a directory"
@@ -1560,11 +1592,11 @@ def restore_handoff(
         result = _validate_directory(
             package_root, hooks=hooks, restored_project=restored_project
         )
-        if target.exists():
+        if io_target.exists():
             raise ResolveHandoffError(
                 f"restore destination appeared before publish: {target}"
             )
-        os.replace(staging, target)
+        os.replace(io_staging, io_target)
         promoted = True
         final_package_root = target / package_relative
         result["package_root"] = os.fspath(final_package_root)
@@ -1574,7 +1606,7 @@ def restore_handoff(
     except Exception as exc:
         # Staging is a unique sibling of the requested target. If promotion
         # succeeded and a later step failed, remove only that exact target.
-        cleanup = target if promoted else staging
+        cleanup = io_target if promoted else io_staging
         try:
             _remove_owned_path(cleanup)
         except OSError as cleanup_exc:

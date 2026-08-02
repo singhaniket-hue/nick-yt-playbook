@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import tempfile
 from types import SimpleNamespace
 import warnings
 import zipfile
@@ -496,6 +497,71 @@ def test_zip_writer_streams_files_and_stores_precompressed_media(
         assert media.file_size == 4096
 
 
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="regression covers the legacy Windows MAX_PATH boundary",
+)
+def test_zip_validation_and_restore_support_deep_portable_members(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "episode"
+    project.mkdir()
+    handoff = package_handoff(
+        project,
+        resolve=FakeResolve(FakeProject()),
+        plan=_plan(project),
+        destination=tmp_path / "handoffs",
+    )
+    package = Path(handoff["package_directory"])
+    deep_relative = (
+        Path("project.dra")
+        / ("a" * 100)
+        / (("b" * 95) + ".bin")
+    )
+    member_name = f"R/{deep_relative.as_posix()}"
+    assert len(member_name) <= 240
+    expected_validation_path_length = (
+        len(tempfile.gettempdir())
+        + 1
+        + len("rabbithole-handoff-validate-")
+        + 8
+        + 1
+        + len(member_name)
+    )
+    assert expected_validation_path_length > 260
+
+    io_package = resolve_handoff._filesystem_path(package)
+    deep_file = io_package / deep_relative
+    archive = tmp_path / "deep-members.zip"
+    restored = tmp_path / "restored-deep-members"
+    try:
+        deep_file.parent.mkdir(parents=True)
+        deep_file.write_bytes(b"deep Resolve archive member")
+        resolve_handoff._write_checksums(io_package)
+        directory_result = validate_handoff(package)
+        assert directory_result["valid"] is True
+        assert Path(directory_result["package_root"]) == package
+        resolve_handoff._zip_tree(io_package, archive, "R")
+
+        archive_result = validate_handoff(archive)
+        assert archive_result["valid"] is True
+        assert not archive_result["package_root"].startswith("\\\\?\\")
+        restored_result = restore_handoff(archive, restored)
+        assert restored_result["valid"] is True
+        restored_file = (
+            resolve_handoff._filesystem_path(restored) / "R" / deep_relative
+        )
+        assert restored_file.read_bytes() == b"deep Resolve archive member"
+    finally:
+        resolve_handoff._remove_owned_path(
+            resolve_handoff._filesystem_path(restored)
+        )
+        if deep_file.exists():
+            deep_file.unlink()
+        if deep_file.parent.exists():
+            deep_file.parent.rmdir()
+
+
 @pytest.mark.parametrize(
     ("members", "message"),
     [
@@ -648,7 +714,7 @@ def test_restore_promotion_failure_rolls_back_staging(
     real_replace = os.replace
 
     def injected_replace(source, destination):
-        if Path(destination) == target:
+        if Path(destination) == resolve_handoff._filesystem_path(target):
             raise OSError("injected restore promotion failure")
         return real_replace(source, destination)
 
