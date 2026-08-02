@@ -202,7 +202,7 @@ A Crowley-style video is built from five visual ingredients. For every script pa
 ### 1. Case evidence (the backbone)
 
 - Preserve full-page screenshots of posts, profiles, comments, and DMs with visible timestamps/URLs for the case file (use browser extension **GoFullPage** or built-in `Ctrl+Shift+S` full-page capture in Firefox).
-- Present a live article, profile, or archived webpage as real browser motion, not a simulated pan across that preservation screenshot. Establish the actual page and browser context, make one restrained scroll or push to the discussed text, then hold it long enough to read. RabbitHole does this through a targeted Chromium `capture_spec` with `motion: true`; OBS Studio is the manual alternative.
+- Present a live article, profile, or archived webpage as real browser motion, not a simulated pan across that preservation screenshot. Establish the actual page and browser context, make one restrained scroll or push only on the first browser slot for that source URL in the episode, then hold every later line from that URL without replaying the move, even after intervening graphics or sources. Highlight the exact sentence being narrated and keep surrounding source context readable. RabbitHole does this through a targeted Chromium `capture_spec` with `motion: true` and `highlight: true`; OBS Studio is the manual alternative.
 - Use a static pan only when the source itself is a genuine static document or image, or when movement would add no source context.
 - Screen recordings of playing original uploads and navigating the Wayback Machine provide the same "you are there" context. Record manual material with **OBS Studio** (free) at 1080p/60.
 - Original footage/uploads from the case, downloaded and archived (**yt-dlp** for public videos).
@@ -347,7 +347,7 @@ Build this once as a reusable timeline chunk / PowerBin item. It becomes your vi
 
 ### Evidence presentation effects
 
-- **Live webpage treatment:** retain real Chromium motion. Establish the page, make one restrained scroll or push to the claim, then hold. Do not fake browser navigation by moving a single screenshot.
+- **Live webpage treatment:** retain real Chromium motion. Establish a source URL only once in the entire episode, make one restrained scroll or push to its first browser claim, then hold every later highlighted line from that URL, even when other shots intervene. Do not fake browser navigation by moving a single screenshot or replay the same zoom for that source.
 - **Static document/image treatment:** place the genuine static source over a dark blurred backdrop, add a subtle drop shadow, scale in slowly (100→105% over its duration), and spotlight the relevant line.
 - **Highlight:** dim the whole image 40% with an adjustment layer, then mask/window a bright region around the key text — the "flashlight" effect. Animate the mask moving between lines as you narrate them.
 - **Redaction:** black bars (solid color rectangles) over names/faces; Resolve's tracker can pin blurs (Blur ResolveFX + tracked Power Window) to moving faces in video.

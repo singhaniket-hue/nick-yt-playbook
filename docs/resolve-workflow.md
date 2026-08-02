@@ -279,18 +279,21 @@ EDITORIAL_v2
 Automation never mutates a timeline whose name starts with `EDITORIAL_`.
 
 When authored, the timeline begins with an approximately eleven-second
-source-led cold open: retained primary-source video and an optional authored
-crackle at entry. Source audio is muted by default and may be enabled only when
-the episode rights ledger explicitly permits that exact use. Because the prefix
-contains no overlays, derived excerpts that require credit must burn a small
-source label into the pixels. Narration, music, and presentation captions begin
-only after the hard cut into the documentary. Do not loop or synthesize source
-action merely to force the target length.
+source-led cold open. Source audio is muted by default and may be enabled only
+when the episode rights ledger explicitly permits that exact interval because
+the sound itself is under discussion. Preserve an approved source audio stream
+without re-encoding and record its checksum and interval; do not replace its
+recognizable tones with a synthetic crackle. Because the prefix contains no
+overlays, derived excerpts that require credit must burn a small source label
+into the pixels. Narration, music, and presentation captions begin only after
+the hard cut into the documentary. Do not loop or synthesize source action
+merely to force the target length.
 
 Keep text-led graphics editorially sparse. Prefer source motion and Chromium
-evidence, avoid consecutive slide-like cards, and place a small claim-specific
-qualifier over usable source pixels instead of a full-screen uncertainty
-placeholder.
+evidence. Consolidate adjacent cards with the same heading into a stable
+maximum-six-row slide, highlight only the row being narrated, and keep Resolve
+transforms at identity. Place a small claim-specific qualifier over usable
+source pixels instead of a full-screen uncertainty placeholder.
 
 ## Primary render and fallback
 

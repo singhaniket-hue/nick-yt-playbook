@@ -44,7 +44,7 @@ from rabbithole.sources.soundgen import (
 
 
 SCHEMA_VERSION = "resolve-plan.v1"
-COMPILER_VERSION = "resolve-compiler.v23"
+COMPILER_VERSION = "resolve-compiler.v24"
 DEFAULT_FPS = 30
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
@@ -146,6 +146,7 @@ _TEXT_LED_OVERLAY_KINDS = {
 _TEXT_LED_PROVIDERS = {
     "rabbithole-cards",
     "rabbithole-evidence-card",
+    "rabbithole-source-text-extract",
 }
 _EVIDENCE_TERMS = {
     "document",
@@ -163,10 +164,12 @@ _ATTRIBUTION_BURNED_PROVIDERS = {
     "rabbithole-evidence-card",
     "rabbithole-source-frame",
     "rabbithole-source-image",
+    "rabbithole-source-text-extract",
 }
 _PROJECT_AUTHORED_PROVIDERS = {
     "rabbithole-cards",
     "rabbithole-evidence-card",
+    "rabbithole-source-text-extract",
 }
 _AUDIO_KIND_TRACKS = {
     "dialogue": "A1",
@@ -773,6 +776,13 @@ def _compile_loaded(
             track = override_track
 
         transform = _transform_for_framing(cut["framing"])
+        # Text-led graphics must remain a stable reading surface.  An authored
+        # EDL push-in is useful for pictorial footage, but on a card it makes
+        # the same words move while the viewer is trying to read them.  Card
+        # animation (including the active-line highlight) is baked into the
+        # asset itself, so Resolve receives an identity transform here.
+        if cut["slot_kind"] == "graphic":
+            transform = _transform_for_framing("wide")
         transform_override = _lookup_override(
             overrides_map.get("transforms", {}), cut["slot_id"], str(cut["index"])
         )

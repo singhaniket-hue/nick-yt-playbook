@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
-from rabbithole import cards
+from rabbithole import cards, source_text
 from rabbithole.jsonio import read_json
 from rabbithole.provenance import AssetRecord
 from rabbithole.slots import Slot
@@ -119,6 +119,10 @@ NON_SOURCE_PIXEL_EVIDENCE_PROVIDERS = frozenset(
         # frame. It is source-backed context, but it contains no retained
         # pixels from the cited page or media.
         "rabbithole-evidence-card",
+        # This provider carries a short verbatim fragment plus visible source
+        # metadata on an editorial reading surface. It is source-backed text,
+        # not retained webpage imagery.
+        "rabbithole-source-text-extract",
     }
 )
 SOURCE_REPLACEMENT_TIERS = frozenset({"primary", "archival", "illustrative"})
@@ -688,9 +692,15 @@ LOCAL_EVIDENCE_CARD_STRATEGIES = frozenset(
         "local-current-context-citation-card-after-fetch-failure",
     }
 )
+SOURCE_TEXT_EXTRACT_STRATEGY = "source-text-extract"
 EVIDENCE_CARD_DISCLOSURE = "EDITORIAL PARAPHRASE · SOURCE-ATTRIBUTED"
 CAPTURE_STRATEGIES = frozenset(
-    {"", *SOURCE_IMAGE_STRATEGIES, *LOCAL_EVIDENCE_CARD_STRATEGIES}
+    {
+        "",
+        SOURCE_TEXT_EXTRACT_STRATEGY,
+        *SOURCE_IMAGE_STRATEGIES,
+        *LOCAL_EVIDENCE_CARD_STRATEGIES,
+    }
 )
 
 
@@ -715,6 +725,18 @@ def _citation_card_primary_text(slot_detail: str, capture_note: str = "") -> str
         text = detail_match.group(1).strip()
     text = re.sub(r"^source=\S+\s*", "", text).strip()
     return text or "Source context"
+
+
+def _capture_exact_text(value: dict[str, object] | None) -> str:
+    """Return the authored verbatim target, never a selector or page label."""
+
+    spec = capture.CaptureSpec.from_value(value)
+    direct = str(spec.text or "").strip()
+    if direct:
+        return direct
+    if spec.scroll_target is not None:
+        return str(spec.scroll_target.text or "").strip()
+    return ""
 
 
 def _artifact_policy_block(
@@ -754,6 +776,35 @@ def _artifact_policy_block(
             return (
                 f"artifact {artifact.artifact_id!r} bound to slot "
                 f"{slot.slot_id!r} has invalid capture_spec: {exc}"
+            )
+
+    if action == "shoot" and strategy == SOURCE_TEXT_EXTRACT_STRATEGY:
+        if artifact.capture_spec is None:
+            return (
+                f"artifact {artifact.artifact_id!r} bound to slot {slot.slot_id!r} "
+                "uses source-text-extract without capture_spec.text or "
+                "capture_spec.scroll_target.text"
+            )
+        exact_text = _capture_exact_text(artifact.capture_spec)
+        if not exact_text:
+            return (
+                f"artifact {artifact.artifact_id!r} bound to slot {slot.slot_id!r} "
+                "uses source-text-extract without an exact authored text target; "
+                "selectors and coordinates are not source text"
+            )
+        try:
+            source_text.SourceTextExtractSpec(
+                text=exact_text,
+                publisher=source_text.publisher_from_url(artifact.url),
+                title=artifact.title,
+                date=artifact.date,
+                url=artifact.url,
+                duration=slot.hold_seconds,
+            )
+        except (TypeError, ValueError) as exc:
+            return (
+                f"artifact {artifact.artifact_id!r} bound to slot {slot.slot_id!r} "
+                f"has invalid source-text-extract metadata: {exc}"
             )
 
     if artifact.source_video_slot:
@@ -952,7 +1003,10 @@ def _artifact_provenance_note(artifact: Artifact) -> str:
 
 
 def _capture_reuse_key(
-    artifact: Artifact, quality: str
+    artifact: Artifact,
+    quality: str,
+    *,
+    effective_capture_spec: dict[str, object] | None = None,
 ) -> tuple[str, str, str] | None:
     """Opt-in identity for a truly identical browser capture request.
 
@@ -964,7 +1018,71 @@ def _capture_reuse_key(
     fingerprint = str(artifact.capture_spec_fingerprint or "").strip()
     if not fingerprint:
         return None
+    if effective_capture_spec is not None:
+        effective_digest = hashlib.sha256(
+            json.dumps(
+                effective_capture_spec,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        fingerprint = f"{fingerprint}:{effective_digest}"
     return (artifact.url.strip(), fingerprint, quality)
+
+
+def _browser_capture_specs_for_slots(
+    slots: list[Slot],
+    artifacts: dict[str, Artifact | str],
+    *,
+    quality: str,
+) -> dict[str, dict[str, object]]:
+    """Resolve editorial capture behavior against the complete slot order.
+
+    Repeated evidence lines from one page form an episode-wide reading
+    sequence.  Only the first browser slot for a source URL may perform the
+    authored establish-to-target move; every later occurrence holds its target
+    instead of replaying the same zoom, even after intervening graphics or
+    other sources.  At final quality, exact text targets also receive the baked
+    yellow evidence highlight.  Computing this from *all* slots keeps a partial
+    ``--refresh --slot`` run consistent with a full acquisition.
+    """
+
+    resolved: dict[str, dict[str, object]] = {}
+    seen_browser_urls: set[str] = set()
+
+    for slot in slots:
+        binding = artifacts.get(slot.slot_id)
+        if KIND_TO_ACTION.get(slot.kind) != "shoot" or not binding:
+            continue
+        artifact = _artifact_from_binding(slot.slot_id, binding)
+        strategy = str(artifact.capture_strategy or "").strip().lower()
+        if strategy or artifact.source_video_slot or artifact.source_license:
+            continue
+        try:
+            spec = capture.CaptureSpec.from_value(artifact.capture_spec)
+        except (TypeError, ValueError):
+            # Planning reports the authored validation error with slot context.
+            continue
+        if not spec.needs_browser_control:
+            continue
+
+        source_url = artifact.url.strip()
+        changed = False
+        if quality == "final" and (
+            spec.text
+            or (spec.scroll_target is not None and spec.scroll_target.text)
+        ) and not spec.highlight:
+            spec = dataclasses.replace(spec, highlight=True)
+            changed = True
+        if source_url in seen_browser_urls and spec.motion is not None:
+            spec = dataclasses.replace(spec, motion=None)
+            changed = True
+
+        if changed:
+            resolved[slot.slot_id] = spec.to_dict()
+        seen_browser_urls.add(source_url)
+
+    return resolved
 
 
 def plan_assets(
@@ -1261,8 +1379,33 @@ def execute_plan(
         slot_id: Path(path).resolve()
         for slot_id, path in (source_media_by_slot or {}).items()
     }
+    source_text_transport = capture.memoized_transport(capture_transport)
     source_image_cache: dict[str, Path] = {}
     slots_by_id = {slot.slot_id: slot for slot in slots}
+    browser_capture_specs = _browser_capture_specs_for_slots(
+        slots, artifacts, quality=quality
+    )
+    original_card_specs: dict[str, cards.CardSpec] = {}
+    card_findings_by_slot: dict[str, list[Finding]] = {}
+    grouped_card_specs: dict[str, cards.CardSpec] = {}
+    graphic_run: list[tuple[str, cards.CardSpec]] = []
+
+    def flush_graphic_run() -> None:
+        if graphic_run:
+            grouped_card_specs.update(cards.group_same_heading_specs(graphic_run))
+            graphic_run.clear()
+
+    # Group only truly adjacent graphics.  A source clip between two cards is
+    # an editorial boundary even when their headings happen to match.
+    for planned_slot in slots:
+        if planned_slot.kind != "graphic":
+            flush_graphic_run()
+            continue
+        card_spec, card_findings = cards.spec_for_slot(planned_slot)
+        original_card_specs[planned_slot.slot_id] = card_spec
+        card_findings_by_slot[planned_slot.slot_id] = card_findings
+        graphic_run.append((planned_slot.slot_id, card_spec))
+    flush_graphic_run()
     resolved_now = now if now is not None else datetime.now(timezone.utc)
 
     records: list[AssetRecord] = []
@@ -1307,6 +1450,108 @@ def execute_plan(
         source_image_cache[url] = destination
         return destination
 
+    def capture_browser_video(
+        artifact: Artifact,
+        slot: Slot,
+        out_path: Path,
+        *,
+        transport: capture.Transport | None,
+        targeted_capture: capture.TargetedCapture | None = None,
+    ) -> capture.CaptureResult:
+        """Capture one browser slot, preserving a static reading hold on retry.
+
+        Some archived pages resolve a text target through the motion CDP path
+        but return an invalid/blank native still crop.  For later lines in a
+        same-source episode sequence, use the authored move only as an internal
+        locator and derive a constant final-frame asset.  The timeline therefore
+        never replays the move even when the browser needs it to obtain valid
+        pixels.
+        """
+
+        effective_value = browser_capture_specs.get(
+            slot.slot_id, artifact.capture_spec
+        )
+        effective_spec = capture.CaptureSpec.from_value(effective_value)
+        original_spec = capture.CaptureSpec.from_value(artifact.capture_spec)
+        try:
+            return capture.capture_to_video(
+                artifact.url,
+                out_path,
+                slot.hold_seconds,
+                out_dir / ".capturework",
+                runner=capture_runner,
+                transport=transport,
+                quality=quality,
+                spec=effective_value,
+                targeted_capture=targeted_capture,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as initial_error:
+            if original_spec.motion is None or effective_spec.motion is not None:
+                raise
+
+            fallback_path = (
+                out_dir / ".capturework" / f".{slot.slot_id}-motion-locator.mp4"
+            )
+            fallback_spec = dataclasses.replace(
+                effective_spec, motion=original_spec.motion
+            )
+            try:
+                motion_result = capture.capture_to_video(
+                    artifact.url,
+                    fallback_path,
+                    slot.hold_seconds,
+                    out_dir / ".capturework",
+                    runner=capture_runner,
+                    transport=transport,
+                    quality=quality,
+                    spec=fallback_spec.to_dict(),
+                    targeted_capture=targeted_capture,
+                )
+                motion = (
+                    motion_result.framing.motion
+                    if motion_result.framing is not None
+                    else None
+                )
+                if motion is None:
+                    raise RuntimeError(
+                        "motion locator returned no motion framing metadata"
+                    )
+                final_timestamp = max(
+                    0.0, motion.duration_seconds - (1.0 / motion.fps)
+                )
+                frame_video.derive_source_frame_video(
+                    fallback_path,
+                    out_path,
+                    timestamp=final_timestamp,
+                    duration=slot.hold_seconds,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as fallback_error:
+                raise RuntimeError(
+                    f"{initial_error}; static reading-hold fallback also failed: "
+                    f"{fallback_error}"
+                ) from fallback_error
+            finally:
+                fallback_path.unlink(missing_ok=True)
+
+            fallback_framing = motion_result.framing
+            if fallback_framing is not None:
+                fallback_framing = dataclasses.replace(
+                    fallback_framing,
+                    mode="target-hold-fallback",
+                    motion=None,
+                )
+            return dataclasses.replace(
+                motion_result,
+                path=out_path,
+                warnings=(
+                    *motion_result.warnings,
+                    "Native static target capture failed; retained the exact "
+                    "highlighted final frame from an internal motion locator. "
+                    "No repeated move is present in the emitted asset.",
+                ),
+                framing=fallback_framing,
+            )
+
     # Capturing a page is much more expensive than deriving a slot-length file
     # from an already captured still. Reuse is strictly opt-in through an
     # explicit capture-spec fingerprint; URL equality by itself is unsafe.
@@ -1324,7 +1569,11 @@ def execute_plan(
             continue
         if _artifact_policy_block(artifact, planned_slot, planned.action) is not None:
             continue
-        key = _capture_reuse_key(artifact, quality)
+        key = _capture_reuse_key(
+            artifact,
+            quality,
+            effective_capture_spec=browser_capture_specs.get(planned.slot_id),
+        )
         if key is None:
             continue
         shoot_durations[key] = max(
@@ -1357,7 +1606,9 @@ def execute_plan(
             or artifact.capture_spec_fingerprint
         ):
             continue
-        capture_spec = capture.CaptureSpec.from_value(artifact.capture_spec)
+        capture_spec = capture.CaptureSpec.from_value(
+            browser_capture_specs.get(planned.slot_id, artifact.capture_spec)
+        )
         if not capture_spec.needs_browser_control:
             continue
         targeted_slots_by_url.setdefault(artifact.url, []).append(planned.slot_id)
@@ -1420,13 +1671,15 @@ def execute_plan(
             continue
 
         if item.action == "draw":
-            spec, card_findings = cards.spec_for_slot(slot)
+            original_spec = original_card_specs[slot.slot_id]
+            spec = grouped_card_specs.get(slot.slot_id, original_spec)
+            card_findings = card_findings_by_slot[slot.slot_id]
             findings.extend(card_findings)
             if any(
                 finding.severity == "error" for finding in card_findings
             ):
                 continue
-            production_note = cards.production_note_reason(slot.detail, spec)
+            production_note = cards.production_note_reason(slot.detail, original_spec)
             if quality == "final" and production_note:
                 findings.append(
                     Finding(
@@ -1481,7 +1734,15 @@ def execute_plan(
                     retrieved_at=_iso_utc(resolved_now),
                     local_path=str(out_path),
                     used_in_slots=(slot.slot_id,),
-                    notes=f"{spec.kind} card drawn from slot detail {slot.detail!r}",
+                    notes=_join_notes(
+                        f"{spec.kind} card drawn from slot detail {slot.detail!r}",
+                        (
+                            "stable grouped reading slide; active row "
+                            f"{spec.active_item_index + 1}/{len(spec.items)}"
+                            if spec.active_item_index is not None
+                            else ""
+                        ),
+                    ),
                 )
             )
             continue
@@ -1514,6 +1775,103 @@ def execute_plan(
             url = artifact.url
             out_path = out_dir / f"{slot.slot_id}-capture.mp4"
             strategy = str(artifact.capture_strategy or "").strip().lower()
+            if strategy == SOURCE_TEXT_EXTRACT_STRATEGY:
+                if typography is None or palette is None:
+                    findings.append(
+                        Finding(
+                            gate="assets",
+                            severity="error",
+                            message=(
+                                f"Source-text extract for slot {slot.slot_id!r} "
+                                "needs the style typography and palette."
+                            ),
+                        )
+                    )
+                    continue
+                exact_text = _capture_exact_text(artifact.capture_spec)
+                extract_spec = source_text.SourceTextExtractSpec(
+                    text=exact_text,
+                    publisher=source_text.publisher_from_url(url),
+                    title=artifact.title,
+                    date=artifact.date,
+                    url=url,
+                    duration=slot.hold_seconds,
+                )
+                try:
+                    fetched_source = capture.fetch_source_bytes(
+                        url, source_text_transport
+                    )
+                except Exception as exc:
+                    findings.append(
+                        Finding(
+                            gate="assets",
+                            severity="error",
+                            message=(
+                                f"Source-text verification fetch failed for slot "
+                                f"{slot.slot_id!r}: {exc}. No extract was rendered."
+                            ),
+                        )
+                    )
+                    continue
+                if not capture.source_contains_exact_text(
+                    fetched_source, exact_text
+                ):
+                    findings.append(
+                        Finding(
+                            gate="assets",
+                            severity="error",
+                            message=(
+                                f"Source-text verification failed for slot "
+                                f"{slot.slot_id!r}: exact target {exact_text!r} "
+                                "was not found in fetched visible source text. "
+                                "No extract was rendered."
+                            ),
+                        )
+                    )
+                    continue
+                try:
+                    source_text.build_source_text_extract(
+                        extract_spec,
+                        out_path,
+                        typography,
+                        palette,
+                        grade,
+                        out_dir / ".source-text-work",
+                    )
+                except RuntimeError as exc:
+                    findings.append(
+                        Finding(
+                            gate="assets",
+                            severity="error",
+                            message=(
+                                f"Source-text extract render failed for slot "
+                                f"{slot.slot_id!r}: {exc}"
+                            ),
+                        )
+                    )
+                    continue
+                accept_record(
+                    AssetRecord(
+                        asset_id=f"capture-{slot.slot_id}",
+                        tier="primary",
+                        provider="rabbithole-source-text-extract",
+                        original_url=url,
+                        license="commentary-use",
+                        retrieved_at=_iso_utc(resolved_now),
+                        local_path=str(out_path),
+                        used_in_slots=(slot.slot_id,),
+                        notes=_join_notes(
+                            (
+                                "verbatim source-text extract rendered as "
+                                "editorial typesetting; no webpage image retained; "
+                                "target verified against fetched visible source text; "
+                                f"exact_target={exact_text!r}"
+                            ),
+                            _artifact_provenance_note(artifact),
+                        ),
+                    )
+                )
+                continue
             if strategy in LOCAL_EVIDENCE_CARD_STRATEGIES:
                 if typography is None or palette is None:
                     findings.append(
@@ -1710,15 +2068,11 @@ def execute_plan(
                             )
                             try:
                                 shared_capture_results[shared_slot_id] = (
-                                    capture.capture_to_video(
-                                        shared_artifact.url,
+                                    capture_browser_video(
+                                        shared_artifact,
+                                        shared_slot,
                                         shared_out_path,
-                                        shared_slot.hold_seconds,
-                                        out_dir / ".capturework",
-                                        runner=capture_runner,
                                         transport=probe_transport,
-                                        quality=quality,
-                                        spec=shared_artifact.capture_spec,
                                         targeted_capture=targeted_capture,
                                     )
                                 )
@@ -1751,7 +2105,11 @@ def execute_plan(
                     )
                     continue
             else:
-                capture_key = _capture_reuse_key(artifact, quality)
+                capture_key = _capture_reuse_key(
+                    artifact,
+                    quality,
+                    effective_capture_spec=browser_capture_specs.get(slot.slot_id),
+                )
                 cached = (
                     capture_cache.get(capture_key)
                     if capture_key is not None
@@ -1786,16 +2144,26 @@ def execute_plan(
                             if capture_key is not None
                             else slot.hold_seconds
                         )
-                        result = capture.capture_to_video(
-                            url,
-                            out_path,
-                            requested_duration,
-                            out_dir / ".capturework",
-                            runner=capture_runner,
-                            transport=capture_transport,
-                            quality=quality,
-                            spec=artifact.capture_spec,
-                        )
+                        if requested_duration == slot.hold_seconds:
+                            result = capture_browser_video(
+                                artifact,
+                                slot,
+                                out_path,
+                                transport=capture_transport,
+                            )
+                        else:
+                            result = capture.capture_to_video(
+                                url,
+                                out_path,
+                                requested_duration,
+                                out_dir / ".capturework",
+                                runner=capture_runner,
+                                transport=capture_transport,
+                                quality=quality,
+                                spec=browser_capture_specs.get(
+                                    slot.slot_id, artifact.capture_spec
+                                ),
+                            )
                     except RuntimeError as exc:
                         findings.append(
                             Finding(
@@ -1836,6 +2204,17 @@ def execute_plan(
                         separators=(",", ":"),
                     )
                 )
+            effective_capture_note = ""
+            effective_capture_spec = browser_capture_specs.get(slot.slot_id)
+            if effective_capture_spec is not None:
+                effective_capture_note = (
+                    "effective_capture_spec="
+                    + json.dumps(
+                        effective_capture_spec,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
 
             accept_record(
                 AssetRecord(
@@ -1850,6 +2229,7 @@ def execute_plan(
                     notes=_join_notes(
                         f"{result.kind} capture{inspection_note}",
                         framing_note,
+                        effective_capture_note,
                         reuse_note,
                         _artifact_provenance_note(artifact),
                     ),

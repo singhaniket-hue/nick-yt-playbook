@@ -82,15 +82,18 @@ slot. Existing source metadata remains useful:
 - `selector` or `text` to identify the evidence element;
 - `scroll_target` with exactly one of `y`, `selector`, or `text`;
 - `full_page: true`;
-- `crop` as `{x, y, width, height}` in the retained screenshot.
+- `crop` as `{x, y, width, height}` in the retained screenshot;
+- `highlight: true` to mark the exact matched text range in yellow.
 
-For article and webpage evidence, retain a Chromium motion recording rather
+For article and webpage evidence, retain a Chromium reading sequence rather
 than a simulated pan across one screenshot. Establish the real page and browser
-context first, make one restrained scroll or push to the authored selector or
-text target, then hold the claim long enough to read. The recorded target and
-final crop must pass the same fail-closed QA as a still capture. Use a still
-only when motion would add no source context or when the source itself is a
-static document/image.
+context first, make one restrained scroll or push only on the first browser slot
+for that source URL in the episode, then hold every later target from that URL
+without replaying the move, even after intervening graphics or sources.
+Highlight the exact narrated DOM text and keep its source context readable. The
+recorded target and final crop must pass the same fail-closed QA as a still
+capture. Use a still only when motion would add no source context or when the
+source itself is a static document/image.
 
 The same fields may be supplied by a `research/capture-targets*.json` overlay
 keyed by slot ID. Invalid targets and crops are rejected during planning before
@@ -163,8 +166,11 @@ neither measurement.
 
 Keep card density restrained. Prefer moving primary-source footage, Chromium
 evidence, retained video frames, and archival material; use a designed card for
-chapter structure or a concept that source pixels cannot communicate. Avoid
-consecutive text-led cards and plan caption exclusion over every text-led shot.
+chapter structure or a concept that source pixels cannot communicate. Merge
+adjacent same-heading cards into one stable slide of at most six rows and move a
+yellow band to the currently narrated row. Do not zoom that reading surface.
+Avoid unrelated consecutive text-led cards and plan caption exclusion over
+every text-led shot.
 
 ## Deriving video from a licensed source image
 

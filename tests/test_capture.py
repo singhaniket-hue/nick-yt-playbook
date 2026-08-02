@@ -41,6 +41,8 @@ from rabbithole.sources.capture import (
     is_archived_url,
     is_pdf,
     memoized_transport,
+    normalize_source_text,
+    source_contains_exact_text,
     shared_page_capture,
     still_to_video,
 )
@@ -129,6 +131,24 @@ def test_fetch_source_bytes_fails_closed(response, match):
             lambda _url: response,
             max_bytes=5,
         )
+
+
+def test_source_text_match_normalizes_html_whitespace_quotes_and_dashes():
+    html = (
+        "<html><article>UPDATE: But there’s another twist — and more"
+        "\n   mundane context.</article></html>"
+    )
+
+    assert source_contains_exact_text(
+        html, "UPDATE: But there's another twist - and more mundane context."
+    )
+    assert normalize_source_text("A\u00a0 B") == "a b"
+
+
+def test_source_text_match_ignores_script_metadata_and_requires_visible_text():
+    html = "<script>the exact hidden claim</script><article>Other copy</article>"
+
+    assert not source_contains_exact_text(html, "the exact hidden claim")
 
 
 def _png(path: Path, size=(320, 180), colour=(200, 30, 30)) -> Path:
@@ -325,6 +345,7 @@ def test_capture_spec_round_trips_through_plain_json():
             "text": "Google acknowledged the test",
             "scroll_to": {"text": "Webdriver Torso"},
             "crop": {"x": 20, "y": 900, "width": 1280, "height": 720},
+            "highlight": True,
         }
     )
 
@@ -334,6 +355,45 @@ def test_capture_spec_round_trips_through_plain_json():
     assert restored.text_locator == "Google acknowledged the test"
     assert restored.scroll_target == ScrollTarget(text="Webdriver Torso")
     assert restored.crop == CaptureCrop(x=20, y=900, width=1280, height=720)
+    assert restored.highlight is True
+
+
+@pytest.mark.parametrize(
+    ("value", "error", "match"),
+    [
+        (
+            {"selector": "article", "highlight": True},
+            ValueError,
+            "requires text or scroll_target.text",
+        ),
+        (
+            {"text": "exact evidence", "highlight": "yes"},
+            TypeError,
+            "must be a boolean",
+        ),
+    ],
+)
+def test_invalid_highlight_capture_specs_fail_before_browser_io(
+    value, error, match
+):
+    with pytest.raises(error, match=match):
+        CaptureSpec.from_value(value)
+
+
+def test_targeting_expression_highlights_an_exact_dom_range_with_safe_fallback():
+    expression = capture_module._targeting_expression(
+        CaptureSpec(
+            scroll_target=ScrollTarget(text="the exact spoken line"),
+            highlight=True,
+        )
+    )
+
+    assert "document.createRange()" in expression
+    assert "range.getClientRects()" in expression
+    assert "CSS.highlights.set" in expression
+    assert "new Highlight(range)" in expression
+    assert "__rabbithole-highlight-overlay" in expression
+    assert "mix-blend-mode:multiply" in expression
 
 
 def test_motion_capture_spec_round_trips_with_an_authored_tab_click():
@@ -624,6 +684,55 @@ def test_cdp_motion_establishes_then_smoothly_pushes_to_the_resolved_target(
     }
 
 
+def test_scroll_text_motion_uses_exact_target_and_retains_highlight_geometry(
+    tmp_path,
+):
+    session = _FakeCdp(
+        target_result={
+            "ok": True,
+            "scrollX": 0,
+            "scrollY": 630,
+            "targetRect": {"x": 80, "y": 700, "width": 160, "height": 40},
+            "highlightRects": [
+                {"x": 80, "y": 700, "width": 160, "height": 18},
+                {"x": 80, "y": 722, "width": 120, "height": 18},
+            ],
+            "highlightMode": "css-highlight",
+        },
+        screenshot_size=(320, 1000),
+    )
+    request = BrowserMotionCaptureRequest(
+        url="https://example.com/article",
+        frames_dir=tmp_path / "highlight-motion",
+        spec=CaptureSpec(
+            scroll_target=ScrollTarget(text="exact evidence"),
+            motion=CaptureMotion(),
+            highlight=True,
+        ),
+        width=320,
+        height=180,
+        duration=0.5,
+        fps=6,
+        settle_ms=0,
+        browser=Path("browser.exe"),
+    )
+
+    response = _capture_motion_frames_with_cdp_session(session, request)
+
+    assert response.framing.mode == "motion-target"
+    assert response.framing.target == CaptureRectangle(
+        x=80, y=700, width=160, height=40
+    )
+    assert response.framing.highlight_rects == (
+        CaptureRectangle(x=80, y=700, width=160, height=18),
+        CaptureRectangle(x=80, y=722, width=120, height=18),
+    )
+    assert response.framing.highlight_mode == "css-highlight"
+    assert response.framing.motion.end_clip == CaptureRectangle(
+        x=40, y=652.5, width=240, height=135
+    )
+
+
 def test_half_frame_motion_keeps_88_authored_frames_plus_identical_handle(
     tmp_path,
 ):
@@ -829,6 +938,58 @@ def test_cdp_untargeted_full_page_capture_is_unchanged(tmp_path):
     assert response.framing.target is None
 
 
+def test_scroll_text_capture_retains_exact_target_without_forcing_a_tight_crop(
+    tmp_path,
+):
+    out = tmp_path / "scroll-highlight.png"
+    session = _FakeCdp(
+        target_result={
+            "ok": True,
+            "scrollX": 0,
+            "scrollY": 630,
+            "targetRect": {"x": 80, "y": 700, "width": 160, "height": 40},
+            "highlightRects": [
+                {"x": 80, "y": 700, "width": 160, "height": 18},
+                {"x": 80, "y": 722, "width": 120, "height": 18},
+            ],
+            "highlightMode": "overlay",
+        },
+        screenshot_size=(400, 1200),
+    )
+    request = BrowserCaptureRequest(
+        url="https://example.com/article",
+        out_png=out,
+        spec=CaptureSpec(
+            scroll_target=ScrollTarget(text="exact evidence"),
+            highlight=True,
+        ),
+        width=400,
+        height=300,
+        settle_ms=0,
+        browser=Path("browser.exe"),
+    )
+
+    response = _capture_with_cdp_session(session, request)
+
+    capture_call = next(
+        params for method, params in session.calls if method == "Page.captureScreenshot"
+    )
+    assert capture_call["captureBeyondViewport"] is False
+    assert "clip" not in capture_call
+    assert response.framing.mode == "viewport"
+    assert response.framing.clip == CaptureRectangle(
+        x=0, y=630, width=400, height=300
+    )
+    assert response.framing.target == CaptureRectangle(
+        x=80, y=700, width=160, height=40
+    )
+    assert response.framing.highlight_rects == (
+        CaptureRectangle(x=80, y=700, width=160, height=18),
+        CaptureRectangle(x=80, y=722, width=120, height=18),
+    )
+    assert response.framing.highlight_mode == "overlay"
+
+
 def test_cdp_explicit_crop_is_sent_directly_to_the_browser(tmp_path):
     out = tmp_path / "authored-crop-source.png"
     authored = CaptureCrop(x=20, y=700, width=300, height=160)
@@ -875,6 +1036,101 @@ def test_cdp_explicit_crop_is_sent_directly_to_the_browser(tmp_path):
         width=300,
         height=160,
     )
+
+
+def test_full_page_explicit_crop_rejects_highlight_outside_retained_clip(
+    tmp_path,
+):
+    out = tmp_path / "missed-highlight.png"
+    session = _FakeCdp(
+        target_result={
+            "ok": True,
+            "scrollX": 0,
+            "scrollY": 840,
+            "targetRect": {"x": 330, "y": 900, "width": 60, "height": 20},
+            "highlightRects": [
+                {"x": 330, "y": 900, "width": 60, "height": 20},
+            ],
+            "highlightMode": "css-highlight",
+        },
+        screenshot_size=(400, 1200),
+    )
+    request = BrowserCaptureRequest(
+        url="https://example.com/article",
+        out_png=out,
+        spec=CaptureSpec(
+            full_page=True,
+            text="exact evidence",
+            crop=CaptureCrop(x=20, y=700, width=300, height=160),
+            highlight=True,
+        ),
+        width=400,
+        height=300,
+        settle_ms=0,
+        browser=Path("browser.exe"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="does not fully contain highlight rectangle",
+    ):
+        _capture_with_cdp_session(session, request)
+
+    assert not any(
+        method == "Page.captureScreenshot" for method, _params in session.calls
+    )
+    assert not out.exists()
+
+
+def test_full_page_explicit_crop_accepts_all_highlight_rectangles_inside_clip(
+    tmp_path,
+):
+    out = tmp_path / "contained-highlight.png"
+    session = _FakeCdp(
+        target_result={
+            "ok": True,
+            "scrollX": 0,
+            "scrollY": 840,
+            "targetRect": {"x": 80, "y": 740, "width": 160, "height": 40},
+            "highlightRects": [
+                {"x": 80, "y": 740, "width": 160, "height": 18},
+                {"x": 80, "y": 762, "width": 120, "height": 18},
+            ],
+            "highlightMode": "overlay",
+        },
+        screenshot_size=(400, 1200),
+    )
+    request = BrowserCaptureRequest(
+        url="https://example.com/article",
+        out_png=out,
+        spec=CaptureSpec(
+            full_page=True,
+            text="exact evidence",
+            crop=CaptureCrop(x=20, y=700, width=300, height=160),
+            highlight=True,
+        ),
+        width=400,
+        height=300,
+        settle_ms=0,
+        browser=Path("browser.exe"),
+    )
+
+    response = _capture_with_cdp_session(session, request)
+
+    assert response.framing.clip == CaptureRectangle(
+        x=20,
+        y=700,
+        width=300,
+        height=160,
+    )
+    assert response.framing.highlight_rects == (
+        CaptureRectangle(x=80, y=740, width=160, height=18),
+        CaptureRectangle(x=80, y=762, width=120, height=18),
+    )
+    assert any(
+        method == "Page.captureScreenshot" for method, _params in session.calls
+    )
+    assert out.exists()
 
 
 def test_cdp_viewport_crop_is_translated_to_post_scroll_page_coordinates(tmp_path):
@@ -1467,6 +1723,56 @@ def test_still_becomes_a_video_of_the_requested_length(tmp_path):
     assert probe_duration(out) == pytest.approx(2.0, abs=0.15)
 
 
+def test_fractional_still_retains_ceiling_frame_for_resolve_source_range(tmp_path):
+    still = _png(tmp_path / "s.png")
+    out = still_to_video(
+        still,
+        tmp_path / "v.mp4",
+        3.286,
+        width=320,
+        height=180,
+        fps=30,
+    )
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "csv=p=0",
+            str(out),
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+
+    assert int(probe.stdout.strip()) == 99
+
+
+def test_still_encoder_uses_explicit_ceiling_frame_count(tmp_path):
+    still = _png(tmp_path / "s.png")
+    observed = []
+
+    def runner(argv):
+        observed.append(argv)
+        return 0, b"", b""
+
+    still_to_video(still, tmp_path / "v.mp4", 2.938, fps=30, runner=runner)
+
+    assert len(observed) == 1
+    argv = observed[0]
+    assert "-t" not in argv
+    assert argv[argv.index("-framerate") + 1] == "30"
+    assert argv[argv.index("-frames:v") + 1] == "89"
+    assert argv[argv.index("-fps_mode") + 1] == "cfr"
+
+
 def test_the_video_carries_a_decodable_video_stream(tmp_path):
     still = _png(tmp_path / "s.png")
     out = still_to_video(still, tmp_path / "v.mp4", 1.0, width=320, height=180, fps=12)
@@ -1886,6 +2192,28 @@ def _targeted_text_response() -> BrowserCaptureResponse:
     )
 
 
+def _highlighted_text_response(
+    *,
+    mode: str = "target",
+    highlight_mode: str = "css-highlight",
+) -> BrowserCaptureResponse:
+    highlight = CaptureRectangle(x=55, y=78, width=245, height=18)
+    return BrowserCaptureResponse(
+        page_source=(
+            "<html><body><p>Exact highlighted evidence is readable.</p>"
+            "</body></html>"
+        ),
+        framing=CaptureFraming(
+            mode=mode,
+            target=highlight,
+            clip=CaptureRectangle(x=0, y=0, width=400, height=225),
+            content=CaptureRectangle(x=0, y=0, width=400, height=900),
+            highlight_rects=(highlight,),
+            highlight_mode=highlight_mode,
+        ),
+    )
+
+
 def test_targeted_sparse_black_text_on_white_passes_structural_blank_qa(tmp_path):
     from PIL import Image, ImageDraw
 
@@ -1919,6 +2247,116 @@ def test_targeted_sparse_black_text_on_white_passes_structural_blank_qa(tmp_path
     # resolved-target pixel structure is what conservatively rescues it.
     assert capture_module.inspect_frame(result.path).looks_blank is True
     assert result.path.exists()
+
+
+@pytest.mark.parametrize(
+    ("framing_mode", "spec"),
+    [
+        (
+            "target",
+            {"text": "Exact highlighted evidence", "highlight": True},
+        ),
+        (
+            "viewport",
+            {
+                "scroll_target": {"text": "Exact highlighted evidence"},
+                "highlight": True,
+            },
+        ),
+        (
+            "target-hold-fallback",
+            {
+                "scroll_target": {"text": "Exact highlighted evidence"},
+                "highlight": True,
+            },
+        ),
+        (
+            "explicit-crop",
+            {
+                "text": "Exact highlighted evidence",
+                "highlight": True,
+                "crop": {"x": 0, "y": 0, "width": 400, "height": 225},
+            },
+        ),
+    ],
+)
+def test_exact_yellow_highlight_passes_structural_blank_qa(
+    tmp_path, framing_mode, spec
+):
+    from PIL import Image, ImageDraw
+
+    out = tmp_path / f"{framing_mode}-highlight.png"
+
+    def targeted(request):
+        image = Image.new("RGB", (400, 225), (255, 255, 255))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((55, 78, 299, 95), fill=(255, 205, 20))
+        draw.text(
+            (58, 80),
+            "Exact highlighted evidence is readable.",
+            fill=(17, 17, 17),
+        )
+        image = image.quantize(
+            colors=3,
+            dither=Image.Dither.NONE,
+        ).convert("RGB")
+        image.save(request.out_png)
+        return _highlighted_text_response(mode=framing_mode)
+
+    result = capture_page(
+        "https://web.archive.org/web/2026/https://example.com",
+        out,
+        width=400,
+        height=225,
+        browser=Path("browser.exe"),
+        spec=spec,
+        targeted_capture=targeted,
+    )
+
+    assert capture_module.inspect_frame(result.path).looks_blank is True
+    assert result.path.exists()
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    ["uniform-yellow", "yellow-dark-panel", "white-error-on-black"],
+)
+def test_highlight_blank_fallback_rejects_uniform_panels_and_error_embeds(
+    tmp_path, fixture
+):
+    from PIL import Image, ImageDraw
+
+    out = tmp_path / f"{fixture}.png"
+
+    def targeted(request):
+        image = Image.new("RGB", (400, 225), (255, 255, 255))
+        draw = ImageDraw.Draw(image)
+        if fixture in {"uniform-yellow", "yellow-dark-panel"}:
+            draw.rectangle((55, 78, 299, 95), fill=(255, 205, 20))
+        if fixture == "yellow-dark-panel":
+            draw.rectangle((125, 80, 225, 93), fill=(17, 17, 17))
+        elif fixture == "white-error-on-black":
+            draw.rectangle((55, 78, 299, 95), fill=(10, 10, 10))
+            draw.text((85, 81), "CONTENT FAILED", fill=(255, 255, 255))
+        image = image.quantize(
+            colors=3,
+            dither=Image.Dither.NONE,
+        ).convert("RGB")
+        image.save(request.out_png)
+        return _highlighted_text_response()
+
+    with pytest.raises(RuntimeError, match="frame is blank"):
+        capture_page(
+            "https://web.archive.org/web/2026/https://example.com",
+            out,
+            width=400,
+            height=225,
+            browser=Path("browser.exe"),
+            spec={"text": "Exact highlighted evidence", "highlight": True},
+            targeted_capture=targeted,
+        )
+
+    assert not out.exists()
 
 
 @pytest.mark.parametrize(

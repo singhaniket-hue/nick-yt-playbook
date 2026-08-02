@@ -473,7 +473,7 @@ def test_compile_is_deterministic_and_preserves_render_offsets(tmp_path):
     assert first["timeline_name"].startswith("AUTO_BUILD_")
     assert first["project_root"] == "."
     assert first["fps"] == 30
-    assert first["compiler_version"] == "resolve-compiler.v23"
+    assert first["compiler_version"] == "resolve-compiler.v24"
     assert "cold_open" not in first
     assert first["render"]["format"] == "mp4"
     assert first["render"]["codec"] == "H264"
@@ -547,6 +547,32 @@ def test_compile_is_deterministic_and_preserves_render_offsets(tmp_path):
     assert [clip["track"] for clip in first["audio"]] == ["A1", "A2"]
     assert first["highlights"][0]["start_frame"] == 63
     assert not first["missing_media"]
+
+
+def test_graphic_clips_ignore_edl_push_in_for_readability(tmp_path):
+    root = _project(tmp_path)
+    timing_path = root / "narration" / "timing.json"
+    timing = json.loads(timing_path.read_text(encoding="utf-8"))
+    timing["markers"][0]["arg"] = "graphic TEST FRAME: exact line | context"
+    _write_json(timing_path, timing)
+
+    edl_path = root / "edit" / "edl.json"
+    edl = json.loads(edl_path.read_text(encoding="utf-8"))
+    edl["cuts"][0]["framing"] = "push-in"
+    _write_json(edl_path, edl)
+
+    plan = compile_resolve_plan(root)
+    clip = next(item for item in plan["clips"] if item["index"] == 0)
+
+    assert clip["slot_kind"] == "graphic"
+    assert clip["framing"] == "push-in"
+    assert clip["transform"] == {
+        "scale_x": 1.0,
+        "scale_y": 1.0,
+        "position_x": 0.0,
+        "position_y": 0.0,
+        "rotation": 0.0,
+    }
 
 
 @pytest.mark.parametrize("with_cold_open", [False, True])

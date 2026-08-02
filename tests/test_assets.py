@@ -26,6 +26,7 @@ from rabbithole.provenance import AssetRecord, check_provenance
 from rabbithole.slots import Slot
 from rabbithole.sources.capture import (
     CaptureFraming,
+    CaptureMotionFraming,
     CaptureRectangle,
     CaptureResult,
 )
@@ -1111,6 +1112,50 @@ def test_a_graphic_slot_now_produces_a_real_asset(tmp_path):
     assert Path(records[0].local_path).exists()
 
 
+def test_execute_plan_keeps_adjacent_same_heading_cards_stable(monkeypatch, tmp_path):
+    slots = [
+        _slot(
+            "s001",
+            "graphic",
+            detail="UPLOAD: EVERY TWO MINUTES | OBSERVED",
+            start=0.0,
+            end=2.0,
+        ),
+        _slot(
+            "s002",
+            "graphic",
+            detail="UPLOAD: PEAK PERIOD | MAY 2014",
+            start=2.0,
+            end=4.0,
+        ),
+    ]
+    rendered = []
+
+    def fake_build(spec, out_path, *_args, **_kwargs):
+        rendered.append(spec)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"grouped card")
+        return out_path
+
+    monkeypatch.setattr(assets_module.cards, "build_card", fake_build)
+    records, findings = execute_plan(
+        plan_assets(slots, [], []),
+        slots,
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        typography={},
+        palette={},
+        media_prober=lambda _path: True,
+    )
+
+    assert [finding for finding in findings if finding.severity == "error"] == []
+    assert len(records) == 2
+    assert rendered[0].items == rendered[1].items
+    assert len(rendered[0].items) == 2
+    assert [spec.active_item_index for spec in rendered] == [0, 1]
+
+
 def test_final_quality_refuses_a_label_only_production_note_card(tmp_path):
     slot = _slot(
         "s002", "graphic", detail="UAPA clause callout", start=0.0, end=1.0
@@ -1259,6 +1304,32 @@ def test_citation_card_is_source_backed_but_not_source_pixel_evidence():
     assert metrics.source_backed_seconds == pytest.approx(10.0)
     assert metrics.source_pixel_duration_ratio == pytest.approx(0.4)
     assert metrics.source_pixel_seconds == pytest.approx(4.0)
+
+
+def test_source_text_extract_is_source_backed_but_not_source_pixel_evidence():
+    slots = [
+        _slot("s001", "screenshot", start=0.0, end=6.0),
+        _slot("s002", "screenshot", start=6.0, end=10.0),
+    ]
+    records = [
+        _record(
+            "extract",
+            tier="primary",
+            provider="rabbithole-source-text-extract",
+            used_in_slots=("s001",),
+        ),
+        _record(
+            "capture",
+            tier="primary",
+            provider="web.archive.org",
+            used_in_slots=("s002",),
+        ),
+    ]
+
+    metrics = evidence_metrics(slots, records)
+
+    assert metrics.source_backed_duration_ratio == pytest.approx(1.0)
+    assert metrics.source_pixel_duration_ratio == pytest.approx(0.4)
 
 
 def test_citation_cards_cannot_satisfy_final_evidence_gate_by_themselves():
@@ -1788,6 +1859,147 @@ def test_targeted_same_url_slots_share_one_page_batch_and_keep_distinct_records(
     assert records[0].local_path != records[1].local_path
 
 
+def test_final_browser_source_url_moves_only_once_across_entire_episode():
+    slots = [
+        _slot("s001", "screenshot", start=0.0, end=1.0),
+        _slot("s002", "graphic", start=1.0, end=2.0),
+        _slot("s003", "screenshot", start=2.0, end=3.0),
+        _slot("s004", "screenshot", start=3.0, end=4.0),
+    ]
+    first_url = "https://example.com/article"
+    other_url = "https://example.com/other"
+    artifacts = [
+        _artifact(
+            f"a00{slot.slot_id[-1]}",
+            url,
+            slot_id=slot.slot_id,
+            capture_spec={"text": f"exact line {slot.slot_id[-1]}", "motion": True},
+        )
+        for slot, url in (
+            (slots[0], first_url),
+            (slots[2], other_url),
+            (slots[3], first_url),
+        )
+    ]
+
+    specs = assets_module._browser_capture_specs_for_slots(
+        slots,
+        artifact_bindings_by_slot(artifacts),
+        quality="final",
+    )
+
+    assert set(specs) == {"s001", "s003", "s004"}
+    assert all(spec["highlight"] is True for spec in specs.values())
+    assert "motion" in specs["s001"]
+    assert "motion" in specs["s003"]
+    assert "motion" not in specs["s004"]
+
+
+def test_later_noncontiguous_browser_line_uses_motion_only_as_static_locator(
+    tmp_path, monkeypatch
+):
+    slots = [
+        _slot("s001", "screenshot", start=0.0, end=1.0),
+        _slot("s002", "screenshot", start=1.0, end=2.0),
+        _slot("s003", "screenshot", start=2.0, end=3.0),
+    ]
+    url = "https://example.com/article"
+    other_url = "https://example.com/other"
+    artifacts = [
+        _artifact(
+            f"a00{index}",
+            artifact_url,
+            slot_id=slot.slot_id,
+            capture_spec={"text": f"exact line {index}", "motion": True},
+        )
+        for index, (slot, artifact_url) in enumerate(
+            zip(slots, [url, other_url, url]), start=1
+        )
+    ]
+    capture_specs = []
+    derived = []
+
+    @contextmanager
+    def fake_shared_page_capture():
+        yield object()
+
+    def fake_capture(_url, out_path, _duration, _work_dir, **kwargs):
+        spec = assets_module.capture.CaptureSpec.from_value(kwargs["spec"])
+        capture_specs.append((out_path.name, spec))
+        if out_path.name == "s003-capture.mp4" and spec.motion is None:
+            raise RuntimeError("native still crop was blank")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"browser capture")
+        framing = None
+        if spec.motion is not None:
+            clip = CaptureRectangle(0, 0, 1920, 1080)
+            framing = CaptureFraming(
+                mode="motion",
+                target=CaptureRectangle(200, 300, 500, 60),
+                clip=clip,
+                content=CaptureRectangle(0, 0, 1920, 4000),
+                motion=CaptureMotionFraming(
+                    frame_count=31,
+                    fps=30,
+                    duration_seconds=31 / 30,
+                    authored_frame_count=30,
+                    safe_trailing_frames=1,
+                    establish_fraction=0.22,
+                    move_fraction=0.50,
+                    easing="smoothstep",
+                    start_clip=clip,
+                    end_clip=clip,
+                ),
+            )
+        return CaptureResult(path=out_path, kind="page", framing=framing)
+
+    def fake_derive(source_path, out_path, **kwargs):
+        derived.append((source_path, out_path, kwargs))
+        out_path.write_bytes(b"static final frame")
+        return out_path
+
+    monkeypatch.setattr(
+        assets_module.capture, "shared_page_capture", fake_shared_page_capture
+    )
+    monkeypatch.setattr(assets_module.capture, "capture_to_video", fake_capture)
+    monkeypatch.setattr(
+        assets_module.frame_video, "derive_source_frame_video", fake_derive
+    )
+
+    records, findings = execute_plan(
+        plan_assets(slots, [], artifacts),
+        slots,
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        artifacts=artifact_bindings_by_slot(artifacts),
+        quality="final",
+        media_prober=lambda _path: True,
+    )
+
+    assert len(records) == 3
+    # Same-URL requests share a page batch, so s003 is attempted before the
+    # intervening URL. Its emitted request is static; the following motion
+    # request is only the internal locator used to derive a frozen frame.
+    assert [
+        (name, spec.motion is not None) for name, spec in capture_specs
+    ] == [
+        ("s001-capture.mp4", True),
+        ("s003-capture.mp4", False),
+        (".s003-motion-locator.mp4", True),
+        ("s002-capture.mp4", True),
+    ]
+    assert all(spec.highlight for _, spec in capture_specs)
+    assert len(derived) == 1
+    assert derived[0][2]["timestamp"] == pytest.approx(1.0)
+    assert derived[0][2]["duration"] == pytest.approx(1.0)
+    assert any(
+        finding.severity == "warning" and "No repeated move" in finding.message
+        for finding in findings
+    )
+    assert '"mode":"target-hold-fallback"' in records[2].notes
+
+
 def test_invalid_artifact_capture_spec_blocks_before_io():
     slot = _slot("s001", "screenshot", start=0.0, end=1.0)
     artifact = _artifact(
@@ -1984,6 +2196,195 @@ def test_execute_plan_builds_local_evidence_card_without_browser(
     )
     assert records[0].provider == "rabbithole-evidence-card"
     assert "manual review required" in records[0].notes
+
+
+def test_source_text_extract_strategy_requires_an_exact_authored_text_target():
+    slot = _slot("s069", "screenshot", start=0.0, end=2.0)
+    artifact = _artifact(
+        "wt-guardian-s069",
+        "https://www.theguardian.com/example",
+        title="Example article",
+        date="2014-05-01",
+        slot_id="s069",
+        acquisition_mode="screenshot-only",
+        capture_strategy="source-text-extract",
+        capture_spec={"selector": "article"},
+    )
+
+    reason = assets_module._artifact_policy_block(artifact, slot, "shoot")
+
+    assert reason is not None
+    assert "without an exact authored text target" in reason
+    assert "selectors and coordinates are not source text" in reason
+
+
+def test_execute_plan_builds_disclosed_source_text_extract_without_browser(
+    tmp_path, monkeypatch
+):
+    slot = _slot("s069", "screenshot", start=0.0, end=2.0)
+    url = "https://www.theguardian.com/technology/example"
+    target = "But the truth is, as ever, more mundane"
+    artifact = _artifact(
+        "wt-guardian-s069",
+        url,
+        title="The truth behind the mysterious videos",
+        date="2014-05-01",
+        slot_id="s069",
+        acquisition_mode="screenshot-only",
+        capture_strategy="source-text-extract",
+        capture_spec={"scroll_target": {"text": target}, "motion": True},
+        capture_note="Browser output is a Guardian consent wall.",
+    )
+    built = []
+
+    def fake_build(spec, out_path, *_args, **_kwargs):
+        built.append(spec)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"source text extract")
+        return out_path
+
+    monkeypatch.setattr(
+        assets_module.source_text, "build_source_text_extract", fake_build
+    )
+    monkeypatch.setattr(
+        assets_module.capture,
+        "capture_to_video",
+        lambda *_args, **_kwargs: pytest.fail("browser capture must not run"),
+    )
+
+    records, findings = execute_plan(
+        plan_assets([slot], [], [artifact]),
+        [slot],
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        artifacts=artifact_bindings_by_slot([artifact]),
+        typography={},
+        palette={},
+        capture_transport=lambda _url: (
+            200,
+            f"<html><article>{target}</article></html>".encode(),
+        ),
+        media_prober=lambda _path: True,
+    )
+
+    assert [finding for finding in findings if finding.severity == "error"] == []
+    assert built[0].text == target
+    assert built[0].publisher == "theguardian.com"
+    assert built[0].date == "2014-05-01"
+    assert built[0].url == url
+    assert records[0].provider == "rabbithole-source-text-extract"
+    assert records[0].tier == "primary"
+    assert records[0].original_url == url
+    assert "verbatim source-text extract" in records[0].notes
+    assert "target verified against fetched visible source text" in records[0].notes
+    assert "no webpage image retained" in records[0].notes
+    assert f"exact_target={target!r}" in records[0].notes
+
+
+def test_source_text_extract_refuses_when_target_is_absent_from_fetched_source(
+    tmp_path, monkeypatch
+):
+    slot = _slot("s069", "screenshot", start=0.0, end=2.0)
+    target = "But the truth is, as ever, more mundane"
+    artifact = _artifact(
+        "wt-guardian-s069",
+        "https://www.theguardian.com/technology/example",
+        title="The truth behind the mysterious videos",
+        date="2014-05-01",
+        slot_id="s069",
+        acquisition_mode="screenshot-only",
+        capture_strategy="source-text-extract",
+        capture_spec={"text": target},
+    )
+    monkeypatch.setattr(
+        assets_module.source_text,
+        "build_source_text_extract",
+        lambda *_args, **_kwargs: pytest.fail("unverified text must not render"),
+    )
+
+    records, findings = execute_plan(
+        plan_assets([slot], [], [artifact]),
+        [slot],
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        artifacts=artifact_bindings_by_slot([artifact]),
+        typography={},
+        palette={},
+        capture_transport=lambda _url: (200, b"<article>Different text</article>"),
+        media_prober=lambda _path: True,
+    )
+
+    assert records == []
+    assert any(
+        finding.severity == "error"
+        and "was not found in fetched visible source text" in finding.message
+        and "No extract was rendered" in finding.message
+        for finding in findings
+    )
+
+
+def test_source_text_extract_refuses_when_verification_fetch_fails(
+    tmp_path, monkeypatch
+):
+    slot = _slot("s069", "screenshot", start=0.0, end=2.0)
+    artifact = _artifact(
+        "wt-guardian-s069",
+        "https://www.theguardian.com/technology/example",
+        title="The truth behind the mysterious videos",
+        date="2014-05-01",
+        slot_id="s069",
+        acquisition_mode="screenshot-only",
+        capture_strategy="source-text-extract",
+        capture_spec={"text": "verified phrase"},
+    )
+    monkeypatch.setattr(
+        assets_module.source_text,
+        "build_source_text_extract",
+        lambda *_args, **_kwargs: pytest.fail("failed fetch must not render"),
+    )
+
+    def failed_transport(_url):
+        raise RuntimeError("network unavailable")
+
+    records, findings = execute_plan(
+        plan_assets([slot], [], [artifact]),
+        [slot],
+        tmp_path,
+        grade=GRADE,
+        claims=[],
+        artifacts=artifact_bindings_by_slot([artifact]),
+        typography={},
+        palette={},
+        capture_transport=failed_transport,
+        media_prober=lambda _path: True,
+    )
+
+    assert records == []
+    assert any(
+        finding.severity == "error"
+        and "Source-text verification fetch failed" in finding.message
+        and "network unavailable" in finding.message
+        and "No extract was rendered" in finding.message
+        for finding in findings
+    )
+
+
+def test_webdriver_guardian_bindings_force_source_text_extract_with_exact_targets():
+    project_root = Path(__file__).resolve().parent.parent / "projects" / "webdriver-torso"
+    artifacts = load_artifacts(project_root / "research" / "artifacts.json")
+    guardian = [
+        artifact
+        for artifact in artifacts
+        if artifact.artifact_id.startswith("wt-guardian-")
+    ]
+
+    assert len(guardian) == 19
+    assert {artifact.capture_strategy for artifact in guardian} == {
+        "source-text-extract"
+    }
+    assert all(assets_module._capture_exact_text(artifact.capture_spec) for artifact in guardian)
 
 
 def test_execute_plan_fetches_direct_source_image_once_for_distinct_slot_crops(

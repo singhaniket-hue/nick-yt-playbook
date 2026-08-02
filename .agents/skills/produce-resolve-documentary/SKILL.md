@@ -156,11 +156,15 @@ Never dismiss consent automatically or bypass blank QA. Use an unobstructed
 archive, an exact frame from already retained source video, or an explicitly
 disclosed citation-card fallback.
 
-Treat article and webpage evidence as a Chromium motion recording by default:
-establish the real page and browser context, then make one restrained scroll or
-push to the authored claim and hold it long enough to read. Do not animate a
-frozen screenshot to imitate browsing. If usable source pixels exist but a
-claim remains uncertain, keep the pixels and add a small, claim-specific
+Treat article and webpage evidence as a Chromium reading sequence. Establish
+the real page and browser context, make one restrained scroll or push only on
+the first browser slot for that source URL in the episode, then hold every later
+line from that URL at its target, even after intervening graphics or sources.
+Never replay the establish-to-target move for the same source URL.
+Author the exact sentence being narrated as the text target and bake a yellow
+highlight onto that DOM range; keep surrounding page context readable. Do not
+animate a frozen screenshot to imitate browsing. If usable source pixels exist
+but a claim remains uncertain, keep the pixels and add a small, claim-specific
 qualifier; never replace them with a full-screen `source unverified` placeholder.
 Reserve a full citation card for the fail-closed case where no usable source
 pixels can be retained, and label it as editorial paraphrase.
@@ -168,11 +172,13 @@ pixels can be retained, and label it as editorial paraphrase.
 When the episode authors a source-led cold open, reserve approximately eleven
 seconds before narration for the retained primary-source clip. Mute source
 audio by default; enable it only when the episode rights ledger explicitly
-permits that exact use. Burn a small source credit into the derived excerpt when
-the cold open intentionally excludes overlays. An authored crackle may lead the
-clip; narration, music, and captions stay silent until the hard cut into the
-documentary. Do not synthesize or extend source action merely to reach the
-target duration.
+permits that exact interval because the sound itself is under discussion. When
+approved, mux the retained source stream without re-encoding, record its hash
+and interval in provenance, and do not substitute a synthetic crackle for the
+recognizable source tones. Burn a small source credit into the derived excerpt
+when the cold open intentionally excludes overlays. Narration, music, and
+captions stay silent until the hard cut into the documentary. Do not synthesize
+or extend source action merely to reach the target duration.
 
 Author the prefix under `cold_open` in project-local `resolve-overrides.json`.
 Use provenance `asset_id` values for video, project-relative paths for SFX, and
@@ -209,8 +215,12 @@ intended gap before approval. Check source/date labels, target context, derived
 frame timestamp/crop, citation-card disclosures, and both signal-card caveats.
 Keep designed cards sparse: use them for chapter structure or a concept that
 source footage cannot show, not as the default visual for every narration beat.
-Avoid consecutive text-led cards and never stack a narration caption over a
-text-led card, article, browser page, quote, or document excerpt.
+When adjacent graphic slots share a heading, consolidate them into one stable
+slide with at most six readable rows and move a yellow band to the row currently
+being narrated. Keep the slide at an identity transform; do not apply an EDL
+push-in or replace the full layout at every short slot. Avoid unrelated
+consecutive text-led cards and never stack a narration caption over a text-led
+card, article, browser page, quote, or document excerpt.
 
 For a no-network technical pass, use `--tier atmospheric --quality animatic`.
 A final run requires source-bound evidence, rights/licence notes, complete

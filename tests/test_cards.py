@@ -20,6 +20,7 @@ from PIL import Image
 import rabbithole.cards as cards_module
 from rabbithole.cards import (
     CARD_KINDS,
+    GROUPED_ROW_SEPARATOR,
     MAX_ITEMS,
     TEXT_SAFE_INSET_FRACTION,
     TITLE_SAFE_FRACTION,
@@ -28,6 +29,7 @@ from rabbithole.cards import (
     build_card,
     card_ass,
     classify,
+    group_same_heading_specs,
     parse_detail,
     production_note_reason,
     spec_for_slot,
@@ -400,6 +402,130 @@ def test_nonpositive_duration_is_rejected():
         CardSpec(kind="callout", heading="x", duration=0.0)
 
 
+@pytest.mark.parametrize("active_index", [-1, 2])
+def test_active_item_index_must_name_an_existing_row(active_index):
+    with pytest.raises(ValueError, match="existing item"):
+        CardSpec(
+            kind="checklist",
+            heading="x",
+            duration=1.0,
+            items=("first", "second"),
+            active_item_index=active_index,
+        )
+
+
+def test_active_item_index_rejects_boolean_even_though_bool_is_an_int():
+    with pytest.raises(TypeError, match="integer or None"):
+        CardSpec(
+            kind="checklist",
+            heading="x",
+            duration=1.0,
+            items=("first",),
+            active_item_index=True,
+        )
+
+
+def test_active_spoken_rows_refuse_more_than_six_items():
+    with pytest.raises(ValueError, match="at most 6 readable"):
+        CardSpec(
+            kind="checklist",
+            heading="x",
+            duration=1.0,
+            items=tuple(f"row {index}" for index in range(MAX_ITEMS + 1)),
+            active_item_index=0,
+        )
+
+
+# --- same-heading consolidation -------------------------------------------------
+
+
+def test_same_heading_specs_share_rows_and_track_each_original_slot():
+    source = [
+        (
+            "s008",
+            CardSpec(
+                kind="checklist",
+                heading="TEST FRAME RECONSTRUCTION",
+                duration=2.6,
+                items=("SHAPES MOVE", "TEMPLATE STAYS"),
+            ),
+        ),
+        (
+            "s009",
+            CardSpec(
+                kind="checklist",
+                heading=" test   frame reconstruction ",
+                duration=3.5,
+                items=("TONE CHANGES", "NO VERIFIED MESSAGE"),
+            ),
+        ),
+    ]
+
+    grouped = group_same_heading_specs(source)
+    expected_rows = (
+        GROUPED_ROW_SEPARATOR.join(("SHAPES MOVE", "TEMPLATE STAYS")),
+        GROUPED_ROW_SEPARATOR.join(("TONE CHANGES", "NO VERIFIED MESSAGE")),
+    )
+
+    assert list(grouped) == ["s008", "s009"]
+    assert grouped["s008"].items == expected_rows
+    assert grouped["s009"].items == expected_rows
+    assert grouped["s008"].active_item_index == 0
+    assert grouped["s009"].active_item_index == 1
+    assert grouped["s008"].duration == 2.6
+    assert grouped["s009"].duration == 3.5
+    assert grouped["s009"].heading == "TEST FRAME RECONSTRUCTION"
+    assert source[0][1].active_item_index is None, "source specs must stay immutable"
+
+
+def test_same_heading_run_is_chunked_at_six_readable_rows():
+    source = [
+        (
+            f"s{index:03d}",
+            CardSpec(
+                kind="timeline",
+                heading="UPLOAD TIMELINE",
+                duration=2.0 + index / 10,
+                items=(f"spoken row {index}",),
+            ),
+        )
+        for index in range(MAX_ITEMS + 1)
+    ]
+
+    grouped = group_same_heading_specs(source)
+
+    first_chunk_rows = tuple(f"spoken row {index}" for index in range(MAX_ITEMS))
+    for index in range(MAX_ITEMS):
+        spec = grouped[f"s{index:03d}"]
+        assert spec.items == first_chunk_rows
+        assert spec.active_item_index == index
+        assert len(spec.items) == MAX_ITEMS
+
+    trailing = grouped[f"s{MAX_ITEMS:03d}"]
+    assert trailing.items == (f"spoken row {MAX_ITEMS}",)
+    assert trailing.active_item_index == 0
+    assert trailing.duration == pytest.approx(2.0 + MAX_ITEMS / 10)
+
+
+def test_same_heading_does_not_group_across_an_intervening_card():
+    first = CardSpec(
+        kind="checklist", heading="DECODE CHECK", duration=2.0, items=("RULE",)
+    )
+    middle = CardSpec(
+        kind="checklist", heading="ANOMALY", duration=2.0, items=("00014",)
+    )
+    last = CardSpec(
+        kind="checklist", heading="DECODE CHECK", duration=2.0, items=("KEY",)
+    )
+
+    grouped = group_same_heading_specs(
+        (("s001", first), ("s002", middle), ("s003", last))
+    )
+
+    assert grouped == {"s001": first, "s002": middle, "s003": last}
+    assert all(spec.active_item_index is None for spec in grouped.values())
+
+
 # --- ASS construction ------------------------------------------------------------
 
 
@@ -416,6 +542,99 @@ def test_ass_carries_every_item(style):
     doc = card_ass(spec, typo, pal)
     for item in spec.items:
         assert item in doc
+
+
+def test_long_url_wrap_does_not_leave_a_one_character_orphan(style):
+    typo, _pal, _grade = style
+    body_font, _findings = pick_font(typo)
+    lines = cards_module._wrap_measured_lines(
+        "https://www.theguardian.com/technology/shortcuts/2014/may/01/"
+        "truth-youtube-mysterious-videos-webdriver-torso",
+        360,
+        18,
+        font_family=body_font,
+    )
+
+    assert len(lines) >= 2
+    assert len(lines[-1]) >= 4
+
+
+def test_active_spoken_row_gets_one_yellow_band_and_dark_ink(style):
+    typo, pal, _ = style
+    spec = CardSpec(
+        # A grouped timeline deliberately uses the stable row surface while
+        # retaining its semantic kind for provenance.
+        kind="timeline",
+        heading="UPLOAD TIMELINE",
+        duration=3.0,
+        items=("FIRST OBSERVATION", "PEAK PERIOD", "CONFIRMATION"),
+        active_item_index=1,
+    )
+
+    doc = card_ass(spec, typo, pal)
+    warning_override = cards_module._wrap_override(pal["warning_yellow"])
+    dark_override = cards_module._wrap_override(pal["text_mid"])
+    highlight_events = [
+        line
+        for line in doc.splitlines()
+        if line.startswith("Dialogue:")
+        and ",CardShape," in line
+        and warning_override in line
+    ]
+    body_events = [
+        line
+        for line in doc.splitlines()
+        if line.startswith("Dialogue:") and ",CardBody," in line
+    ]
+
+    assert len(highlight_events) == 1
+    assert r"\alpha&H18&" in highlight_events[0]
+    assert len(body_events) == 3
+    assert all(r"\fs" in event for event in body_events)
+    assert "PEAK PERIOD" in body_events[1]
+    assert dark_override in body_events[1]
+    assert dark_override not in body_events[0]
+    assert dark_override not in body_events[2]
+
+
+def test_active_spoken_row_renders_as_one_visible_yellow_band(style, tmp_path):
+    typo, pal, grade = style
+    spec = CardSpec(
+        kind="checklist",
+        heading="TEST FRAME RECONSTRUCTION",
+        duration=1.5,
+        items=(
+            "SHAPES MOVE · TEMPLATE STAYS",
+            "TONE CHANGES · NO VERIFIED MESSAGE",
+            "OUTPUT REPEATS · PURPOSE UNKNOWN",
+        ),
+        active_item_index=1,
+    )
+
+    out = build_card(
+        spec,
+        tmp_path / "highlight.mp4",
+        typo,
+        pal,
+        grade,
+        tmp_path / "work",
+        width=640,
+        height=360,
+        fps=12,
+    )
+    frame = _rgb_frame(out, 0.5)
+    yellow = (
+        (frame[:, :, 0] > 175)
+        & (frame[:, :, 1] > 155)
+        & (frame[:, :, 2] < 100)
+    )
+    ys, _xs = np.where(yellow)
+
+    assert yellow.mean() > 0.008, "the active band is not visibly present"
+    assert ys.size
+    assert int(ys.max()) - int(ys.min()) < frame.shape[0] * 0.22, (
+        "yellow leaked into multiple row bands"
+    )
 
 
 def test_document_disclosure_is_rendered_inside_the_card(style):
@@ -479,6 +698,50 @@ def test_heading_rule_sits_below_the_actual_wrapped_title_block(style):
     assert rule_y >= (
         heading_y + line_count * heading_size * 0.5 + height * 0.01
     )
+
+
+def test_four_line_checklist_heading_stays_below_title_safe_top(style):
+    """A tall s266-style title must not be clipped above the safe frame."""
+    import re
+
+    typo, pal, _ = style
+    width = 1920
+    height = 1080
+    doc = card_ass(
+        CardSpec(
+            kind="checklist",
+            heading=(
+                "MYSTERY BOARD CLEARS LEAVING ONLY A QA CHECKLIST AND "
+                "RED-BLUE THUMBNAIL"
+            ),
+            duration=3.0,
+        ),
+        typo,
+        pal,
+        width=width,
+        height=height,
+    )
+    events = [line for line in doc.splitlines() if line.startswith("Dialogue:")]
+    heading_event = next(line for line in events if ",CardHead," in line)
+    rule_event = next(line for line in events if ",CardShape," in line)
+    heading_y = int(re.search(r"\\pos\(-?\d+,(-?\d+)\)", heading_event).group(1))
+    rule_y = int(re.search(r"\\pos\(-?\d+,(-?\d+)\)", rule_event).group(1))
+    heading_size = int(
+        re.search(r"^Style: CardHead,[^,]+,(\d+),", doc, re.MULTILINE).group(1)
+    )
+    line_count = heading_event.count(r"\N") + 1
+    heading_height = (
+        line_count
+        * heading_size
+        * cards_module._HEADING_LINE_HEIGHT_MULTIPLIER
+    )
+    heading_top = heading_y - heading_height / 2
+    heading_bottom = heading_y + heading_height / 2
+    title_safe_top = height * (1 - TITLE_SAFE_FRACTION) / 2
+
+    assert line_count == 4
+    assert heading_top >= title_safe_top - 1
+    assert rule_y > heading_bottom
 
 
 def test_ass_positions_everything_inside_the_title_safe_box(style):

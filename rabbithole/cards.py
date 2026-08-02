@@ -72,7 +72,8 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_HALF_EVEN
 from functools import lru_cache
 from pathlib import Path
@@ -114,7 +115,10 @@ TITLE_SAFE_FRACTION = 0.68
 # outline at the exact text anchor was enough to make a first character look
 # missing even when its mathematical position was technically in bounds.
 TEXT_SAFE_INSET_FRACTION = 0.05
-_TEXT_WIDTH_SAFETY_MULTIPLIER = 1.12
+# Pillow/libass font substitution can differ on a laptop that lacks the
+# preferred face. A 1.18 budget makes line endings portable instead of
+# letting the last word disappear behind the hard title-safe clip.
+_TEXT_WIDTH_SAFETY_MULTIPLIER = 1.18
 
 # The background every card is drawn onto. 'grain' rather than 'black': a card
 # on pure black reads as a slide, a card on moving grain reads as part of the
@@ -169,6 +173,12 @@ SIGNAL_COMPARISON_ITEM_COUNTS = {
 # being legible at 1080p, so extra items are dropped and reported rather than
 # silently overflowing off the safe area.
 MAX_ITEMS = 6
+
+# Same-heading cards are consolidated into one stable reading surface. Each
+# source slot contributes one row; its own render highlights that row while
+# keeping the surrounding context visible. A middle dot is deliberately used
+# instead of a slash: it reads as one line rather than two competing columns.
+GROUPED_ROW_SEPARATOR = " · "
 
 # Ordered longest-first and matched as complete words or phrases in the
 # lowercased detail. Order between groups is significant: a detail reading
@@ -235,6 +245,11 @@ class CardSpec:
     `disclosure` is optional frame-native editorial context. Document cards
     use it for labels such as ``EDITORIAL PARAPHRASE · SOURCE-ATTRIBUTED`` so
     a locally composed evidence summary cannot be mistaken for source pixels.
+
+    `active_item_index` opts into the spoken-row treatment. It is set by
+    :func:`group_same_heading_specs` for each original slot so the card stays
+    visually stable while a yellow/amber band follows the exact row currently
+    being narrated.
     """
 
     kind: str
@@ -242,6 +257,7 @@ class CardSpec:
     duration: float
     items: tuple[str, ...] = ()
     disclosure: str = ""
+    active_item_index: int | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in CARD_KINDS:
@@ -250,6 +266,121 @@ class CardSpec:
             )
         if self.duration <= 0:
             raise ValueError(f"Card duration must be positive, got {self.duration}")
+        if self.active_item_index is not None:
+            if (
+                isinstance(self.active_item_index, bool)
+                or not isinstance(self.active_item_index, int)
+            ):
+                raise TypeError("active_item_index must be an integer or None")
+            if len(self.items) > MAX_ITEMS:
+                raise ValueError(
+                    "spoken-row cards support at most "
+                    f"{MAX_ITEMS} readable items; got {len(self.items)}"
+                )
+            if not 0 <= self.active_item_index < len(self.items):
+                raise ValueError(
+                    "active_item_index must name an existing item; got "
+                    f"{self.active_item_index} for {len(self.items)} items"
+                )
+
+
+def _grouped_row(spec: CardSpec) -> str:
+    """Collapse one source card's authored content into one readable row."""
+
+    return GROUPED_ROW_SEPARATOR.join(
+        re.sub(r"\s+", " ", item).strip()
+        for item in spec.items
+        if item.strip()
+    )
+
+
+def _normalized_group_heading(heading: str) -> str:
+    """Heading identity used only for adjacent-card consolidation."""
+
+    return re.sub(r"\s+", " ", heading).strip().casefold()
+
+
+def group_same_heading_specs(
+    slot_specs: Iterable[tuple[str, CardSpec]],
+) -> dict[str, CardSpec]:
+    """Return per-slot specs with consecutive same-heading cards consolidated.
+
+    The input is timeline-ordered ``(slot_id, spec)`` pairs. Only adjacent
+    cards with a non-empty shared heading and authored items are grouped;
+    crossing an intervening heading would make unrelated parts of the episode
+    share a slide. Editorial disclosure cards and already-highlighted specs are
+    intentionally left alone.
+
+    A source slot contributes exactly one row by joining its explicit items.
+    Runs are chunked at :data:`MAX_ITEMS`, so every grouped card stays within
+    the renderer's six-row readability ceiling. Every original slot keeps its
+    own duration and receives the same group rows plus its zero-based
+    ``active_item_index``. The returned dictionary preserves input order.
+    """
+
+    ordered = list(slot_specs)
+    seen: set[str] = set()
+    for slot_id, spec in ordered:
+        if not isinstance(slot_id, str) or not slot_id.strip():
+            raise ValueError("grouped card slot_id must be a non-empty string")
+        if slot_id in seen:
+            raise ValueError(f"duplicate grouped card slot_id {slot_id!r}")
+        if not isinstance(spec, CardSpec):
+            raise TypeError(
+                f"grouped card spec for {slot_id!r} must be CardSpec, "
+                f"got {type(spec).__name__}"
+            )
+        seen.add(slot_id)
+
+    def eligible(spec: CardSpec) -> bool:
+        return bool(
+            _normalized_group_heading(spec.heading)
+            and _grouped_row(spec)
+            and not spec.disclosure.strip()
+            and spec.active_item_index is None
+        )
+
+    grouped: dict[str, CardSpec] = {}
+    cursor = 0
+    while cursor < len(ordered):
+        slot_id, spec = ordered[cursor]
+        if not eligible(spec):
+            grouped[slot_id] = spec
+            cursor += 1
+            continue
+
+        heading_key = _normalized_group_heading(spec.heading)
+        run_end = cursor + 1
+        while run_end < len(ordered):
+            _next_slot_id, next_spec = ordered[run_end]
+            if (
+                not eligible(next_spec)
+                or _normalized_group_heading(next_spec.heading) != heading_key
+            ):
+                break
+            run_end += 1
+
+        run = ordered[cursor:run_end]
+        if len(run) == 1:
+            grouped[slot_id] = spec
+            cursor = run_end
+            continue
+
+        for chunk_start in range(0, len(run), MAX_ITEMS):
+            chunk = run[chunk_start:chunk_start + MAX_ITEMS]
+            rows = tuple(_grouped_row(source_spec) for _, source_spec in chunk)
+            display_heading = chunk[0][1].heading
+            for active_index, (source_slot_id, source_spec) in enumerate(chunk):
+                grouped[source_slot_id] = replace(
+                    source_spec,
+                    heading=display_heading,
+                    items=rows,
+                    active_item_index=active_index,
+                )
+
+        cursor = run_end
+
+    return grouped
 
 
 def _contains_classification_cue(detail: str, cue: str) -> bool:
@@ -652,6 +783,15 @@ def _wrap_measured_lines(
                 current = candidate
         if current:
             pieces.append(current)
+        # Greedy splitting can leave a one-character orphan on a long URL.
+        # Rebalance only the final pair; both halves remain comfortably below
+        # the width already proven for their combined greedy prefix.
+        if len(pieces) >= 2 and len(pieces[-1]) < max(4, len(pieces[-2]) // 5):
+            combined = pieces[-2] + pieces[-1]
+            midpoint = len(combined) // 2
+            left, right = combined[:midpoint], combined[midpoint:]
+            if left and right and fits(left) and fits(right):
+                pieces[-2:] = [left, right]
         return pieces or [word]
 
     lines: list[str] = []
@@ -806,15 +946,19 @@ def _heading_events(spec: CardSpec, layout: _Layout, palette: dict, typography: 
             letter_spacing=heading_size * tracking,
         )
         line_count = heading.count(r"\N") + 1
-        heading_bottom = (
-            y
-            + (
-                line_count
-                * heading_size
-                * _HEADING_LINE_HEIGHT_MULTIPLIER
-            )
-            / 2
+        heading_height = (
+            line_count
+            * heading_size
+            * _HEADING_LINE_HEIGHT_MULTIPLIER
         )
+        # ASS positions CardHead at the vertical centre of the rendered block.
+        # A long checklist heading can therefore extend above the title-safe
+        # clip even though its anchor is inside that clip.  Clamp the anchor
+        # after wrapping, when the full block height is known, so the first
+        # rendered line remains visible.  The rule continues to derive from
+        # the clamped bottom edge and stays beneath the complete heading.
+        y = max(y, layout.top + heading_height / 2)
+        heading_bottom = y + heading_height / 2
         rule_y = heading_bottom + max(
             layout.height * _HEADING_RULE_PADDING_FRACTION,
             thickness * 2,
@@ -901,6 +1045,115 @@ def _checklist_events(spec, layout, palette, typography):
             f"{clip_right:.0f},{layout.top + layout.safe_h:.0f})"
             f"\\c{_wrap_override(light)}}}"
             f"{_wrapped_ass_text(item, body_width, body_size, font_family=body_font)}"))
+    return events
+
+
+def _spoken_row_events(spec, layout, palette, typography):
+    """Stable same-heading slide with one narration-synchronised highlight.
+
+    Unlike the legacy checklist's uniform baselines, this layout measures each
+    wrapped row. A two-line active phrase therefore receives a two-line band
+    and reserves its full height instead of colliding with the next row.
+    """
+
+    events = _heading_events(
+        spec,
+        layout,
+        palette,
+        typography,
+        layout.top + layout.safe_h * 0.18,
+    )
+    if not spec.items:
+        return events
+
+    accent = palette.get("accent_red", "#E02020")
+    highlight = palette.get("warning_yellow", "#E9B949")
+    highlight_ink = palette.get("text_mid", "#202020")
+    light = palette.get("text_light", "#E0E0E0")
+    thickness = max(2.0, layout.height * _RULE_THICKNESS_FRACTION)
+    marker_w = layout.height * 0.018
+    marker_h = thickness * 1.6
+    body_font, _findings = pick_font(typography)
+
+    band_x = layout.left + layout.safe_w * 0.055
+    band_w = layout.safe_w * 0.89
+    marker_x = layout.left + layout.safe_w * 0.075
+    text_x = layout.text_left + layout.safe_w * 0.085
+    clip_right = layout.text_right
+    body_width = max(1.0, clip_right - text_x - layout.safe_w * 0.018)
+    # Leave enough vertical room for a two-line shared heading and its rule;
+    # placing the first row at 28.5% clipped the top heading line at 360p and
+    # left almost no air at 1080p.
+    area_top = layout.top + layout.safe_h * 0.35
+    area_bottom = layout.top + layout.safe_h * 0.955
+    available_h = area_bottom - area_top
+
+    count = len(spec.items)
+    default_size = max(1, round(layout.height * _BODY_SIZE_FRACTION))
+    density_fraction = 0.046 if count <= 3 else (0.040 if count <= 4 else 0.034)
+    body_size = min(default_size, max(1, round(layout.height * density_fraction)))
+    minimum_size = max(1, round(layout.height * 0.028))
+
+    def measured_rows(size: int):
+        wrapped = [
+            _wrapped_ass_text(
+                item,
+                body_width,
+                size,
+                font_family=body_font,
+            )
+            for item in spec.items
+        ]
+        # libass's shaped line box is taller than Pillow's nominal point size,
+        # especially with fallback faces. Reserve real baseline-to-baseline
+        # room so the following highlight band never paints over the prior row.
+        line_height = size * 1.42
+        pad_y = max(layout.height * 0.006, size * 0.12)
+        gap = max(layout.height * 0.014, size * 0.30)
+        block_heights = [
+            (text.count(r"\N") + 1) * line_height + pad_y * 2
+            for text in wrapped
+        ]
+        total = sum(block_heights) + gap * max(0, count - 1)
+        return wrapped, block_heights, gap, pad_y, total
+
+    wrapped_rows, block_heights, gap, pad_y, total_h = measured_rows(body_size)
+    while total_h > available_h and body_size > minimum_size:
+        body_size -= 1
+        wrapped_rows, block_heights, gap, pad_y, total_h = measured_rows(body_size)
+
+    cursor_y = area_top + max(0.0, (available_h - total_h) / 2)
+    for index, (item, row_h) in enumerate(zip(wrapped_rows, block_heights)):
+        is_active = index == spec.active_item_index
+        if is_active:
+            events.append(_dialogue(
+                "CardShape",
+                spec.duration,
+                f"{{\\an{_ASS_TOP_LEFT}\\pos({band_x:.0f},{cursor_y:.0f})"
+                f"\\c{_wrap_override(highlight)}\\alpha&H18&}}"
+                f"{_rect(0, 0, band_w, row_h)}",
+            ))
+
+        marker_y = cursor_y + row_h / 2 - marker_h / 2
+        events.append(_dialogue(
+            "CardShape",
+            spec.duration,
+            f"{{\\an{_ASS_TOP_LEFT}\\pos({marker_x:.0f},{marker_y:.0f})"
+            f"\\c{_wrap_override(highlight_ink if is_active else accent)}}}"
+            f"{_rect(0, 0, marker_w, marker_h)}",
+        ))
+        events.append(_dialogue(
+            "CardBody",
+            spec.duration,
+             f"{{\\an{_ASS_TOP_LEFT}\\pos({text_x:.0f},{cursor_y + pad_y:.0f})"
+             f"\\clip({text_x - layout.safe_w * 0.01:.0f},{layout.top:.0f},"
+             f"{clip_right:.0f},{layout.top + layout.safe_h:.0f})"
+             f"\\fs{body_size}"
+             f"\\c{_wrap_override(highlight_ink if is_active else light)}}}"
+             f"{item}",
+        ))
+        cursor_y += row_h + gap
+
     return events
 
 
@@ -1614,7 +1867,14 @@ def card_ass(
     if signal_errors:
         raise ValueError(signal_errors[0].message)
     layout = _Layout(width=width, height=height)
-    events = _EVENT_BUILDERS[spec.kind](spec, layout, palette, typography)
+    # An active row is an explicit request for the stable spoken-row reading
+    # surface, regardless of the source cards' former visual archetype. The
+    # semantic ``kind`` remains on CardSpec for provenance and diagnostics.
+    events = (
+        _spoken_row_events(spec, layout, palette, typography)
+        if spec.active_item_index is not None
+        else _EVENT_BUILDERS[spec.kind](spec, layout, palette, typography)
+    )
 
     lines = [
         "[Script Info]",

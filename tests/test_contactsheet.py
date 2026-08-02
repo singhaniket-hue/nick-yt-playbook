@@ -84,20 +84,23 @@ def test_plan_is_timeline_ordered_and_groups_graphics_from_evidence():
 
 
 def test_review_kind_discloses_derived_evidence_instead_of_calling_it_a_screenshot():
-    document = _timing(["screenshot", "screenshot", "screenshot"])
+    document = _timing(["screenshot", "screenshot", "screenshot", "screenshot"])
     records = [
         _record("capture-s001", "s001"),
         _record("capture-s002", "s002"),
         _record("capture-s003", "s003"),
+        _record("capture-s004", "s004"),
     ]
     records[0] = replace(records[0], provider="rabbithole-evidence-card")
-    records[1] = replace(records[1], provider="rabbithole-source-frame")
-    records[2] = replace(records[2], provider="rabbithole-source-image")
+    records[1] = replace(records[1], provider="rabbithole-source-text-extract")
+    records[2] = replace(records[2], provider="rabbithole-source-frame")
+    records[3] = replace(records[3], provider="rabbithole-source-image")
 
     items = plan_review_items(document, records)
 
     assert [review_kind(item) for item in items] == [
         "CITATION CARD",
+        "SOURCE-TEXT EXTRACT",
         "SOURCE FRAME",
         "SOURCE IMAGE",
     ]

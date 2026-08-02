@@ -53,10 +53,12 @@ dark, sufficiently opaque backing or outline enabled so white text stays
 readable on light source pixels; do not restore cues over text-heavy evidence
 just to make the timeline match the full upload sidecar.
 
-Live article and webpage evidence should be captured as real Chromium motion:
-establish the page, make one restrained scroll or push to the authored target,
-then hold it long enough to read. A simulated pan remains appropriate for a
-genuine static document or image, not as a substitute for live browser context.
+Live article and webpage evidence should be captured from real Chromium pixels.
+Only the first browser slot for one exact source URL may establish the page and
+make one restrained scroll or push to its authored target; every later use of
+that URL is a static highlighted reading hold, even after intervening shots.
+A simulated pan remains appropriate for a genuine static document or image,
+not as a substitute for live browser context.
 
 Generated sound follows the same deterministic handoff rule. Before compiling
 FCPXML, `resolve prepare` freezes the approved mix decisions into immutable,

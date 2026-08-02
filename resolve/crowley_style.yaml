@@ -103,7 +103,7 @@ motion:
   heavy_freeze: true
   easing: smooth
   live_webpage_capture: chromium_motion
-  live_webpage_pattern: establish_scroll_or_push_hold
+  live_webpage_pattern: first_url_occurrence_establish_move_then_static_holds
   static_pan_allowed_for: [static_document, static_image]
 
 transitions:

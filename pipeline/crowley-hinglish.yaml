@@ -255,12 +255,13 @@ stages:
       acquisition. Explicit --refresh requires the complete repeated --slot
       set, quarantines replaced media, and preserves retired audit provenance.
       Target-aware browser capture fails closed on consent/challenge/blank
-      pages. Article evidence defaults to a Chromium motion recording that
-      establishes the real page, scrolls/pushes once to the authored claim, and
-      holds it for reading; retained source-video frames and portable H.264
-      yt-dlp downloads provide deterministic alternatives. Read-only contact
-      sheets are generated with `python -m rabbithole.contactsheet` before asset
-      approval.
+      pages. Article evidence defaults to real Chromium pixels. Only the first
+      browser slot for an exact source URL may establish and scroll/push to its
+      authored claim; every later occurrence is a static highlighted reading
+      hold, even after intervening shots. Retained source-video frames and
+      portable H.264 yt-dlp downloads provide deterministic alternatives.
+      Read-only contact sheets are generated with
+      `python -m rabbithole.contactsheet` before asset approval.
     required_artifacts_in:
       - timing_spine
       - slot_plan

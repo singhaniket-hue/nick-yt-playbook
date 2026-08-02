@@ -58,6 +58,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -367,10 +368,13 @@ class CaptureSpec:
     scroll_target: ScrollTarget | None = None
     crop: CaptureCrop | None = None
     motion: CaptureMotion | None = None
+    highlight: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.full_page, bool):
             raise TypeError("capture full_page must be a boolean")
+        if not isinstance(self.highlight, bool):
+            raise TypeError("capture highlight must be a boolean")
         for name, value in (
             ("selector", self.selector),
             ("text", self.text),
@@ -397,6 +401,12 @@ class CaptureSpec:
             object.__setattr__(
                 self, "motion", CaptureMotion.from_value(self.motion)
             )
+        if self.highlight and not (
+            self.text or (self.scroll_target and self.scroll_target.text)
+        ):
+            raise ValueError(
+                "Capture highlight requires text or scroll_target.text"
+            )
         if self.motion is not None:
             if self.full_page or self.crop is not None:
                 raise ValueError(
@@ -417,6 +427,7 @@ class CaptureSpec:
             or self.click_text
             or self.scroll_target
             or self.motion
+            or self.highlight
         )
 
     @property
@@ -455,6 +466,7 @@ class CaptureSpec:
                 "scroll_target": scroll,
                 "crop": crop,
                 "motion": self.motion.to_dict() if self.motion else None,
+                "highlight": True if self.highlight else None,
             }.items()
             if value is not None
         }
@@ -495,6 +507,7 @@ class CaptureSpec:
             "scroll_target",
             "crop",
             "motion",
+            "highlight",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -657,6 +670,8 @@ class CaptureFraming:
     content: CaptureRectangle | None = None
     authored_crop: CaptureCrop | None = None
     motion: CaptureMotionFraming | None = None
+    highlight_rects: tuple[CaptureRectangle, ...] = ()
+    highlight_mode: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         crop = self.authored_crop
@@ -678,6 +693,12 @@ class CaptureFraming:
         }
         if self.motion is not None:
             value["motion"] = self.motion.to_dict()
+        if self.highlight_rects:
+            value["highlight_rects"] = [
+                rectangle.to_dict() for rectangle in self.highlight_rects
+            ]
+        if self.highlight_mode is not None:
+            value["highlight_mode"] = self.highlight_mode
         return value
 
 
@@ -1084,6 +1105,39 @@ def _capture_rectangle(
     return rectangle
 
 
+def _capture_rectangles(
+    value: Any,
+    *,
+    purpose: str,
+) -> tuple[CaptureRectangle, ...]:
+    if not isinstance(value, list) or not value:
+        raise RuntimeError(f"Browser returned no {purpose} rectangles")
+    return tuple(
+        _capture_rectangle(item, purpose=f"{purpose} line {index}")
+        for index, item in enumerate(value, start=1)
+    )
+
+
+def _capture_highlight_framing(
+    targeting: Mapping[str, Any],
+    *,
+    requested: bool,
+) -> tuple[tuple[CaptureRectangle, ...], str | None]:
+    if not requested:
+        return (), None
+    rectangles = _capture_rectangles(
+        targeting.get("highlightRects"),
+        purpose="resolved text highlight",
+    )
+    mode = targeting.get("highlightMode")
+    if mode not in {"css-highlight", "overlay"}:
+        raise RuntimeError(
+            "Browser returned an invalid text highlight mode. "
+            "No screenshot retained."
+        )
+    return rectangles, str(mode)
+
+
 def _layout_content_rectangle(session: _CdpCommands) -> CaptureRectangle:
     metrics = session.command("Page.getLayoutMetrics")
     content = metrics.get("cssContentSize") or metrics.get("contentSize")
@@ -1135,6 +1189,59 @@ def _require_clip_inside(
             f"{clip.height:g}) falls outside browser bounds "
             f"{bounds.width:g}x{bounds.height:g}. No screenshot retained."
         )
+
+
+def _require_explicit_crop_contains_highlight(
+    spec: CaptureSpec,
+    framing: CaptureFraming | None,
+) -> None:
+    """Fail closed when an authored crop omits any exact highlighted text.
+
+    Highlight rectangles are the browser's line-level record of the yellow DOM
+    range. Older or injected capture callbacks may only return the union target
+    rectangle, which is the minimum geometry this check will accept. Both the
+    retained clip and evidence geometry use page-coordinate CSS pixels.
+    """
+
+    if spec.crop is None or not spec.highlight:
+        return
+    if (
+        framing is None
+        or framing.mode != "explicit-crop"
+        or framing.clip is None
+    ):
+        raise RuntimeError(
+            "Explicit crop with an exact yellow highlight returned no "
+            "verifiable retained-clip geometry. No screenshot retained."
+        )
+
+    rectangles = framing.highlight_rects
+    geometry_label = "highlight rectangle"
+    if not rectangles:
+        if framing.target is None:
+            raise RuntimeError(
+                "Explicit crop with an exact yellow highlight returned no "
+                "highlight or target geometry. No screenshot retained."
+            )
+        rectangles = (framing.target,)
+        geometry_label = "exact target rectangle"
+
+    clip = framing.clip
+    tolerance = 1e-6
+    for index, rectangle in enumerate(rectangles, start=1):
+        if (
+            rectangle.x < clip.x - tolerance
+            or rectangle.y < clip.y - tolerance
+            or rectangle.right > clip.right + tolerance
+            or rectangle.bottom > clip.bottom + tolerance
+        ):
+            raise RuntimeError(
+                f"Explicit crop ({clip.x:g}, {clip.y:g}, {clip.width:g}, "
+                f"{clip.height:g}) does not fully contain {geometry_label} "
+                f"{index} ({rectangle.x:g}, {rectangle.y:g}, "
+                f"{rectangle.width:g}, {rectangle.height:g}). No screenshot "
+                "retained; expand or reposition the crop."
+            )
 
 
 def _target_document_clip(
@@ -1350,6 +1457,7 @@ def _perform_authored_click(
 def _targeting_expression(spec: CaptureSpec) -> str:
     selector = json.dumps(spec.selector)
     text = json.dumps(spec.text)
+    highlight = json.dumps(spec.highlight)
     scroll = spec.scroll_target
     scroll_value = (
         {"y": scroll.y, "selector": scroll.selector, "text": scroll.text}
@@ -1363,6 +1471,10 @@ def _targeting_expression(spec: CaptureSpec) -> str:
   const selector = {selector};
   const textNeedle = {text};
   const scrollTarget = {scroll_json};
+  const highlightRequested = {highlight};
+  const highlightName = "rabbithole-spoken-line";
+  const highlightStyleId = "__rabbithole-highlight-style";
+  const highlightOverlayId = "__rabbithole-highlight-overlay";
   const normalize = value => String(value || "").replace(/\\s+/g, " ").trim();
   const visible = element => {{
     if (!element || !element.getBoundingClientRect) return false;
@@ -1390,7 +1502,121 @@ def _targeting_expression(spec: CaptureSpec) -> str:
     }});
     return candidates[0] || null;
   }};
+  const exactTextRange = (root, value) => {{
+    const needle = normalize(value);
+    if (!root || !needle) return null;
+    const characters = [];
+    const points = [];
+    let pendingSpace = null;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node) {{
+      const parent = node.parentElement;
+      if (parent && visible(parent) &&
+          !/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/i.test(parent.tagName)) {{
+        const data = node.data || "";
+        for (let index = 0; index < data.length; index += 1) {{
+          const character = data[index];
+          if (/\\s/.test(character)) {{
+            if (characters.length && characters[characters.length - 1] !== " ") {{
+              pendingSpace = {{node, start: index, end: index + 1}};
+            }}
+            continue;
+          }}
+          if (pendingSpace) {{
+            characters.push(" ");
+            points.push(pendingSpace);
+            pendingSpace = null;
+          }}
+          characters.push(character);
+          points.push({{node, start: index, end: index + 1}});
+        }}
+      }}
+      node = walker.nextNode();
+    }}
+    const startIndex = characters.join("").indexOf(needle);
+    if (startIndex < 0) return null;
+    const first = points[startIndex];
+    const last = points[startIndex + needle.length - 1];
+    if (!first || !last) return null;
+    const range = document.createRange();
+    range.setStart(first.node, first.start);
+    range.setEnd(last.node, last.end);
+    return range;
+  }};
+  const pageRectsForRange = range => Array.from(range.getClientRects())
+    .filter(rect => rect.width > 0 && rect.height > 0)
+    .map(rect => ({{
+      x: rect.x + window.scrollX,
+      y: rect.y + window.scrollY,
+      width: rect.width,
+      height: rect.height
+    }}));
+  const unionRect = rectangles => {{
+    if (!rectangles.length) return null;
+    const left = Math.min(...rectangles.map(rect => rect.x));
+    const top = Math.min(...rectangles.map(rect => rect.y));
+    const right = Math.max(...rectangles.map(rect => rect.x + rect.width));
+    const bottom = Math.max(...rectangles.map(rect => rect.y + rect.height));
+    return {{x: left, y: top, width: right - left, height: bottom - top}};
+  }};
+  const pageRectForElement = element => {{
+    if (!element) return null;
+    const rect = element.getBoundingClientRect();
+    return {{
+      x: rect.x + window.scrollX,
+      y: rect.y + window.scrollY,
+      width: rect.width,
+      height: rect.height
+    }};
+  }};
+  const clearPriorHighlight = () => {{
+    const priorOverlay = document.getElementById(highlightOverlayId);
+    if (priorOverlay) priorOverlay.remove();
+    if (window.CSS && CSS.highlights &&
+        typeof CSS.highlights.delete === "function") {{
+      CSS.highlights.delete(highlightName);
+    }}
+  }};
+  const paintHighlight = (range, rectangles) => {{
+    let style = document.getElementById(highlightStyleId);
+    if (!style) {{
+      style = document.createElement("style");
+      style.id = highlightStyleId;
+      (document.head || document.documentElement).appendChild(style);
+    }}
+    style.textContent = `::highlight(${{highlightName}}) {{
+      background-color: rgba(255, 205, 20, 0.82);
+      color: #111;
+      text-shadow: none;
+    }}`;
+    if (window.CSS && CSS.highlights && typeof Highlight === "function") {{
+      CSS.highlights.set(highlightName, new Highlight(range));
+      return "css-highlight";
+    }}
+    const overlay = document.createElement("div");
+    overlay.id = highlightOverlayId;
+    overlay.setAttribute("aria-hidden", "true");
+    overlay.style.cssText = [
+      "position:absolute", "left:0", "top:0", "width:0", "height:0",
+      "overflow:visible", "pointer-events:none", "z-index:2147483646"
+    ].join(";");
+    for (const rect of rectangles) {{
+      const strip = document.createElement("div");
+      strip.style.cssText = [
+        "position:absolute", `left:${{rect.x}}px`, `top:${{rect.y}}px`,
+        `width:${{rect.width}}px`, `height:${{rect.height}}px`,
+        "background:rgba(255,205,20,0.68)", "mix-blend-mode:multiply",
+        "border-radius:2px", "pointer-events:none"
+      ].join(";");
+      overlay.appendChild(strip);
+    }}
+    document.documentElement.appendChild(overlay);
+    return "overlay";
+  }};
+  clearPriorHighlight();
   let evidence = null;
+  let evidenceRange = null;
   if (selector) {{
     const resolved = findSelector(selector);
     if (resolved.error) return {{ok: false, error: resolved.error}};
@@ -1418,8 +1644,10 @@ def _targeting_expression(spec: CaptureSpec) -> str:
         }};
       }}
     }}
+    evidenceRange = exactTextRange(evidence, textNeedle);
   }}
   let scrollElement = evidence;
+  let scrollTextRange = null;
   if (scrollTarget && scrollTarget.selector) {{
     const resolved = findSelector(scrollTarget.selector);
     if (resolved.error) return {{ok: false, error: resolved.error}};
@@ -1438,23 +1666,41 @@ def _targeting_expression(spec: CaptureSpec) -> str:
         error: `scroll text ${{JSON.stringify(scrollTarget.text)}} was not found`
       }};
     }}
+    scrollTextRange = exactTextRange(scrollElement, scrollTarget.text);
+  }}
+  const targetElement = evidence ||
+    (scrollTarget && scrollTarget.text ? scrollElement : null);
+  const targetRange = evidenceRange ||
+    (!evidence && scrollTarget && scrollTarget.text ? scrollTextRange : null);
+  if (highlightRequested && !targetRange) {{
+    return {{
+      ok: false,
+      error: "exact highlight text could not be resolved to a DOM range"
+    }};
   }}
   if (scrollTarget && scrollTarget.y !== null) {{
     window.scrollTo(0, scrollTarget.y);
   }} else if (scrollElement) {{
     scrollElement.scrollIntoView({{block: "center", inline: "center", behavior: "auto"}});
   }}
-  const rect = evidence ? evidence.getBoundingClientRect() : null;
+  const rangeRects = targetRange ? pageRectsForRange(targetRange) : [];
+  const targetRect = unionRect(rangeRects) || pageRectForElement(targetElement);
+  if (highlightRequested && !rangeRects.length) {{
+    return {{
+      ok: false,
+      error: "exact highlight text has no visible line rectangles"
+    }};
+  }}
+  const highlightMode = highlightRequested
+    ? paintHighlight(targetRange, rangeRects)
+    : null;
   return {{
     ok: true,
     scrollX: window.scrollX,
     scrollY: window.scrollY,
-    targetRect: rect ? {{
-      x: rect.x + window.scrollX,
-      y: rect.y + window.scrollY,
-      width: rect.width,
-      height: rect.height
-    }} : null
+    targetRect,
+    highlightRects: highlightRequested ? rangeRects : [],
+    highlightMode
   }};
 }})()
 """.strip()
@@ -1523,12 +1769,18 @@ def _capture_loaded_page_with_cdp_session(
 
     has_evidence_target = bool(request.spec.selector or request.spec.text)
     target: CaptureRectangle | None = None
-    if has_evidence_target:
+    if has_evidence_target or targeting.get("targetRect") is not None:
         target = _capture_rectangle(
             targeting.get("targetRect"),
             purpose="resolved evidence target",
         )
-    auto_target_clip = bool(target is not None and request.spec.crop is None)
+    highlight_rects, highlight_mode = _capture_highlight_framing(
+        targeting,
+        requested=request.spec.highlight,
+    )
+    auto_target_clip = bool(
+        has_evidence_target and target is not None and request.spec.crop is None
+    )
 
     content: CaptureRectangle | None = None
     clip: CaptureRectangle | None = None
@@ -1616,13 +1868,48 @@ def _capture_loaded_page_with_cdp_session(
         framing_mode = "full-page"
     else:
         framing_mode = "viewport"
+    framing_clip = clip
+    if (
+        framing_mode == "viewport"
+        and request.spec.highlight
+        and highlight_rects
+        and request.spec.scroll_target is not None
+        and request.spec.scroll_target.text
+    ):
+        try:
+            viewport_x = float(targeting.get("scrollX", 0))
+            viewport_y = float(targeting.get("scrollY", 0))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Browser returned invalid scroll coordinates for highlighted "
+                "viewport framing. No screenshot retained."
+            ) from exc
+        if (
+            not math.isfinite(viewport_x)
+            or not math.isfinite(viewport_y)
+            or viewport_x < 0
+            or viewport_y < 0
+        ):
+            raise RuntimeError(
+                "Browser returned invalid scroll coordinates for highlighted "
+                "viewport framing. No screenshot retained."
+            )
+        framing_clip = CaptureRectangle(
+            x=viewport_x,
+            y=viewport_y,
+            width=float(request.width),
+            height=float(request.height),
+        )
     framing = CaptureFraming(
         mode=framing_mode,
         target=target,
-        clip=clip,
+        clip=framing_clip,
         content=content,
         authored_crop=request.spec.crop,
+        highlight_rects=highlight_rects,
+        highlight_mode=highlight_mode,
     )
+    _require_explicit_crop_contains_highlight(request.spec, framing)
 
     screenshot = session.command("Page.captureScreenshot", screenshot_params)
     encoded = screenshot.get("data")
@@ -1893,11 +2180,16 @@ def _capture_motion_frames_with_cdp_session(
         time.sleep(0.1)
 
     target: CaptureRectangle | None = None
-    if request.spec.selector or request.spec.text:
+    has_evidence_target = bool(request.spec.selector or request.spec.text)
+    if has_evidence_target or targeting.get("targetRect") is not None:
         target = _capture_rectangle(
             targeting.get("targetRect"),
             purpose="resolved motion evidence target",
         )
+    highlight_rects, highlight_mode = _capture_highlight_framing(
+        targeting,
+        requested=request.spec.highlight,
+    )
     content = _layout_content_rectangle(session)
     start_clip = _viewport_document_clip(
         content,
@@ -1997,6 +2289,8 @@ def _capture_motion_frames_with_cdp_session(
             target=target,
             clip=end_clip,
             content=content,
+            highlight_rects=highlight_rects,
+            highlight_mode=highlight_mode,
             motion=CaptureMotionFraming(
                 frame_count=frame_count,
                 fps=request.fps,
@@ -2204,8 +2498,20 @@ TARGETED_TEXT_MIN_COMPONENTS = 4
 TARGETED_TEXT_MIN_STRUCTURED_INK_FRACTION = 0.35
 TARGETED_TEXT_MIN_EDGE_PER_INK = 0.20
 TARGETED_TEXT_MIN_SHAPE_VARIATION = 0.15
+TARGETED_HIGHLIGHT_MAX_INK_FRACTION = 0.55
+TARGETED_HIGHLIGHT_MIN_BACKGROUND_FRACTION = 0.50
 _TARGETED_TEXT_MIN_CONTRAST = 32
 _TARGETED_TEXT_MAX_RUNS = 100_000
+_TARGETED_TEXT_FRAMING_MODES = frozenset(
+    {
+        "explicit-crop",
+        "target",
+        "motion-target",
+        "target-hold-fallback",
+        "viewport",
+    }
+)
+_TARGETED_HIGHLIGHT_MODES = frozenset({"css-highlight", "overlay"})
 
 
 @dataclass(frozen=True)
@@ -2250,6 +2556,33 @@ def looks_blank(png: Path) -> bool:
     return inspect_frame(png).looks_blank
 
 
+def _page_rectangle_pixel_box(
+    image_size: tuple[int, int],
+    clip: CaptureRectangle,
+    rectangle: CaptureRectangle,
+) -> tuple[int, int, int, int] | None:
+    """Map one page-coordinate rectangle into retained screenshot pixels."""
+
+    image_width, image_height = image_size
+    if image_width <= 0 or image_height <= 0:
+        return None
+    scale_x = image_width / clip.width
+    scale_y = image_height / clip.height
+    left = math.floor((rectangle.x - clip.x) * scale_x)
+    top = math.floor((rectangle.y - clip.y) * scale_y)
+    right = math.ceil((rectangle.right - clip.x) * scale_x)
+    bottom = math.ceil((rectangle.bottom - clip.y) * scale_y)
+    if right <= 0 or bottom <= 0 or left >= image_width or top >= image_height:
+        return None
+    left = max(0, left)
+    top = max(0, top)
+    right = min(image_width, right)
+    bottom = min(image_height, bottom)
+    if right - left < 1 or bottom - top < 1:
+        return None
+    return left, top, right, bottom
+
+
 def _target_pixel_region(
     image_size: tuple[int, int], framing: CaptureFraming
 ) -> tuple[int, int, int, int] | None:
@@ -2264,20 +2597,18 @@ def _target_pixel_region(
 
     target = framing.target
     clip = framing.clip
-    if framing.mode not in {"target", "motion-target"} or target is None or clip is None:
+    if (
+        framing.mode not in _TARGETED_TEXT_FRAMING_MODES
+        or target is None
+        or clip is None
+    ):
         return None
 
     image_width, image_height = image_size
-    if image_width <= 0 or image_height <= 0:
+    box = _page_rectangle_pixel_box(image_size, clip, target)
+    if box is None:
         return None
-    scale_x = image_width / clip.width
-    scale_y = image_height / clip.height
-    left = math.floor((target.x - clip.x) * scale_x)
-    top = math.floor((target.y - clip.y) * scale_y)
-    right = math.ceil((target.right - clip.x) * scale_x)
-    bottom = math.ceil((target.bottom - clip.y) * scale_y)
-    if right <= 0 or bottom <= 0 or left >= image_width or top >= image_height:
-        return None
+    left, top, right, bottom = box
 
     target_width = max(1, right - left)
     target_height = max(1, bottom - top)
@@ -2290,6 +2621,32 @@ def _target_pixel_region(
     if right - left < 3 or bottom - top < 3:
         return None
     return left, top, right, bottom
+
+
+def _highlight_pixel_regions(
+    image_size: tuple[int, int], framing: CaptureFraming
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Map exact recorded highlight lines into retained screenshot pixels."""
+
+    if (
+        framing.mode not in _TARGETED_TEXT_FRAMING_MODES
+        or framing.highlight_mode not in _TARGETED_HIGHLIGHT_MODES
+        or framing.clip is None
+        or not framing.highlight_rects
+    ):
+        return ()
+    return tuple(
+        box
+        for rectangle in framing.highlight_rects
+        if (
+            box := _page_rectangle_pixel_box(
+                image_size,
+                framing.clip,
+                rectangle,
+            )
+        )
+        is not None
+    )
 
 
 def _ink_component_stats(mask: Any) -> tuple[list[tuple[int, int, int]], int]:
@@ -2381,16 +2738,20 @@ def _has_targeted_text_structure(
     """Whether a low-palette target crop has pixel structure resembling text.
 
     DOM resolution grants eligibility for this fallback, never acceptance.
-    Acceptance comes only from the retained target pixels: a dominant flat
-    background, a bounded amount of contrasting ink, several separate glyph-
-    sized components, repeated row structure, and enough edge for thin strokes
-    rather than one solid panel.
+    Acceptance comes only from the retained target pixels: a dominant bright
+    page or recorded yellow-highlight background, a bounded amount of dark
+    ink, several separate glyph-sized components, repeated row structure, and
+    enough edge for thin strokes rather than one solid panel.
     """
 
+    scroll_text = (
+        capture_spec.scroll_target.text
+        if capture_spec.scroll_target is not None
+        else None
+    )
     if (
         framing is None
-        or not (capture_spec.text or capture_spec.selector)
-        or capture_spec.crop is not None
+        or not (capture_spec.text or capture_spec.selector or scroll_text)
     ):
         return False
 
@@ -2400,41 +2761,106 @@ def _has_targeted_text_structure(
 
     try:
         with Image.open(png) as image:
-            grey_image = image.convert("L")
-            region_box = _target_pixel_region(grey_image.size, framing)
-            if region_box is None:
+            rgb_image = image.convert("RGB")
+            highlight_expected = bool(
+                capture_spec.highlight
+                and framing.highlight_mode in _TARGETED_HIGHLIGHT_MODES
+                and framing.highlight_rects
+            )
+            highlight_boxes = (
+                _highlight_pixel_regions(rgb_image.size, framing)
+                if highlight_expected
+                else ()
+            )
+            if highlight_expected and not highlight_boxes:
                 return False
-            grey = np.asarray(grey_image.crop(region_box), dtype=np.uint8)
+            if highlight_boxes:
+                left = min(box[0] for box in highlight_boxes)
+                top = min(box[1] for box in highlight_boxes)
+                right = max(box[2] for box in highlight_boxes)
+                bottom = max(box[3] for box in highlight_boxes)
+                rgb = np.asarray(
+                    rgb_image.crop((left, top, right, bottom)),
+                    dtype=np.uint8,
+                )
+                coverage = np.zeros(rgb.shape[:2], dtype=bool)
+                for box_left, box_top, box_right, box_bottom in highlight_boxes:
+                    coverage[
+                        box_top - top : box_bottom - top,
+                        box_left - left : box_right - left,
+                    ] = True
+                red = rgb[:, :, 0].astype(np.int16)
+                green = rgb[:, :, 1].astype(np.int16)
+                blue = rgb[:, :, 2].astype(np.int16)
+                white = (
+                    (red >= TARGETED_TEXT_MIN_BACKGROUND_LEVEL)
+                    & (green >= TARGETED_TEXT_MIN_BACKGROUND_LEVEL)
+                    & (blue >= TARGETED_TEXT_MIN_BACKGROUND_LEVEL)
+                )
+                yellow = (
+                    (red >= 200)
+                    & (green >= 145)
+                    & (blue <= 190)
+                    & (red >= green)
+                    & ((red - blue) >= 60)
+                    & ((green - blue) >= 30)
+                )
+                background_like = coverage & (white | yellow)
+                analysis_pixels = int(np.count_nonzero(coverage))
+                if analysis_pixels == 0:
+                    return False
+                background_fraction = (
+                    int(np.count_nonzero(background_like)) / analysis_pixels
+                )
+                if (
+                    background_fraction
+                    < TARGETED_HIGHLIGHT_MIN_BACKGROUND_FRACTION
+                ):
+                    return False
+                ink = coverage & ~background_like
+                highlighted = True
+            else:
+                grey_image = rgb_image.convert("L")
+                region_box = _target_pixel_region(grey_image.size, framing)
+                if region_box is None:
+                    return False
+                grey = np.asarray(grey_image.crop(region_box), dtype=np.uint8)
+                if grey.ndim != 2 or grey.size == 0:
+                    return False
+                histogram = np.bincount(grey.ravel(), minlength=256)
+                background = int(histogram.argmax())
+                background_fraction = int(histogram[background]) / int(grey.size)
+                if (
+                    background < TARGETED_TEXT_MIN_BACKGROUND_LEVEL
+                    or background_fraction
+                    < TARGETED_TEXT_MIN_BACKGROUND_FRACTION
+                ):
+                    return False
+
+                # This exception is deliberately for dark document text on a
+                # bright page. Symmetric contrast would also rescue white error
+                # copy on a failed black embed, which must remain fail-closed.
+                ink = (
+                    grey.astype(np.int16)
+                    <= background - _TARGETED_TEXT_MIN_CONTRAST
+                )
+                analysis_pixels = int(grey.size)
+                highlighted = False
     except Exception:
         return False
-    if grey.ndim != 2 or grey.size == 0:
-        return False
-
-    histogram = np.bincount(grey.ravel(), minlength=256)
-    background = int(histogram.argmax())
-    background_fraction = int(histogram[background]) / int(grey.size)
-    if (
-        background < TARGETED_TEXT_MIN_BACKGROUND_LEVEL
-        or background_fraction < TARGETED_TEXT_MIN_BACKGROUND_FRACTION
-    ):
-        return False
-
-    # This exception is deliberately for dark document text on a bright page.
-    # Symmetric contrast would also rescue white error copy on a failed black
-    # embed, which is exactly the kind of low-palette capture that must remain
-    # fail-closed.
-    ink = (
-        grey.astype(np.int16)
-        <= background - _TARGETED_TEXT_MIN_CONTRAST
-    )
     ink_pixels = int(np.count_nonzero(ink))
     if ink_pixels == 0:
         return False
-    ink_fraction = ink_pixels / int(grey.size)
+    ink_fraction = ink_pixels / analysis_pixels
+    maximum_ink_fraction = (
+        TARGETED_HIGHLIGHT_MAX_INK_FRACTION
+        if highlighted
+        else TARGETED_TEXT_MAX_INK_FRACTION
+    )
     if not (
         TARGETED_TEXT_MIN_INK_FRACTION
         <= ink_fraction
-        <= TARGETED_TEXT_MAX_INK_FRACTION
+        <= maximum_ink_fraction
     ):
         return False
 
@@ -2446,13 +2872,15 @@ def _has_targeted_text_structure(
 
     components, rich_rows = _ink_component_stats(ink)
     height, width = ink.shape
+    maximum_component_height_fraction = 0.95 if highlighted else 0.60
     text_components = [
         (area, component_width, component_height)
         for area, component_width, component_height in components
         if area >= 3
         and component_height >= 2
         and component_width <= max(12, round(width * 0.45))
-        and component_height <= max(12, round(height * 0.60))
+        and component_height
+        <= max(12, round(height * maximum_component_height_fraction))
         and area / (component_width * component_height) < 0.95
     ]
     if len(text_components) < TARGETED_TEXT_MIN_COMPONENTS or rich_rows < 2:
@@ -2505,6 +2933,57 @@ def _page_text(value: str | bytes | None) -> tuple[str, str]:
     visible = html.unescape(visible)
     visible = re.sub(r"\s+", " ", visible).strip()
     return raw, visible
+
+
+_SOURCE_TEXT_NORMALIZATION = str.maketrans(
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u02bc": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2212": "-",
+    }
+)
+
+
+def normalize_source_text(value: str | bytes | None) -> str:
+    """Normalize visible source/target text for a strict substring check.
+
+    Whitespace, compatibility glyphs, curly quotes, and dash variants are
+    normalized because HTML rendering legitimately changes those forms. Words
+    and punctuation are otherwise preserved; this is not fuzzy matching.
+    """
+
+    if value is None:
+        return ""
+    decoded = (
+        value.decode("utf-8", errors="replace")
+        if isinstance(value, bytes)
+        else str(value)
+    )
+    normalized = unicodedata.normalize("NFKC", html.unescape(decoded))
+    normalized = normalized.translate(_SOURCE_TEXT_NORMALIZATION)
+    return re.sub(r"\s+", " ", normalized).strip().casefold()
+
+
+def source_contains_exact_text(
+    page_source: str | bytes | None, exact_text: str
+) -> bool:
+    """Whether a normalized authored fragment occurs in visible source HTML.
+
+    Script/style payloads and markup are removed first, so JSON metadata cannot
+    silently certify a phrase that a reader could not find in the source page.
+    """
+
+    _raw, visible = _page_text(page_source)
+    needle = normalize_source_text(exact_text)
+    return bool(needle and needle in normalize_source_text(visible))
 
 
 _CONTENT_BLOCKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -2698,6 +3177,11 @@ def capture_page(
             # return rendered DOM directly. The native CDP path always returns
             # BrowserCaptureResponse with exact target/clip inspection state.
             browser_stdout = targeted_output
+        try:
+            _require_explicit_crop_contains_highlight(capture_spec, framing)
+        except RuntimeError:
+            out_png.unlink(missing_ok=True)
+            raise
         returncode, stderr = 0, b""
     else:
         argv = [
@@ -2920,13 +3404,18 @@ def still_to_video(
     Letterboxed onto the target frame rather than cropped to fill it: a document
     or a screenshot is information, and cropping a court order to 16:9 cuts off
     the part the shot exists to show. `render.cut_segment` applies the framing
-    move afterwards, so this deliberately holds still.
+    move afterwards, so this deliberately holds still.  Resolve quantizes the
+    absolute start and end of a clip independently, so their frame difference
+    can be the ceiling of the authored fractional-frame duration.  Encode that
+    exact ceiling explicitly instead of letting FFmpeg's ``-t`` truncate the
+    looped still to the previous whole frame.
     """
     still = Path(still).resolve()
     out_path = Path(out_path).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if duration <= 0:
         raise ValueError(f"still_to_video duration must be positive, got {duration}")
+    frame_count = max(1, math.ceil((float(duration) * fps) - 1e-9))
 
     vf = (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
@@ -2935,11 +3424,14 @@ def still_to_video(
     )
     argv = [
         "ffmpeg", "-y", "-v", "error",
-        "-loop", "1", "-i", str(still),
-        "-t", f"{duration:.6f}",
+        "-loop", "1", "-framerate", str(fps), "-i", str(still),
+        "-frames:v", str(frame_count),
+        "-an",
         "-r", str(fps),
+        "-fps_mode", "cfr",
         "-vf", vf,
         *video_args(20),
+        "-movflags", "+faststart",
         str(out_path),
     ]
     active = runner or _default_runner

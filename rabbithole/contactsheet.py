@@ -111,6 +111,8 @@ def review_kind(item: ReviewItem) -> str:
         provider = item.asset.provider.casefold()
         if provider == "rabbithole-evidence-card":
             return "CITATION CARD"
+        if provider == "rabbithole-source-text-extract":
+            return "SOURCE-TEXT EXTRACT"
         if provider == "rabbithole-source-frame":
             return "SOURCE FRAME"
         if provider == "rabbithole-source-image":
