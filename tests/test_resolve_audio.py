@@ -254,6 +254,49 @@ def test_gain_bake_is_exact_length_scaled_and_source_preserving(tmp_path):
     assert source.read_bytes() == source_before
 
 
+def test_gain_bake_fingerprint_distinguishes_identical_project_sources(tmp_path):
+    root = tmp_path / "episode"
+    first_source = _tone(
+        root / "resolve" / "audio-stems" / "first" / "music-stem.wav"
+    )
+    second_source = root / "resolve" / "audio-stems" / "second" / "music-stem.wav"
+    second_source.parent.mkdir(parents=True)
+    second_source.write_bytes(first_source.read_bytes())
+    source_sha = resolve_audio._sha256_file(first_source)
+
+    clip = {
+        "id": "music",
+        "media_path": "resolve/audio-stems/first/music-stem.wav",
+        "path_kind": "project-relative",
+        "sha256": source_sha,
+        "source_start_frame": 0,
+        "duration_frames": 30,
+        "gain_db": -3.0,
+    }
+
+    first = resolve_audio.prepare_resolve_gain_bake(root, clip, fps=30)
+    second = resolve_audio.prepare_resolve_gain_bake(
+        root,
+        {
+            **clip,
+            "media_path": "resolve/audio-stems/second/music-stem.wav",
+        },
+        fps=30,
+    )
+
+    assert first["fingerprint"] != second["fingerprint"]
+    assert first["manifest"]["source"]["media_path"].endswith(
+        "/first/music-stem.wav"
+    )
+    assert second["manifest"]["source"]["media_path"].endswith(
+        "/second/music-stem.wav"
+    )
+    assert (
+        first["manifest"]["output"]["sha256"]
+        == second["manifest"]["output"]["sha256"]
+    )
+
+
 def test_gain_bake_plan_rewrites_nested_cold_open_audio(tmp_path):
     root = tmp_path / "episode"
     source = _tone(root / "assets" / "crackle.wav", seconds=0.6)

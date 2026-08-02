@@ -630,6 +630,8 @@ def prepare_resolve_gain_bake(
             f"audio clip {clip.get('id')!r} has an invalid gain-bake frame range"
         )
     metadata = _pcm_wave_metadata(source)
+    source_media_path = str(clip["media_path"]).replace("\\", "/")
+    source_path_kind = clip.get("path_kind")
     source_start_sample = _frame_to_audio_sample(
         source_start_frame, metadata["sample_rate"], fps
     )
@@ -646,6 +648,13 @@ def prepare_resolve_gain_bake(
     contract = {
         "generator_version": GAIN_BAKE_GENERATOR_VERSION,
         "source_basename": source.name,
+        # The checksum identifies the PCM bytes, while the normalized logical
+        # path identifies which immutable project source supplied them.  Two
+        # content-addressed stem sets may legitimately contain byte-identical
+        # WAVs.  Keeping the path in the contract prevents a later prepare from
+        # reusing a bake manifest whose provenance points at a retired stem set.
+        "source_media_path": source_media_path,
+        "source_path_kind": source_path_kind,
         "source_sha256": actual_sha,
         "gain_db": gain_db,
         "source_start_frame": source_start_frame,
@@ -709,8 +718,8 @@ def prepare_resolve_gain_bake(
             "fingerprint": fingerprint,
             "contract": contract,
             "source": {
-                "media_path": str(clip["media_path"]).replace("\\", "/"),
-                "path_kind": clip.get("path_kind"),
+                "media_path": source_media_path,
+                "path_kind": source_path_kind,
                 "sha256": actual_sha,
             },
             "output": {
